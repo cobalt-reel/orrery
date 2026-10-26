@@ -16,10 +16,9 @@ struct Cli {
 enum Command {
     /// Run the compositor (the default).
     Run(RunArgs),
-    /// Send one request to a running orrery.
+    #[command(about = format!("Send one request to a running {NAME}"))]
     Msg {
-        /// The control socket. Default: `$XDG_RUNTIME_DIR/orrery.sock`.
-        #[arg(long)]
+        #[arg(long, help = socket_help())]
         socket: Option<PathBuf>,
         /// Words (`focus-slot left`) or a single JSON request.
         #[arg(required = true)]
@@ -27,8 +26,7 @@ enum Command {
     },
     /// Validate a config file: `ok`, or every problem as `FILE:LINE:COL: message`; exit 0 or 1.
     Check {
-        /// Default: `$XDG_CONFIG_HOME/orrery/config.kdl`.
-        #[arg(long)]
+        #[arg(long, help = format!("Default: `{}`", config_default()))]
         config: Option<PathBuf>,
     },
 }
@@ -38,15 +36,22 @@ struct RunArgs {
     /// `winit` runs as a window inside the current session; `headless` has no screen (tests).
     #[arg(long, value_enum, default_value = "winit")]
     backend: Backend,
-    /// Default: `$XDG_CONFIG_HOME/orrery/config.kdl`; the built-in config when it does not exist.
-    #[arg(long)]
+    #[arg(long, help = format!("Default: `{}`; the built-in config when it does not exist", config_default()))]
     config: Option<PathBuf>,
     /// The headless output's size.
     #[arg(long, default_value = "1920x1080", value_parser = comp::parse_size)]
     size: (i32, i32),
-    /// The control socket. Default: `$XDG_RUNTIME_DIR/orrery.sock`.
-    #[arg(long)]
+    #[arg(long, help = socket_help())]
     socket: Option<PathBuf>,
+}
+
+// The default paths in `--help`, from `NAME` (doc comments cannot hold it).
+fn socket_help() -> String {
+    format!("The control socket. Default: `$XDG_RUNTIME_DIR/{NAME}.sock`")
+}
+
+fn config_default() -> String {
+    format!("$XDG_CONFIG_HOME/{NAME}/config.kdl")
 }
 
 fn main() -> ExitCode {
