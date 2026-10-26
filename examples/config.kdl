@@ -1,0 +1,48 @@
+// ~/.config/orrery/config.kdl
+mod "Super"               // the bind modifier written as `Mod`; nested, let the host pass it through
+
+layout "wall" {
+    grid cols=3 rows=3
+    slot col=0 row=0
+    slot col=0 row=1
+    slot col=0 row=2
+    slot "hero" col=1 row=0 cols=2 rows=2
+    slot col=1 row=2
+    slot col=2 row=2
+}
+layout "halves" {
+    grid cols=2 rows=1
+    slot col=0 row=0
+    slot col=1 row=0
+}
+
+monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
+
+colors {
+    focus "#ff7edb"
+    badge "#ff7edb"
+    background "#1a1625"
+}
+
+binds {
+    "Mod+H" focus-slot "left"
+    "Mod+J" focus-slot "down"
+    "Mod+K" focus-slot "up"
+    "Mod+L" focus-slot "right"
+    "Mod+Shift+H" move-tab "left"
+    "Mod+Shift+J" move-tab "down"
+    "Mod+Shift+K" move-tab "up"
+    "Mod+Shift+L" move-tab "right"
+    "Mod+Ctrl+H" swap-slot "left"
+    "Mod+Ctrl+J" swap-slot "down"
+    "Mod+Ctrl+K" swap-slot "up"
+    "Mod+Ctrl+L" swap-slot "right"
+    "Mod+Tab" cycle-tab "next"
+    "Mod+Shift+Tab" cycle-tab "prev"
+    "Mod+1" layout "wall"
+    "Mod+2" layout "halves"
+    "Mod+Return" spawn "kitty"
+    "Mod+Shift+Q" close           // as Hyprland's killactive
+    "Mod+Space" show-tabs        // held: tab strips visible while down
+    "Mod+Shift+E" quit
+}

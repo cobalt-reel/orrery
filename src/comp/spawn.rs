@@ -1,0 +1,134 @@
+//! `spawn` binds: start a program with orrery as its display, detached from orrery's terminal and signals.
+//! Children are reaped on SIGCHLD (`Orrery::reap_children`, from the signal source in `run`). They are not
+//! signalled when orrery exits: each leads its own process group, deliberately, so a program started from
+//! orrery outlives it like one started from a launcher.
+
+use std::ffi::OsStr;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Child, Command, Stdio};
+
+use super::Orrery;
+
+/// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
+/// toolkit falls back to the host's Xwayland) for the child only (orrery's
+/// own environment keeps the host's, which winit needs), no stdio, its own process group (a Ctrl+C in orrery's
+/// terminal does not reach it), and an empty signal mask. None for an empty argv.
+#[must_use]
+pub fn command(argv: &[String], display: &OsStr) -> Option<Command> {
+    let (program, args) = argv.split_first()?;
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env("WAYLAND_DISPLAY", display)
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // calloop's Signals blocks SIGTERM/SIGINT in orrery's thread and a child inherits the mask across exec:
+    // without this, the child could never be stopped with SIGTERM.
+    // A pre_exec hook makes std fork and exec rather than posix_spawn; that is what lets this run in the child.
+    // Safety: between fork and exec only async-signal-safe calls are allowed; sigemptyset and sigprocmask are
+    // (pthread_sigmask is not on POSIX's list), and nothing here allocates.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(empty.as_mut_ptr());
+            if libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Some(cmd)
+}
+
+impl Orrery {
+    pub fn spawn(&mut self, argv: &[String]) {
+        let Some(mut cmd) = command(argv, &self.socket_name) else {
+            return;
+        };
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!("spawned {argv:?} (pid {})", child.id());
+                self.children.push(child);
+            }
+            Err(e) => tracing::warn!("cannot spawn {argv:?}: {e}"),
+        }
+    }
+
+    /// Waits for children that have exited, so none stays a zombie. Called on SIGCHLD; signals coalesce, so
+    /// every child is tried each time.
+    pub fn reap_children(&mut self) {
+        self.children.retain_mut(|child: &mut Child| match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::debug!("child {} exited: {status}", child.id());
+                false
+            }
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!("cannot wait for child {}: {e}", child.id());
+                false
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Blocks SIGTERM and SIGINT in this thread, as calloop does in orrery's.
+    fn block_term() {
+        unsafe {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(set.as_mut_ptr());
+            libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+            libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn the_child_does_not_see_the_host_x_display() {
+        // With DISPLAY set (Xwayland in the host), toolkits may pick X and open outside orrery.
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9")).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("DISPLAY"), None)), "{envs:?}");
+        assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wayland-9")))));
+    }
+
+    #[test]
+    fn empty_argv_is_nothing() {
+        assert!(command(&[], OsStr::new("wayland-9")).is_none());
+    }
+
+    #[test]
+    fn the_child_gets_the_display_its_own_group_and_no_blocked_signals() {
+        // Run in its own thread so the blocked mask does not leak into other tests.
+        let out = std::thread::spawn(|| {
+            block_term();
+            let argv: Vec<String> = [
+                "sh",
+                "-c",
+                "echo \"$WAYLAND_DISPLAY\"; echo $$; cut -d' ' -f5 /proc/self/stat; grep SigBlk /proc/self/status",
+            ]
+            .map(String::from)
+            .to_vec();
+            let mut cmd = command(&argv, OsStr::new("wayland-test-7")).unwrap();
+            cmd.stdout(Stdio::piped());
+            cmd.output().unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "wayland-test-7");
+        assert_eq!(lines[1], lines[2], "the shell leads its own process group: {text}");
+        let mask = lines[3].trim_start_matches("SigBlk:").trim();
+        assert!(mask.chars().all(|c| c == '0'), "no signal blocked in the child: {text}");
+    }
+}
