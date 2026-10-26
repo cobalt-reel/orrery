@@ -2,8 +2,8 @@
 
 mod support;
 
-use orrery_wm::config;
 use orrery_wm::layout::Rect;
+use orrery_wm::{NAME, config};
 use support::Compositor;
 use support::client::{Client, DecorationMode};
 
@@ -180,7 +180,7 @@ fn assert_serves(orrery: &Compositor) {
     let w = client.create_window("probe", "probe");
     let slot = size_of(rects("wall")[0]);
     let ok = client.wait_for(|s| s.windows[w].mapped() && s.windows[w].activated() && s.windows[w].size == slot);
-    assert!(ok, "orrery still serves clients: {:#?}", client.state.windows);
+    assert!(ok, "{NAME} still serves clients: {:#?}", client.state.windows);
 }
 
 #[test]

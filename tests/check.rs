@@ -1,11 +1,14 @@
 //! `orrery check`: the binary run on temp files, never the user's config.
 
+mod support;
+
 use std::process::{Command, Output};
 
-use orrery_wm::config;
+use orrery_wm::comp::config_path_in;
+use orrery_wm::{NAME, config};
 
 fn check(args: &[&std::ffi::OsStr], config_home: &std::path::Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_orrery"))
+    Command::new(support::BIN)
         .arg("check")
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
@@ -50,8 +53,8 @@ fn without_config_it_checks_the_default_path() {
     assert_eq!(out.status.code(), Some(1), "a missing file is not ok");
     assert!(text(&out.stderr).contains("built-in"), "{}", text(&out.stderr));
 
-    std::fs::create_dir(home.path().join("orrery")).unwrap();
-    std::fs::write(home.path().join("orrery").join("config.kdl"), config::DEFAULT).unwrap();
+    std::fs::create_dir(home.path().join(NAME)).unwrap();
+    std::fs::write(config_path_in(home.path()), config::DEFAULT).unwrap();
     let out = check(&[], home.path());
     assert!(out.status.success(), "{}", text(&out.stderr));
 }

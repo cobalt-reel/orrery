@@ -20,6 +20,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 
 use super::Orrery;
+use crate::NAME;
 use crate::ipc::{Request, Response};
 
 /// A request line longer than this is refused unread.
@@ -35,12 +36,18 @@ pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// How long `orrery msg` waits for orrery.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The control socket in `dir`: `<dir>/<NAME>.sock`.
+#[must_use]
+pub fn socket_path_in(dir: &Path) -> PathBuf {
+    dir.join(format!("{NAME}.sock"))
+}
+
 /// `$XDG_RUNTIME_DIR/orrery.sock`.
 #[must_use]
 pub fn default_socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
-        .map(|d| PathBuf::from(d).join("orrery.sock"))
+        .map(|d| socket_path_in(Path::new(&d)))
 }
 
 /// The bound socket and the lock that makes it ours. Dropping it (a clean exit) removes the socket, if the file
@@ -63,7 +70,7 @@ impl Drop for ControlSocket {
                 }
             }
             Ok(_) => tracing::warn!(
-                "{} is no longer the socket orrery bound; left alone",
+                "{} is no longer the socket {NAME} bound; left alone",
                 self.path.display()
             ),
             Err(_) => {}
@@ -112,12 +119,12 @@ pub fn bind(path: &Path) -> anyhow::Result<ControlSocket> {
         .with_context(|| format!("cannot open {}", Path::new(&lock_path).display()))?;
     // Safety: a valid fd for the life of `lock`.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("orrery already running (it holds {})", Path::new(&lock_path).display());
+        bail!("{NAME} already running (it holds {})", Path::new(&lock_path).display());
     }
 
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if UnixStream::connect(path).is_ok() {
-            bail!("orrery already running (its control socket {} answers)", path.display());
+            bail!("{NAME} already running (its control socket {} answers)", path.display());
         }
         if !meta.file_type().is_socket() {
             bail!("{} exists and is not a socket; not touching it", path.display());
@@ -447,7 +454,7 @@ fn write_later(
 /// `orrery msg`: one request to the orrery at `path`, its answer back.
 pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
     let mut stream = UnixStream::connect(path)
-        .with_context(|| format!("cannot reach orrery at {} (is it running?)", path.display()))?;
+        .with_context(|| format!("cannot reach {NAME} at {} (is it running?)", path.display()))?;
     stream
         .set_read_timeout(Some(CLIENT_TIMEOUT))
         .context("socket timeout")?;
@@ -467,7 +474,7 @@ pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
     let first = answer.split(|&b| b == b'\n').next().unwrap_or_default();
     serde_json::from_slice(first).with_context(|| {
         format!(
-            "orrery answered something that is not a response: {:?}",
+            "{NAME} answered something that is not a response: {:?}",
             String::from_utf8_lossy(first)
         )
     })

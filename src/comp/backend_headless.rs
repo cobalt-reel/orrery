@@ -9,6 +9,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::utils::Transform;
 
 use super::Orrery;
+use crate::NAME;
 use crate::layout::Rect;
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -19,7 +20,7 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery, (w,
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "orrery".into(),
+            make: NAME.into(),
             model: "headless".into(),
         },
     );

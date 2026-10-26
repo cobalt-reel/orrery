@@ -11,7 +11,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use orrery_wm::NAME;
+use orrery_wm::comp::ipc_server::socket_path_in;
 use tempfile::TempDir;
+
+/// The binary under test: the one place a test names it.
+pub const BIN: &str = env!("CARGO_BIN_EXE_orrery");
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// A orrery still running after this is killed, so a deadlocked compositor fails the test (its client's
@@ -29,7 +34,7 @@ pub struct Compositor {
 }
 
 fn log_of(config_dir: &TempDir) -> String {
-    std::fs::read_to_string(config_dir.path().join("orrery.log")).unwrap_or_default()
+    std::fs::read_to_string(config_dir.path().join(format!("{NAME}.log"))).unwrap_or_default()
 }
 
 /// Kills the child after WATCHDOG unless the test has taken it out first (stop or drop). It holds the `Child`
@@ -66,14 +71,14 @@ impl Compositor {
         std::fs::write(&config_path, config).expect("write the temp config");
 
         // orrery's log, printed only when a test fails (see Drop).
-        let log = std::fs::File::create(config_dir.path().join("orrery.log")).expect("log file");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_orrery"))
+        let log = std::fs::File::create(config_dir.path().join(format!("{NAME}.log"))).expect("log file");
+        let mut child = Command::new(BIN)
             .args(["run", "--backend", "headless", "--size"])
             .arg(format!("{}x{}", size.0, size.1))
             .arg("--config")
             .arg(&config_path)
             .arg("--socket")
-            .arg(runtime.path().join("orrery.sock"))
+            .arg(socket_path_in(runtime.path()))
             // Never the user's session: our own runtime dir, and no display to inherit.
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", config_dir.path())
@@ -106,7 +111,7 @@ impl Compositor {
                     c.wait()
                 });
                 panic!(
-                    "orrery printed no WAYLAND_DISPLAY line ({e}); exit {status:?}\n--- orrery log ---\n{}--- end ---",
+                    "{NAME} printed no WAYLAND_DISPLAY line ({e}); exit {status:?}\n--- {NAME} log ---\n{}--- end ---",
                     log_of(&config_dir)
                 );
             }
@@ -150,7 +155,7 @@ impl Compositor {
     }
 
     pub fn control_socket(&self) -> PathBuf {
-        self.runtime.path().join("orrery.sock")
+        socket_path_in(self.runtime.path())
     }
 
     /// A raw connection to orrery's Wayland socket, by path (no environment involved).
@@ -161,7 +166,7 @@ impl Compositor {
 
     /// `orrery msg --socket <ours> <words>`.
     pub fn msg(&self, words: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_orrery"))
+        Command::new(BIN)
             .arg("msg")
             .arg("--socket")
             .arg(self.control_socket())
@@ -176,7 +181,7 @@ impl Compositor {
         let out = self.msg(words);
         assert!(
             out.status.success(),
-            "orrery msg {words:?}: {}{}",
+            "{NAME} msg {words:?}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -186,7 +191,7 @@ impl Compositor {
     /// `msg`, which must fail, its stdout (the response) as JSON.
     pub fn msg_err(&self, words: &[&str]) -> serde_json::Value {
         let out = self.msg(words);
-        assert!(!out.status.success(), "orrery msg {words:?} should fail");
+        assert!(!out.status.success(), "{NAME} msg {words:?} should fail");
         serde_json::from_slice(&out.stdout).expect("msg prints the error response as JSON")
     }
 
@@ -221,7 +226,7 @@ impl Compositor {
     pub fn wait_exit(mut self) -> (ExitStatus, TempDir) {
         let mut child = self.child.lock().expect("child lock").take().expect("running");
         let runtime = std::mem::replace(&mut self.runtime, tempfile::tempdir().expect("temp dir"));
-        (wait_or_kill(&mut child, "orrery did not exit on quit"), runtime)
+        (wait_or_kill(&mut child, "the compositor did not exit on quit"), runtime)
     }
 
     /// SIGTERM, then wait: orrery must exit by itself, successfully.
@@ -237,7 +242,10 @@ impl Compositor {
         let pid = child.id().to_string();
         let sent = Command::new("kill").args(["-TERM", &pid]).status().expect("run kill");
         assert!(sent.success(), "kill -TERM {pid} failed");
-        (wait_or_kill(&mut child, "orrery did not exit on SIGTERM"), runtime)
+        (
+            wait_or_kill(&mut child, "the compositor did not exit on SIGTERM"),
+            runtime,
+        )
     }
 }
 

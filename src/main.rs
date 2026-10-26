@@ -3,10 +3,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use orrery_wm::comp::{self, Backend, RunOptions, ipc_server};
-use orrery_wm::{config, ipc};
+use orrery_wm::{NAME, config, ipc};
 
 #[derive(Parser)]
-#[command(name = "orrery", version, about = "A static tiling Wayland compositor")]
+#[command(name = NAME, version, about = "A static tiling Wayland compositor")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     // No verb means `run` with clap's own defaults, so they are written once (in the attributes above).
     let command = cli
         .command
-        .unwrap_or_else(|| Cli::parse_from(["orrery", "run"]).command.expect("`run` parses"));
+        .unwrap_or_else(|| Cli::parse_from([NAME, "run"]).command.expect("`run` parses"));
     match command {
         Command::Run(args) => {
             // Logs go to stderr: stdout carries the WAYLAND_DISPLAY line for scripts.
@@ -68,7 +68,7 @@ fn main() -> ExitCode {
             match comp::run(opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("orrery: {e:#}");
+                    eprintln!("{NAME}: {e:#}");
                     ExitCode::FAILURE
                 }
             }
@@ -81,14 +81,14 @@ fn main() -> ExitCode {
 /// `orrery check`. Unlike `run`, a missing file is not ok: the point is to check a file.
 fn check(path: Option<PathBuf>) -> ExitCode {
     let Some(path) = path.or_else(comp::default_config_path) else {
-        eprintln!("orrery check: no config path: pass --config or set XDG_CONFIG_HOME or HOME");
+        eprintln!("{NAME} check: no config path: pass --config or set XDG_CONFIG_HOME or HOME");
         return ExitCode::FAILURE;
     };
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "{}: no such file (orrery would use the built-in config)",
+                "{}: no such file ({NAME} would use the built-in config)",
                 path.display()
             );
             return ExitCode::FAILURE;
@@ -119,18 +119,18 @@ fn msg(socket: Option<PathBuf>, words: &[String]) -> ExitCode {
     let request = match ipc::parse_words(words) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("orrery msg: {e}");
+            eprintln!("{NAME} msg: {e}");
             return ExitCode::FAILURE;
         }
     };
     let Some(path) = socket.or_else(ipc_server::default_socket_path) else {
-        eprintln!("orrery msg: no control socket: pass --socket or set XDG_RUNTIME_DIR");
+        eprintln!("{NAME} msg: no control socket: pass --socket or set XDG_RUNTIME_DIR");
         return ExitCode::FAILURE;
     };
     let response = match ipc_server::send(&path, &request) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("orrery msg: {e:#}");
+            eprintln!("{NAME} msg: {e:#}");
             return ExitCode::FAILURE;
         }
     };
@@ -141,10 +141,10 @@ fn msg(socket: Option<PathBuf>, words: &[String]) -> ExitCode {
     };
     match json {
         Ok(j) => println!("{j}"),
-        Err(e) => eprintln!("orrery msg: {e}"),
+        Err(e) => eprintln!("{NAME} msg: {e}"),
     }
     if let Some(e) = &response.error {
-        eprintln!("orrery: {e}");
+        eprintln!("{NAME}: {e}");
     }
     if response.ok {
         ExitCode::SUCCESS
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn run_defaults_come_from_clap() {
-        let Some(Command::Run(args)) = Cli::parse_from(["orrery", "run"]).command else {
+        let Some(Command::Run(args)) = Cli::parse_from([NAME, "run"]).command else {
             panic!("run parses");
         };
         assert_eq!(args.backend, Backend::Winit);
@@ -170,14 +170,14 @@ mod tests {
     #[test]
     fn msg_takes_options_before_or_after_the_words() {
         let Some(Command::Msg { request, socket }) =
-            Cli::parse_from(["orrery", "msg", "--socket", "/s", "layout", "wall"]).command
+            Cli::parse_from([NAME, "msg", "--socket", "/s", "layout", "wall"]).command
         else {
             panic!("msg parses");
         };
         assert_eq!(request, ["layout", "wall"]);
         assert_eq!(socket, Some(PathBuf::from("/s")));
         let Some(Command::Msg { request, socket }) =
-            Cli::parse_from(["orrery", "msg", "focus-slot", "left", "--socket", "/t"]).command
+            Cli::parse_from([NAME, "msg", "focus-slot", "left", "--socket", "/t"]).command
         else {
             panic!("msg parses");
         };

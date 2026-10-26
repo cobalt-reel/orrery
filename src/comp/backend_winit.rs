@@ -32,6 +32,7 @@ use smithay::reexports::winit::window::Window as WinitWindow;
 use smithay::utils::Transform;
 
 use super::{Orrery, render};
+use crate::NAME;
 use crate::layout::Rect;
 
 /// How often housekeeping runs, clients get frame callbacks and a redraw is requested: about 60 Hz.
@@ -40,9 +41,9 @@ const FRAME: Duration = Duration::from_millis(16);
 pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> anyhow::Result<()> {
     let attributes = WinitWindow::default_attributes()
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
-        .with_title("orrery")
+        .with_title(NAME)
         // The app id, so host window rules can match `class:^(orrery)$`.
-        .with_name("orrery", "orrery")
+        .with_name(NAME, NAME)
         .with_visible(true);
     let (mut backend, winit) = winit::init_from_attributes::<GlesRenderer>(attributes)
         .map_err(|e| anyhow::anyhow!("cannot open the nested window: {e}"))?;
@@ -56,7 +57,7 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "orrery".into(),
+            make: NAME.into(),
             model: "winit".into(),
         },
     );

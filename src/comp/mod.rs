@@ -40,6 +40,7 @@ use smithay::wayland::shell::xdg::{XdgShellState, XdgToplevelSurfaceData};
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
+use crate::NAME;
 use crate::config::{self, Config};
 use crate::ipc::{Request, Response, StateView};
 use crate::layout::{Layout, Rect};
@@ -76,13 +77,19 @@ pub fn parse_size(s: &str) -> Result<(i32, i32), String> {
     Ok((w, h))
 }
 
+/// The config file under a config base directory: `<base>/<NAME>/config.kdl`.
+#[must_use]
+pub fn config_path_in(base: &Path) -> PathBuf {
+    base.join(NAME).join("config.kdl")
+}
+
 /// The config path when none is given: XDG first, then `~/.config`.
 pub fn default_config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("orrery").join("config.kdl"))
+    Some(config_path_in(&base))
 }
 
 /// How often the config file is looked at for changes.
@@ -766,6 +773,14 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_and_config_paths_come_from_the_name() {
+        let dir = Path::new("/run/user/1000");
+        assert_eq!(ipc_server::socket_path_in(dir), dir.join(format!("{NAME}.sock")));
+        let base = Path::new("/home/someone/.config");
+        assert_eq!(config_path_in(base), base.join(NAME).join("config.kdl"));
+    }
 
     #[test]
     fn configure_sizes_are_never_zero() {

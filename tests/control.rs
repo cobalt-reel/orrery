@@ -9,6 +9,8 @@ use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use orrery_wm::NAME;
+use orrery_wm::comp::ipc_server::socket_path_in;
 use orrery_wm::config;
 use orrery_wm::layout::Rect;
 use serde_json::Value;
@@ -271,7 +273,7 @@ fn quit_stops_orrery_cleanly_and_removes_the_socket() {
     let (status, runtime) = orrery.wait_exit();
     assert!(status.success(), "quit is a clean exit: {status}");
     assert!(
-        !runtime.path().join("orrery.sock").exists(),
+        !socket_path_in(runtime.path()).exists(),
         "the control socket is removed"
     );
 }
@@ -287,7 +289,7 @@ fn sigterm_removes_the_socket_and_it_was_private() {
     drop(client);
     let (status, runtime) = orrery.stop_keeping_runtime();
     assert!(status.success());
-    assert!(!runtime.path().join("orrery.sock").exists());
+    assert!(!socket_path_in(runtime.path()).exists());
 }
 
 #[test]
@@ -333,21 +335,21 @@ fn msg_refuses_bad_words_locally_and_reports_a_missing_orrery() {
     assert!(orrery.stop().success());
 
     let dir = tempfile::tempdir().expect("temp dir");
-    let out = Command::new(env!("CARGO_BIN_EXE_orrery"))
+    let out = Command::new(support::BIN)
         .args(["msg", "--socket"])
-        .arg(dir.path().join("orrery.sock"))
+        .arg(socket_path_in(dir.path()))
         .arg("state")
         .output()
         .expect("run orrery msg");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot reach orrery"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("cannot reach {NAME}")));
 }
 
 #[test]
 fn a_second_orrery_refuses_a_live_socket() {
     let (orrery, client) = start();
     let runtime = tempfile::tempdir().expect("temp runtime dir");
-    let mut second = Command::new(env!("CARGO_BIN_EXE_orrery"))
+    let mut second = Command::new(support::BIN)
         .args(["run", "--backend", "headless", "--socket"])
         .arg(orrery.control_socket())
         .arg("--config")
@@ -376,7 +378,7 @@ fn a_second_orrery_refuses_a_live_socket() {
 fn a_stale_socket_is_replaced() {
     let runtime = tempfile::tempdir().expect("temp runtime dir");
     // A socket file nobody listens on: a orrery that was killed.
-    drop(UnixListener::bind(runtime.path().join("orrery.sock")).expect("bind"));
+    drop(UnixListener::bind(socket_path_in(runtime.path())).expect("bind"));
     let orrery = Compositor::start_in(runtime, config::DEFAULT, SIZE);
     assert_eq!(orrery.state()["monitors"][0]["name"], "headless");
     assert!(orrery.stop().success());
@@ -415,7 +417,7 @@ fn a_disconnected_client_leaves_exactly_the_other_tabs() {
 /// once; its stderr.
 fn refused_with(socket: &std::path::Path) -> String {
     let runtime = tempfile::tempdir().expect("temp runtime dir");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_orrery"))
+    let mut child = Command::new(support::BIN)
         .args(["run", "--backend", "headless", "--socket"])
         .arg(socket)
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -426,7 +428,7 @@ fn refused_with(socket: &std::path::Path) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orrery");
-    let status = wait_or_kill(&mut child, "orrery kept running");
+    let status = wait_or_kill(&mut child, "the compositor kept running");
     assert!(!status.success());
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut stderr).expect("stderr");
@@ -436,7 +438,7 @@ fn refused_with(socket: &std::path::Path) -> String {
 #[test]
 fn a_path_that_is_not_a_socket_is_refused_and_kept() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("orrery.sock");
+    let path = socket_path_in(dir.path());
     std::fs::write(&path, "mine").expect("write");
     let stderr = refused_with(&path);
     assert!(stderr.contains("not a socket"), "{stderr}");
@@ -447,14 +449,14 @@ fn a_path_that_is_not_a_socket_is_refused_and_kept() {
 fn a_socket_dir_others_can_write_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).expect("chmod");
-    let path = dir.path().join("orrery.sock");
+    let path = socket_path_in(dir.path());
     let stderr = refused_with(&path);
     assert!(stderr.contains("writable"), "{stderr}");
     assert!(!path.exists());
     // Sticky makes it acceptable (like /tmp, were it ours).
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).expect("chmod");
     let runtime = tempfile::tempdir().expect("temp runtime dir");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_orrery"))
+    let mut child = Command::new(support::BIN)
         .args(["run", "--backend", "headless", "--socket"])
         .arg(&path)
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -467,8 +469,8 @@ fn a_socket_dir_others_can_write_is_refused() {
         .expect("spawn orrery");
     let deadline = Instant::now() + TIMEOUT;
     while !path.exists() {
-        assert!(Instant::now() < deadline, "orrery listens in a sticky dir of ours");
-        assert!(child.try_wait().expect("wait").is_none(), "orrery exited");
+        assert!(Instant::now() < deadline, "{NAME} listens in a sticky dir of ours");
+        assert!(child.try_wait().expect("wait").is_none(), "{NAME} exited");
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();
@@ -485,7 +487,7 @@ fn a_socket_replaced_under_orrery_is_not_removed_on_exit() {
     let (status, runtime) = orrery.stop_keeping_runtime();
     assert!(status.success());
     assert!(
-        runtime.path().join("orrery.sock").exists(),
+        socket_path_in(runtime.path()).exists(),
         "not ours any more, so left alone"
     );
     drop(impostor);
@@ -584,7 +586,7 @@ fn out_of_descriptors_orrery_backs_off_instead_of_spinning() {
     std::thread::sleep(Duration::from_millis(1000));
     let spent = cpu_ticks(pid) - before;
     // Spinning on a ready listener would burn the whole second (~100 ticks).
-    assert!(spent < 60, "orrery used {spent} ticks in 1 s while out of descriptors");
+    assert!(spent < 60, "{NAME} used {spent} ticks in 1 s while out of descriptors");
 
     set_nofile(pid, old.rlim_cur, old.rlim_max);
     s.set_read_timeout(Some(TIMEOUT)).expect("timeout");
