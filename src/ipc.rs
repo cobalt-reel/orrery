@@ -178,15 +178,18 @@ impl StateView {
                     .slots
                     .iter()
                     .zip(mon.layout().rects(mon.area()))
-                    .zip(mon.stacks())
+                    .zip(mon.slots())
                     .enumerate()
-                    .map(|(index, ((spec, rect), stack))| SlotView {
+                    .map(|(index, ((spec, rect), slot))| SlotView {
                         index,
                         name: spec.name.clone(),
                         rect,
                         focused: focused && index == mon.focus(),
-                        tabs: stack
+                        // Every window of the slot, tab by tab, bottom to top.
+                        tabs: slot
+                            .tabs()
                             .iter()
+                            .flatten()
                             .map(|&id| {
                                 let (app_id, title) = info(id);
                                 TabView { id, app_id, title }
@@ -218,7 +221,7 @@ impl Request {
     pub fn apply(&self, stacks: &mut Stacks, config: &Config) -> Result<(), String> {
         match self {
             Request::FocusSlot { dir } => stacks.focus_slot(*dir),
-            Request::MoveTab { dir } => stacks.move_tab(*dir),
+            Request::MoveTab { dir } => stacks.move_stack(*dir),
             Request::SwapSlot { dir } => stacks.swap_slot(*dir),
             Request::CycleTab { cycle } => stacks.cycle_tab(*cycle),
             Request::Layout { name, monitor } => {
@@ -548,7 +551,10 @@ mod tests {
         };
         s.add_monitor("winit", area, layout("wall"));
         s.add_monitor("other", area, layout("halves"));
-        (1..=3).for_each(|w| s.open(w));
+        // Three tabs, so cycling has somewhere to go.
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        s.open_tab(3, None, None);
         (s, config)
     }
 
@@ -557,7 +563,7 @@ mod tests {
         type Op = fn(&mut Stacks);
         let cases: [(Request, Op); 6] = [
             (Request::FocusSlot { dir: Dir::Right }, |s| s.focus_slot(Dir::Right)),
-            (Request::MoveTab { dir: Dir::Right }, |s| s.move_tab(Dir::Right)),
+            (Request::MoveTab { dir: Dir::Right }, |s| s.move_stack(Dir::Right)),
             (Request::SwapSlot { dir: Dir::Down }, |s| s.swap_slot(Dir::Down)),
             (Request::CycleTab { cycle: Cycle::Next }, |s| s.cycle_tab(Cycle::Next)),
             (Request::CycleTab { cycle: Cycle::Prev }, |s| s.cycle_tab(Cycle::Prev)),
@@ -645,8 +651,8 @@ mod tests {
             h: 2160,
         };
         s.add_monitor("winit", uhd, layout("wall"));
-        s.open(1);
-        s.open(2);
+        s.open_stacked(1);
+        s.open_stacked(2);
         s.add_monitor("second", uhd, layout("halves"));
         let v = StateView::new(&s, Some("broken".into()), |w| {
             (Some(format!("app{w}")), (w == 2).then(|| "two".into()))

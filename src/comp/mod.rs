@@ -377,7 +377,7 @@ impl Orrery {
             toplevel.send_configure();
         }
         if has_buffer && self.opened.insert(id) {
-            self.stacks.open(id);
+            self.stacks.open_stacked(id);
             self.arrange();
         }
     }
@@ -414,9 +414,9 @@ impl Orrery {
             .or_else(|| self.stacks.focused_rect())
     }
 
-    /// Makes Wayland match the stacks, in one pass over `placements()`: a window on top of its slot is mapped
-    /// at the slot's rectangle; one beneath is unmapped but stays alive. Both are configured to the slot's size
-    /// (so raising one later needs no round trip), tiled on every edge, activated only when focused. Waiting
+    /// Makes Wayland match the stacks, in one pass over `placements()`: the top of a slot's current tab is mapped
+    /// at the slot's rectangle; every other window is unmapped but stays alive. Both are configured to the slot's
+    /// size (so showing one later needs no round trip), tiled on every edge, activated only when focused. Waiting
     /// windows (no buffer yet) are unmapped and configured to where they would open (the focused slot). Opened
     /// windows in no slot (pending without a monitor) are unmapped and keep their size; they are neither drawn
     /// nor focused. Keyboard and pointer focus then follow.
@@ -863,7 +863,7 @@ mod tests {
         let mut s = Stacks::new();
         s.add_monitor("a", area, wall.clone());
         s.add_monitor("b", area, halves.clone());
-        s.open(1);
+        s.open_stacked(1);
 
         // Unchanged layouts: nothing moves, nothing kept.
         assert!(reapply_layouts(&mut s, &c).is_empty());
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(reapply_layouts(&mut s, &new), [("b".to_owned(), "halves".to_owned())]);
         assert_eq!(s.monitors()[0].layout(), &wide);
         assert_eq!(s.monitors()[1].layout(), &halves);
-        assert_eq!(s.monitors()[0].stacks().concat(), [1]);
+        assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
     }
 
     #[test]
@@ -914,10 +914,10 @@ mod tests {
         let mut s = Stacks::new();
         s.add_monitor("winit", area, halves.clone());
         s.add_monitor("other", area, halves.clone());
-        s.open(1);
+        s.open_stacked(1);
         apply_monitor_rules(&mut s, &c);
         assert_eq!(s.monitors()[0].layout().name, "wall", "the winit rule");
         assert_eq!(s.monitors()[1].layout().name, "wall", "no rule: the first layout");
-        assert_eq!(s.monitors()[0].stacks().concat(), [1]);
+        assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
     }
 }

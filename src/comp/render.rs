@@ -82,19 +82,19 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
     let mut borders = Vec::new();
     let mut badges = Vec::new();
     let mut strips = Vec::new();
-    for (slot, (stack, rect)) in mon.stacks().iter().zip(rects).enumerate() {
+    for (i, (slot, rect)) in mon.slots().iter().zip(rects).enumerate() {
         let rect = local(rect);
-        if let Some(&top) = stack.last() {
+        if let Some(top) = slot.top() {
             out.windows.push((top, rect));
         }
         // The focused slot is outlined even when empty: it is where the next window opens.
-        if mi == stacks.focused_monitor() && slot == mon.focus() {
+        if mi == stacks.focused_monitor() && i == mon.focus() {
             borders.extend(border(rect, colors.focus));
         }
-        if stack.len() > 1 {
+        if slot.len() > 1 {
             badges.extend(badge(rect, colors.badge));
             if show_tabs {
-                strips.extend(strip(rect, stack.len(), colors.badge));
+                strips.extend(strip(rect, slot.tabs().len(), slot.current(), colors.badge));
             }
         }
     }
@@ -162,11 +162,12 @@ fn badge(r: Rect, color: Color) -> Option<Solid> {
     (r.w >= BADGE + 2 * BADGE_INSET && r.h >= BADGE + 2 * BADGE_INSET).then_some(Solid { rect, color })
 }
 
-/// A STRIP-high bar along the slot's top, one segment per tab (bottom of the stack on the left), split with the
-/// layout's integer math so segments tile the width exactly; a 1 px gap separates neighbours when there is room.
-/// The top tab (the last) is bright, the others dim.
-fn strip(r: Rect, tabs: usize, color: Color) -> impl Iterator<Item = Solid> {
+/// A STRIP-high bar along the slot's top, one segment per tab, left to right, split with the layout's integer
+/// math so segments tile the width exactly; a 1 px gap separates neighbours when there is room. The current tab
+/// is bright, the others dim.
+fn strip(r: Rect, tabs: usize, current: usize, color: Color) -> impl Iterator<Item = Solid> {
     let n = i64::try_from(tabs).unwrap_or(i64::MAX).max(1);
+    let current = i64::try_from(current).unwrap_or(i64::MAX);
     let w = i64::from(r.w);
     let edge = move |i: i64| r.x + i32::try_from(w * i / n).unwrap_or(r.w);
     let dim = Color {
@@ -184,7 +185,7 @@ fn strip(r: Rect, tabs: usize, color: Color) -> impl Iterator<Item = Solid> {
         })?;
         Some(Solid {
             rect,
-            color: if i + 1 == n { color } else { dim },
+            color: if i == current { color } else { dim },
         })
     })
 }
@@ -389,13 +390,13 @@ mod tests {
     fn windows_are_the_tops_clipped_to_their_slots() {
         let (mut s, rects, colors) = wall();
         for id in [1, 2, 3] {
-            s.open(id);
+            s.open_stacked(id);
         }
         s.focus_slot(crate::layout::Dir::Right);
-        s.open(4);
+        s.open_stacked(4);
         let scene = scene(&s, "m", &colors, false, false);
         assert_eq!(scene.windows, [(3, rects[0]), (4, rects[3])]);
-        // The border moved to the hero; slot 0 (three tabs) has a badge, the hero (one) none.
+        // The border moved to the hero; slot 0 (three windows) has a badge, the hero (one) none.
         let border = of_color(&scene, colors.focus);
         assert_eq!(border.len(), 4);
         assert!(border.iter().all(|e| inside(*e, rects[3])));
@@ -414,9 +415,12 @@ mod tests {
     #[test]
     fn held_tab_strips_split_the_top_edge_per_tab() {
         let (mut s, rects, colors) = wall();
-        for id in [1, 2, 3] {
-            s.open(id);
-        }
+        s.open_stacked(1);
+        s.open_stacked(2);
+        s.open_tab(3, None, None);
+        s.open_tab(4, None, None);
+        s.cycle_tab(crate::config::Cycle::Next);
+        // Tabs [1, 2], [3], [4], the first current: one segment per tab, not per window.
         let scene = scene(&s, "m", &colors, true, false);
         let r = rects[0];
         let dim = Color {
@@ -427,8 +431,8 @@ mod tests {
         assert_eq!(segments.len(), 3);
         assert_eq!(
             [segments[0].color, segments[1].color, segments[2].color],
-            [dim, dim, colors.badge],
-            "top is bright"
+            [colors.badge, dim, dim],
+            "the current tab is bright"
         );
         // Exact tiling of the width with the layout's integer math, a 1 px gap between neighbours.
         let w = r.w;
@@ -447,14 +451,14 @@ mod tests {
         }
         // Front to back: the border over the badge over the strips.
         assert_eq!(scene.solids[0].color, colors.focus);
-        assert_eq!(scene.solids.last().map(|s| s.color), Some(colors.badge));
+        assert_eq!(scene.solids.last().map(|s| s.color), Some(dim));
     }
 
     #[test]
     fn a_config_error_puts_a_red_bar_over_everything() {
         let (mut s, _, colors) = wall();
-        s.open(1);
-        s.open(2);
+        s.open_stacked(1);
+        s.open_stacked(2);
         let plain = scene(&s, "m", &colors, true, false);
         let flagged = scene(&s, "m", &colors, true, true);
         assert_eq!(
@@ -491,7 +495,7 @@ mod tests {
             h: 600,
         };
         s.add_monitor("right", area, halves);
-        s.open(9);
+        s.open_stacked(9);
         let scene = scene(&s, "right", &c.colors, false, false);
         assert_eq!(
             scene.windows,
@@ -518,7 +522,7 @@ mod tests {
             "{edges:?}"
         );
         assert!(badge(Rect { w: 19, ..r }, colors.badge).is_none());
-        let segs: Vec<Solid> = strip(Rect { w: 2, h: 3, ..r }, 5, colors.badge).collect();
+        let segs: Vec<Solid> = strip(Rect { w: 2, h: 3, ..r }, 5, 4, colors.badge).collect();
         assert!(
             segs.iter().all(|e| inside(e.rect, Rect { w: 2, h: 3, ..r })),
             "{segs:?}"

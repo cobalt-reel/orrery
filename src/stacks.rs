@@ -1,4 +1,4 @@
-//! Slots as tab stacks: the state machine behind every window move.
+//! Slots of tabs, tabs of stacked windows: the state machine behind every window move.
 //!
 //! Pure: windows are opaque ids, monitors are names with an area. Every operation keeps each window in exactly
 //! one place, and an operation that cannot apply (an edge, an empty slot, an unknown id) does nothing. The state
@@ -9,13 +9,22 @@ use crate::layout::{Dir, Layout, Rect};
 
 pub type WinId = u64;
 
+/// One layout slot: its tabs, left to right, each a stack of windows (bottom to top), and the one shown. Only
+/// the top window of the current tab is drawn; a tab is never empty, so an empty slot has no tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Slot {
+    tabs: Vec<Vec<WinId>>,
+    /// The tab shown; 0 when there is none.
+    current: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
     name: String,
     area: Rect,
     layout: Layout,
-    /// One stack per layout slot, in slot order; the last window of a stack is its top.
-    stacks: Vec<Vec<WinId>>,
+    /// One per layout slot, in slot order.
+    slots: Vec<Slot>,
     /// The focused slot.
     focus: usize,
 }
@@ -25,11 +34,11 @@ pub struct Stacks {
     monitors: Vec<Monitor>,
     focused_monitor: usize,
     /// Windows with no monitor to live on (none yet, or the last one went away), oldest first. The next monitor
-    /// added takes them into its focused slot.
+    /// added takes them, as one stack, into its focused slot.
     pending: Vec<WinId>,
 }
 
-/// What is drawn: the top window of a non-empty slot, at the slot's rectangle.
+/// What is drawn: the top window of a non-empty slot's current tab, at the slot's rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tile {
     pub monitor: usize,
@@ -37,21 +46,86 @@ pub struct Tile {
     pub rect: Rect,
     pub win: WinId,
     pub focused: bool,
-    /// The stack's length: more than 1 earns a badge.
+    /// The slot's tab count.
+    pub tabs: usize,
+    /// The current tab's stack length.
     pub depth: usize,
+    /// Every window in the slot, any tab, any depth: more than 1 earns a badge.
+    pub windows: usize,
 }
 
-/// Where a placed window is: every window in a slot has one, whether it is drawn (`on_top`) or waiting beneath.
+/// Where a placed window is: every window in a slot has one, whether it is drawn (`on_top`) or waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     pub win: WinId,
     pub monitor: usize,
     pub slot: usize,
-    /// The slot's rectangle: windows beneath the top are kept at this size so raising them is instant.
+    pub tab: usize,
+    /// The slot's rectangle: waiting windows are kept at this size so showing them is instant.
     pub rect: Rect,
+    /// On top of its slot's current tab.
     pub on_top: bool,
     /// On top of the focused slot of the focused monitor.
     pub focused: bool,
+}
+
+impl Slot {
+    /// Left to right, each bottom to top.
+    #[must_use]
+    pub fn tabs(&self) -> &[Vec<WinId>] {
+        &self.tabs
+    }
+
+    #[must_use]
+    pub fn current(&self) -> usize {
+        self.current
+    }
+
+    /// The top of the current tab: the slot's one drawn window.
+    #[must_use]
+    pub fn top(&self) -> Option<WinId> {
+        self.tabs.get(self.current)?.last().copied()
+    }
+
+    /// Windows in the slot, every tab.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tabs.iter().map(Vec::len).sum()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    fn current_mut(&mut self) -> Option<&mut Vec<WinId>> {
+        self.tabs.get_mut(self.current)
+    }
+
+    /// `tab` right after the current one (first in an empty slot), made current.
+    fn insert_tab(&mut self, tab: Vec<WinId>) {
+        let at = if self.tabs.is_empty() { 0 } else { self.current + 1 };
+        self.tabs.insert(at, tab);
+        self.current = at;
+    }
+
+    /// Takes tab `i` out; if it was current, the tab now at its index is shown, else the previous one.
+    fn remove_tab(&mut self, i: usize) -> Vec<WinId> {
+        let tab = self.tabs.remove(i);
+        if i < self.current {
+            self.current -= 1;
+        }
+        self.current = self.current.min(self.tabs.len().saturating_sub(1));
+        tab
+    }
+
+    /// Removes the window at `pos` of tab `t`; a tab left empty goes.
+    fn remove(&mut self, t: usize, pos: usize) {
+        self.tabs[t].remove(pos);
+        if self.tabs[t].is_empty() {
+            self.remove_tab(t);
+        }
+    }
 }
 
 impl Monitor {
@@ -70,10 +144,10 @@ impl Monitor {
         &self.layout
     }
 
-    /// One stack per layout slot, bottom to top.
+    /// One per layout slot.
     #[must_use]
-    pub fn stacks(&self) -> &[Vec<WinId>] {
-        &self.stacks
+    pub fn slots(&self) -> &[Slot] {
+        &self.slots
     }
 
     #[must_use]
@@ -108,7 +182,7 @@ impl Stacks {
     /// Focuses a slot by pointer, empty or not; an unknown monitor or slot does nothing.
     pub fn focus_at(&mut self, monitor: &str, slot: usize) {
         if let Some(i) = self.index_of(monitor)
-            && slot < self.monitors[i].stacks.len()
+            && slot < self.monitors[i].slots.len()
         {
             self.focused_monitor = i;
             self.monitors[i].focus = slot;
@@ -122,27 +196,30 @@ impl Stacks {
         }
     }
 
-    /// Every window in a slot, in one pass: monitor by monitor, slot by slot, bottom to top.
+    /// Every window in a slot, in one pass: monitor by monitor, slot by slot, tab by tab, bottom to top.
     // No #[must_use]: iterators already carry it.
     pub fn placements(&self) -> impl Iterator<Item = Placement> + '_ {
         self.monitors.iter().enumerate().flat_map(move |(mi, mon)| {
             let focused_monitor = mi == self.focused_monitor;
             let rects = mon.layout.rects(mon.area);
-            mon.stacks
+            mon.slots
                 .iter()
                 .zip(rects)
                 .enumerate()
-                .flat_map(move |(si, (stack, rect))| {
-                    stack.iter().enumerate().map(move |(pos, &win)| {
-                        let on_top = pos + 1 == stack.len();
-                        Placement {
-                            win,
-                            monitor: mi,
-                            slot: si,
-                            rect,
-                            on_top,
-                            focused: on_top && focused_monitor && si == mon.focus,
-                        }
+                .flat_map(move |(si, (slot, rect))| {
+                    slot.tabs.iter().enumerate().flat_map(move |(ti, stack)| {
+                        stack.iter().enumerate().map(move |(pos, &win)| {
+                            let on_top = ti == slot.current && pos + 1 == stack.len();
+                            Placement {
+                                win,
+                                monitor: mi,
+                                slot: si,
+                                tab: ti,
+                                rect,
+                                on_top,
+                                focused: on_top && focused_monitor && si == mon.focus,
+                            }
+                        })
                     })
                 })
         })
@@ -153,9 +230,10 @@ impl Stacks {
     }
 
     /// Adds an output. Layouts must be valid (`Layout::validate`); one with no slots, or a name already present,
-    /// is ignored. Pending windows move onto it.
+    /// is ignored. Pending windows move onto it, as one tab of its first slot.
     pub fn add_monitor(&mut self, name: &str, area: Rect, layout: Layout) {
-        // Zero slots would break "one stack per slot" even in release; anything else invalid is a caller bug.
+        // Zero slots would break "one slot per layout slot" even in release; anything else invalid is a caller
+        // bug.
         if layout.slots.is_empty() || self.monitors.iter().any(|m| m.name == name) {
             return;
         }
@@ -163,20 +241,23 @@ impl Stacks {
             layout.validate().is_ok(),
             "add_monitor needs a valid layout: {layout:?}"
         );
-        let mut stacks = vec![Vec::new(); layout.slots.len()];
-        stacks[0] = std::mem::take(&mut self.pending);
+        let mut slots = vec![Slot::default(); layout.slots.len()];
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            slots[0].insert_tab(pending);
+        }
         self.monitors.push(Monitor {
             name: name.to_owned(),
             area,
             layout,
-            stacks,
+            slots,
             focus: 0,
         });
     }
 
-    /// Its windows (slot by slot, bottom to top) go on top of the focused monitor's focused slot, or the first
-    /// monitor's when the focused one is the one removed, or to `pending` when none is left. The focused monitor
-    /// is where the user is looking, so orphans land in sight.
+    /// Its tabs (slot by slot) are appended to the focused monitor's focused slot, or the first monitor's when
+    /// the focused one is the one removed; that slot keeps showing its current tab. With no monitor left their
+    /// windows go to `pending`. The focused monitor is where the user is looking, so orphans land in sight.
     pub fn remove_monitor(&mut self, name: &str) {
         let Some(i) = self.index_of(name) else {
             return;
@@ -187,29 +268,74 @@ impl Stacks {
         } else if self.focused_monitor == i {
             self.focused_monitor = 0;
         }
-        let windows = gone.stacks.into_iter().flatten();
+        let tabs = gone.slots.into_iter().flat_map(|s| s.tabs);
         match self.monitors.get_mut(self.focused_monitor) {
-            Some(m) => m.stacks[m.focus].extend(windows),
-            None => self.pending.extend(windows),
+            Some(m) => m.slots[m.focus].tabs.extend(tabs),
+            None => self.pending.extend(tabs.flatten()),
         }
     }
 
-    /// On top of the focused slot's stack (or `pending` with no monitor). An id already present is left where it
-    /// is, so a window can never be in two places.
-    pub fn open(&mut self, w: WinId) {
-        if self.where_is(w).is_some() || self.pending.contains(&w) {
+    /// On top of the focused slot's current stack (its first tab when empty), or `pending` with no monitor.
+    pub fn open_stacked(&mut self, w: WinId) {
+        if self.has(w) {
             return;
         }
-        match self.focused_stack_mut() {
+        let Some(slot) = self.focused_slot_mut() else {
+            self.pending.push(w);
+            return;
+        };
+        match slot.current_mut() {
             Some(stack) => stack.push(w),
-            None => self.pending.push(w),
+            None => slot.insert_tab(vec![w]),
         }
     }
 
-    /// Removed wherever it is; focus stays on that slot.
+    /// A new tab right after the current one in `slot` of `monitor` (that monitor's focused slot without one),
+    /// made current, and the slot and monitor focused. A target that is not there means the focused slot;
+    /// `pending` with no monitor.
+    pub fn open_tab(&mut self, w: WinId, monitor: Option<&str>, slot: Option<usize>) {
+        if self.has(w) {
+            return;
+        }
+        let m = match monitor {
+            Some(name) => self.index_of(name),
+            None => Some(self.focused_monitor),
+        };
+        let target = m.and_then(|m| {
+            let mon = self.monitors.get(m)?;
+            let s = slot.unwrap_or(mon.focus);
+            (s < mon.slots.len()).then_some((m, s))
+        });
+        let Some((m, s)) = target.or_else(|| {
+            let mon = self.monitors.get(self.focused_monitor)?;
+            Some((self.focused_monitor, mon.focus))
+        }) else {
+            self.pending.push(w);
+            return;
+        };
+        self.focused_monitor = m;
+        let mon = &mut self.monitors[m];
+        mon.focus = s;
+        mon.slots[s].insert_tab(vec![w]);
+    }
+
+    /// On top of `parent`'s stack, wherever it is; the current tab and focus stay. `false` (and nothing done)
+    /// when the parent is not placed or `w` already is somewhere, so the caller can fall back.
+    pub fn open_on(&mut self, w: WinId, parent: WinId) -> bool {
+        if self.has(w) {
+            return false;
+        }
+        let Some((m, s, t, _)) = self.where_is(parent) else {
+            return false;
+        };
+        self.monitors[m].slots[s].tabs[t].push(w);
+        true
+    }
+
+    /// Removed wherever it is; a tab left empty goes (see `Slot::remove_tab`). Focus stays on that slot.
     pub fn close(&mut self, w: WinId) {
-        if let Some((m, s, p)) = self.where_is(w) {
-            self.monitors[m].stacks[s].remove(p);
+        if let Some((m, s, t, p)) = self.where_is(w) {
+            self.monitors[m].slots[s].remove(t, p);
         }
         self.pending.retain(|&x| x != w);
     }
@@ -221,43 +347,60 @@ impl Stacks {
         }
     }
 
-    /// Rotates the focused stack: next sends the top to the bottom, prev brings the bottom to the top.
+    /// Shows the focused slot's next or previous tab, wrapping. Tabs never move.
     pub fn cycle_tab(&mut self, c: Cycle) {
-        if let Some(stack) = self.focused_stack_mut()
-            && !stack.is_empty()
-        {
-            match c {
-                Cycle::Next => stack.rotate_right(1),
-                Cycle::Prev => stack.rotate_left(1),
+        if let Some(slot) = self.focused_slot_mut() {
+            let n = slot.tabs.len();
+            if n > 1 {
+                slot.current = match c {
+                    Cycle::Next => (slot.current + 1) % n,
+                    Cycle::Prev => (slot.current + n - 1) % n,
+                };
             }
         }
     }
 
-    /// The focused top window onto the neighbour's top; focus follows. Nothing at the edge or from an empty slot.
-    pub fn move_tab(&mut self, d: Dir) {
+    /// The focused slot's current tab, its whole stack, becomes a tab of the neighbour right after its current
+    /// one, shown there; focus follows. Nothing at the edge or from an empty slot.
+    pub fn move_stack(&mut self, d: Dir) {
         let Some((m, to)) = self.neighbour(d) else {
             return;
         };
         let mon = &mut self.monitors[m];
-        if let Some(w) = mon.stacks[mon.focus].pop() {
-            mon.stacks[to].push(w);
-            mon.focus = to;
+        let from = &mut mon.slots[mon.focus];
+        if from.is_empty() {
+            return;
         }
+        let tab = from.remove_tab(from.current);
+        mon.slots[to].insert_tab(tab);
+        mon.focus = to;
     }
 
-    /// Swaps the focused stack with the neighbour's; focus follows the focused stack.
+    /// Swaps the focused slot with the neighbour, every tab and the current one; focus follows.
     pub fn swap_slot(&mut self, d: Dir) {
         if let Some((m, to)) = self.neighbour(d) {
             let mon = &mut self.monitors[m];
-            mon.stacks.swap(mon.focus, to);
+            mon.slots.swap(mon.focus, to);
             mon.focus = to;
         }
     }
 
-    /// Stacks keep their order and fill the new slots in sequence; with fewer slots the extras go, in order, on
-    /// top of the last slot's stack; with more, the new slots start empty. Focus is clamped. So a round trip
-    /// through a smaller layout is not an identity: merged stacks stay merged. An unknown monitor or a layout
-    /// with no slots does nothing.
+    /// The focused stack's top window leaves it for a tab of its own right after, made current. Nothing for a
+    /// stack of one or an empty slot.
+    pub fn split(&mut self) {
+        if let Some(slot) = self.focused_slot_mut()
+            && let Some(stack) = slot.current_mut()
+            && stack.len() > 1
+            && let Some(top) = stack.pop()
+        {
+            slot.insert_tab(vec![top]);
+        }
+    }
+
+    /// Slots keep their order and fill the new layout's in sequence; with fewer slots the extras' tabs are
+    /// appended, in order, to the last slot, which keeps its current tab; with more, the new slots start empty.
+    /// Focus is clamped. So a round trip through a smaller layout is not an identity: merged tabs stay merged.
+    /// An unknown monitor or a layout with no slots does nothing.
     pub fn set_layout(&mut self, monitor: &str, l: Layout) {
         let n = l.slots.len();
         let Some(mon) = self.monitors.iter_mut().find(|m| m.name == monitor) else {
@@ -267,78 +410,92 @@ impl Stacks {
             return;
         }
         debug_assert!(l.validate().is_ok(), "set_layout needs a valid layout: {l:?}");
-        let extras: Vec<WinId> = if mon.stacks.len() > n {
-            mon.stacks.drain(n..).flatten().collect()
+        let extras: Vec<Vec<WinId>> = if mon.slots.len() > n {
+            mon.slots.drain(n..).flat_map(|s| s.tabs).collect()
         } else {
             Vec::new()
         };
-        mon.stacks.resize_with(n, Vec::new);
-        mon.stacks[n - 1].extend(extras);
+        mon.slots.resize_with(n, Slot::default);
+        mon.slots[n - 1].tabs.extend(extras);
         mon.focus = mon.focus.min(n - 1);
         mon.layout = l;
     }
 
-    /// Focuses the slot (and monitor) holding `w` and raises `w` to its top: a client asked for focus, or a click.
-    pub fn activate(&mut self, w: WinId) {
-        let Some((m, s, p)) = self.where_is(w) else {
-            return;
+    /// Focuses the slot (and monitor) holding `w` when `w` is what it shows, the top of its current tab, and
+    /// says whether it did. Nothing is ever raised: a window beneath stays there.
+    pub fn focus_window(&mut self, w: WinId) -> bool {
+        let Some((m, s, _, _)) = self.where_is(w) else {
+            return false;
         };
+        if self.monitors[m].slots[s].top() != Some(w) {
+            return false;
+        }
         self.focused_monitor = m;
-        let mon = &mut self.monitors[m];
-        mon.focus = s;
-        let stack = &mut mon.stacks[s];
-        stack.remove(p);
-        stack.push(w);
+        self.monitors[m].focus = s;
+        true
     }
 
-    /// One per non-empty slot: its top window at the slot's rectangle.
+    /// One per non-empty slot: the top of its current tab at the slot's rectangle.
     #[must_use]
     pub fn tiles(&self) -> Vec<Tile> {
         self.placements()
             .filter(|p| p.on_top)
-            .map(|p| Tile {
-                monitor: p.monitor,
-                slot: p.slot,
-                rect: p.rect,
-                win: p.win,
-                focused: p.focused,
-                depth: self.monitors[p.monitor].stacks[p.slot].len(),
+            .map(|p| {
+                let slot = &self.monitors[p.monitor].slots[p.slot];
+                Tile {
+                    monitor: p.monitor,
+                    slot: p.slot,
+                    rect: p.rect,
+                    win: p.win,
+                    focused: p.focused,
+                    tabs: slot.tabs.len(),
+                    depth: slot.tabs[p.tab].len(),
+                    windows: slot.len(),
+                }
             })
             .collect()
     }
 
+    /// The focused slot's top.
     #[must_use]
     pub fn focused_window(&self) -> Option<WinId> {
         let mon = self.monitors.get(self.focused_monitor)?;
-        mon.stacks.get(mon.focus)?.last().copied()
+        mon.slots.get(mon.focus)?.top()
     }
 
-    /// The focused slot's rectangle: where `open` would put a window. A toplevel that has not mapped yet is
-    /// configured to it.
+    /// The focused slot's rectangle: where `open_stacked` would put a window. A toplevel that has not mapped yet
+    /// is configured to it.
     #[must_use]
     pub fn focused_rect(&self) -> Option<Rect> {
         let mon = self.monitors.get(self.focused_monitor)?;
         mon.layout.rects(mon.area).get(mon.focus).copied()
     }
 
-    /// (monitor, slot, position from the bottom) of `w`; None for unknown or pending windows.
+    /// (monitor, slot, tab, position from the bottom) of `w`; None for unknown or pending windows.
     #[must_use]
-    pub fn where_is(&self, w: WinId) -> Option<(usize, usize, usize)> {
+    pub fn where_is(&self, w: WinId) -> Option<(usize, usize, usize, usize)> {
         self.monitors.iter().enumerate().find_map(|(mi, mon)| {
-            mon.stacks
-                .iter()
-                .enumerate()
-                .find_map(|(si, stack)| stack.iter().position(|&x| x == w).map(|p| (mi, si, p)))
+            mon.slots.iter().enumerate().find_map(|(si, slot)| {
+                slot.tabs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ti, stack)| stack.iter().position(|&x| x == w).map(|p| (mi, si, ti, p)))
+            })
         })
+    }
+
+    /// Placed or pending: every open refuses such an id, so a window can never be in two places.
+    fn has(&self, w: WinId) -> bool {
+        self.where_is(w).is_some() || self.pending.contains(&w)
     }
 
     fn index_of(&self, monitor: &str) -> Option<usize> {
         self.monitors.iter().position(|m| m.name == monitor)
     }
 
-    fn focused_stack_mut(&mut self) -> Option<&mut Vec<WinId>> {
+    fn focused_slot_mut(&mut self) -> Option<&mut Slot> {
         let mon = self.monitors.get_mut(self.focused_monitor)?;
-        mon.stacks.get_mut(mon.focus)
+        mon.slots.get_mut(mon.focus)
     }
 
     /// The focused monitor and the slot next to its focused one in `d`.
@@ -346,7 +503,7 @@ impl Stacks {
         let m = self.focused_monitor;
         let mon = self.monitors.get(m)?;
         let to = mon.layout.neighbour(mon.focus, d)?;
-        (to < mon.stacks.len()).then_some((m, to))
+        (to < mon.slots.len()).then_some((m, to))
     }
 }
 
@@ -364,7 +521,7 @@ mod tests {
         assert_eq!(s.focused_rect(), Some(rects[0]));
         s.focus_at("winit", 3);
         assert_eq!(s.focused_rect(), Some(rects[3]));
-        s.open(7);
+        s.open_stacked(7);
         assert_eq!(s.placements().find(|p| p.win == 7).map(|p| p.rect), Some(rects[3]));
         assert_invariants(&s);
     }
@@ -412,15 +569,44 @@ mod tests {
         s
     }
 
-    /// Each id exactly once; every monitor has one stack per slot and its focus in range; tiles and placements
-    /// agree with the stacks and with focus.
+    /// A slot's tabs, bottom to top each.
+    fn tabs(s: &Stacks, m: usize, slot: usize) -> Vec<Vec<WinId>> {
+        s.monitors[m].slots[slot].tabs.clone()
+    }
+
+    fn current(s: &Stacks, m: usize, slot: usize) -> usize {
+        s.monitors[m].slots[slot].current
+    }
+
+    /// Each id exactly once; every monitor has one slot per layout slot and its focus in range; no tab is empty
+    /// and every slot's current tab is in range (0 when it has none); tiles and placements agree with the slots
+    /// and with focus.
     fn assert_invariants(s: &Stacks) {
         let mut seen = BTreeSet::new();
         for m in &s.monitors {
-            assert!(!m.stacks.is_empty(), "{}: no slots", m.name);
-            assert_eq!(m.stacks.len(), m.layout.slots.len(), "{}: stacks vs slots", m.name);
-            assert!(m.focus < m.stacks.len(), "{}: focus {} out of range", m.name, m.focus);
-            for w in m.stacks.iter().flatten() {
+            assert!(!m.slots.is_empty(), "{}: no slots", m.name);
+            assert_eq!(m.slots.len(), m.layout.slots.len(), "{}: slots vs layout", m.name);
+            assert!(m.focus < m.slots.len(), "{}: focus {} out of range", m.name, m.focus);
+            for (i, slot) in m.slots.iter().enumerate() {
+                assert!(
+                    slot.tabs.iter().all(|t| !t.is_empty()),
+                    "{} slot {i}: an empty tab",
+                    m.name
+                );
+                if slot.tabs.is_empty() {
+                    assert_eq!(slot.current, 0, "{} slot {i}: current without tabs", m.name);
+                } else {
+                    assert!(
+                        slot.current < slot.tabs.len(),
+                        "{} slot {i}: current out of range",
+                        m.name
+                    );
+                }
+                assert_eq!(slot.len(), slot.tabs.iter().map(Vec::len).sum::<usize>());
+                assert_eq!(slot.is_empty(), slot.tabs.is_empty());
+                assert_eq!(slot.top(), slot.tabs.get(slot.current).and_then(|t| t.last().copied()));
+            }
+            for w in m.slots.iter().flat_map(|sl| sl.tabs.iter().flatten()) {
                 assert!(seen.insert(*w), "window {w} twice");
             }
         }
@@ -437,11 +623,18 @@ mod tests {
         let non_empty = s
             .monitors
             .iter()
-            .flat_map(|m| &m.stacks)
-            .filter(|st| !st.is_empty())
+            .flat_map(|m| &m.slots)
+            .filter(|sl| !sl.is_empty())
             .count();
         let tiles = s.tiles();
         assert_eq!(tiles.len(), non_empty, "one tile per non-empty slot");
+        for t in &tiles {
+            let slot = &s.monitors[t.monitor].slots[t.slot];
+            assert_eq!(
+                (t.tabs, t.depth, t.windows),
+                (slot.tabs.len(), slot.tabs[slot.current].len(), slot.len())
+            );
+        }
         let focused: Vec<&Tile> = tiles.iter().filter(|t| t.focused).collect();
         assert!(focused.len() <= 1, "{} focused tiles", focused.len());
         assert_eq!(
@@ -457,9 +650,10 @@ mod tests {
             "every placed window once"
         );
         for p in &placements {
-            let (m, sl, pos) = s.where_is(p.win).expect("placed windows are found");
-            assert_eq!((m, sl), (p.monitor, p.slot));
-            assert_eq!(p.on_top, pos + 1 == s.monitors[m].stacks[sl].len());
+            let (m, sl, tab, pos) = s.where_is(p.win).expect("placed windows are found");
+            assert_eq!((m, sl, tab), (p.monitor, p.slot, p.tab));
+            let slot = &s.monitors[m].slots[sl];
+            assert_eq!(p.on_top, tab == slot.current && pos + 1 == slot.tabs[tab].len());
         }
         let tops: Vec<(usize, usize, Rect, WinId, bool)> = placements
             .iter()
@@ -476,20 +670,34 @@ mod tests {
     fn ids(s: &Stacks) -> BTreeSet<WinId> {
         s.monitors
             .iter()
-            .flat_map(|m| m.stacks.iter().flatten())
+            .flat_map(|m| m.slots.iter().flat_map(|sl| sl.tabs.iter().flatten()))
             .chain(&s.pending)
             .copied()
             .collect()
     }
 
+    /// wall with slot 0 holding the tabs [1], [2, 3], [4], the middle one current.
+    fn three_tabs() -> Stacks {
+        let mut s = wall_monitor();
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        s.open_stacked(3);
+        s.open_tab(4, None, None);
+        s.cycle_tab(Cycle::Prev);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 1);
+        assert_invariants(&s);
+        s
+    }
+
     #[test]
-    fn open_puts_the_newest_on_top() {
+    fn open_stacked_puts_the_newest_on_top_of_one_tab() {
         let mut s = wall_monitor();
         for w in 1..=3 {
-            s.open(w);
+            s.open_stacked(w);
             assert_invariants(&s);
         }
-        assert_eq!(s.monitors[0].stacks[0], vec![1, 2, 3]);
+        assert_eq!(tabs(&s, 0, 0), [vec![1, 2, 3]]);
         assert_eq!(s.focused_window(), Some(3));
         let tiles = s.tiles();
         assert_eq!(tiles.len(), 1);
@@ -501,27 +709,133 @@ mod tests {
                 rect: rect(0, 0, 1280, 720),
                 win: 3,
                 focused: true,
+                tabs: 1,
                 depth: 3,
+                windows: 3,
             }
         );
-        assert_eq!(s.where_is(1), Some((0, 0, 0)));
-        assert_eq!(s.where_is(3), Some((0, 0, 2)));
+        assert_eq!(s.where_is(1), Some((0, 0, 0, 0)));
+        assert_eq!(s.where_is(3), Some((0, 0, 0, 2)));
         assert_eq!(s.where_is(9), None);
+    }
+
+    #[test]
+    fn open_stacked_goes_on_the_current_tab() {
+        let mut s = three_tabs();
+        s.open_stacked(5);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3, 5], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 1);
+        assert_eq!(s.focused_window(), Some(5));
+    }
+
+    #[test]
+    fn open_tab_goes_right_after_the_current_tab_and_becomes_current() {
+        let mut s = three_tabs();
+        s.open_tab(5, None, None);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3], vec![5], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 2);
+        assert_eq!(s.focused_window(), Some(5));
+        let tile = s.tiles()[0];
+        assert_eq!((tile.tabs, tile.depth, tile.windows), (4, 1, 5));
+    }
+
+    #[test]
+    fn open_tab_targets_a_slot_and_focuses_it() {
+        let mut s = wall_monitor();
+        s.add_monitor("second", UHD, layout("halves"));
+        s.open_stacked(1);
+        s.open_tab(2, Some("second"), Some(1));
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 1, 1), [vec![2]]);
+        assert_eq!((s.focused_monitor, s.monitors[1].focus), (1, 1));
+        assert_eq!(s.focused_window(), Some(2));
+        // A monitor alone: its focused slot.
+        s.focus_at("winit", 3);
+        s.open_tab(3, Some("second"), None);
+        assert_eq!(tabs(&s, 1, 1), [vec![2], vec![3]]);
+        assert_eq!(s.focused_monitor, 1);
+        // Nothing given: the focused slot.
+        s.open_tab(4, None, None);
+        assert_eq!(tabs(&s, 1, 1), [vec![2], vec![3], vec![4]]);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn open_tab_with_an_unknown_target_uses_the_focused_slot() {
+        let mut s = wall_monitor();
+        s.add_monitor("second", UHD, layout("halves"));
+        s.focus_at("winit", 3);
+        s.open_tab(1, Some("nope"), Some(1));
+        s.open_tab(2, Some("second"), Some(9));
+        s.open_tab(3, None, Some(9));
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 3), [vec![1], vec![2], vec![3]]);
+        assert_eq!((s.focused_monitor, s.monitors[0].focus), (0, 3));
+        // No monitor at all: pending, as any open.
+        let mut none = Stacks::new();
+        none.open_tab(1, Some("nope"), Some(0));
+        assert_eq!(none.pending, [1]);
+        assert_invariants(&none);
+    }
+
+    #[test]
+    fn open_on_puts_a_window_on_its_parents_stack_without_raising_it() {
+        let mut s = three_tabs();
+        s.focus_slot(Dir::Right);
+        s.open_stacked(9);
+        let before = (s.focused_window(), s.monitors[0].focus);
+        // The parent's tab is in the background: the window waits there.
+        assert!(s.open_on(5, 1));
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1, 5], vec![2, 3], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 1);
+        assert_eq!((s.focused_window(), s.monitors[0].focus), before);
+        // On the parent's stack even when the parent is beneath its top.
+        assert!(s.open_on(6, 2));
+        assert_eq!(tabs(&s, 0, 0), [vec![1, 5], vec![2, 3, 6], vec![4]]);
+        assert_eq!(s.tiles()[0].win, 6);
+        assert_eq!(s.focused_window(), Some(9), "focus stays");
+        assert_invariants(&s);
+        // An unknown parent: nothing, for the caller to fall back.
+        let before = s.clone();
+        assert!(!s.open_on(7, 42));
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn opening_an_id_twice_keeps_one() {
+        let mut s = three_tabs();
+        let before = s.clone();
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        assert!(!s.open_on(3, 4));
+        assert!(!s.open_on(4, 4));
+        assert_invariants(&s);
+        assert_eq!(s, before);
+        let mut pending = Stacks::new();
+        pending.open_stacked(1);
+        pending.open_tab(1, None, None);
+        pending.open_stacked(1);
+        assert_eq!(pending.pending, [1]);
     }
 
     #[test]
     fn placements_list_every_placed_window() {
         let mut s = wall_monitor();
-        s.open(1);
-        s.open(2);
+        s.open_stacked(1);
+        s.open_stacked(2);
+        s.open_tab(3, None, None);
         s.focus_slot(Dir::Right);
-        s.open(3);
+        s.open_stacked(4);
         let cell = rect(0, 0, 1280, 720);
         let hero = rect(1280, 0, 2560, 1440);
-        let p = |win, slot, rect, on_top, focused| Placement {
+        let p = |win, slot, tab, rect, on_top, focused| Placement {
             win,
             monitor: 0,
             slot,
+            tab,
             rect,
             on_top,
             focused,
@@ -529,28 +843,19 @@ mod tests {
         assert_eq!(
             s.placements().collect::<Vec<_>>(),
             vec![
-                p(1, 0, cell, false, false),
-                p(2, 0, cell, true, false),
-                p(3, 3, hero, true, true)
+                p(1, 0, 0, cell, false, false),
+                p(2, 0, 0, cell, false, false),
+                p(3, 0, 1, cell, true, false),
+                p(4, 3, 0, hero, true, true)
             ]
         );
         assert_invariants(&s);
     }
 
     #[test]
-    fn opening_an_id_twice_keeps_one() {
-        let mut s = wall_monitor();
-        s.open(1);
-        s.open(2);
-        s.open(1);
-        assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![1, 2]);
-    }
-
-    #[test]
     fn closing_the_top_reveals_the_one_beneath() {
         let mut s = wall_monitor();
-        (1..=3).for_each(|w| s.open(w));
+        (1..=3).for_each(|w| s.open_stacked(w));
         s.close(3);
         assert_invariants(&s);
         assert_eq!(s.focused_window(), Some(2));
@@ -561,17 +866,47 @@ mod tests {
         assert_invariants(&s);
         assert_eq!(s.focused_window(), None);
         assert!(s.tiles().is_empty());
+        assert!(tabs(&s, 0, 0).is_empty(), "the emptied tab went");
         // Closing an unknown id does nothing.
         s.close(42);
         assert_invariants(&s);
     }
 
     #[test]
+    fn closing_the_current_tab_shows_the_next_else_the_previous() {
+        let mut s = three_tabs();
+        s.close(3);
+        s.close(2);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![4]]);
+        assert_eq!(s.focused_window(), Some(4), "the next took its place");
+        s.close(4);
+        assert_invariants(&s);
+        assert_eq!(s.focused_window(), Some(1), "no next: the previous");
+    }
+
+    #[test]
+    fn closing_another_tab_keeps_the_current_one() {
+        let mut s = three_tabs();
+        s.close(1);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![2, 3], vec![4]]);
+        assert_eq!(s.focused_window(), Some(3), "a tab before it went");
+        s.close(4);
+        assert_invariants(&s);
+        assert_eq!(s.focused_window(), Some(3), "a tab after it went");
+        // A window beneath the top of the current tab: the top stays.
+        s.close(2);
+        assert_eq!(tabs(&s, 0, 0), [vec![3]]);
+        assert_invariants(&s);
+    }
+
+    #[test]
     fn closing_elsewhere_keeps_focus() {
         let mut s = wall_monitor();
-        s.open(1);
+        s.open_stacked(1);
         s.focus_slot(Dir::Right);
-        s.open(2);
+        s.open_stacked(2);
         s.close(1);
         assert_invariants(&s);
         assert_eq!(s.monitors[0].focus, 3);
@@ -579,29 +914,31 @@ mod tests {
     }
 
     #[test]
-    fn cycle_next_sends_the_top_to_the_bottom_and_prev_undoes_it() {
-        let mut s = wall_monitor();
-        (1..=3).for_each(|w| s.open(w));
+    fn cycle_tab_walks_the_tabs_and_wraps() {
+        let mut s = three_tabs();
+        let windows = tabs(&s, 0, 0);
         s.cycle_tab(Cycle::Next);
-        assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![3, 1, 2]);
-        assert_eq!(s.focused_window(), Some(2));
+        assert_eq!((current(&s, 0, 0), s.focused_window()), (2, Some(4)));
+        s.cycle_tab(Cycle::Next);
+        assert_eq!((current(&s, 0, 0), s.focused_window()), (0, Some(1)), "wraps forward");
         s.cycle_tab(Cycle::Prev);
-        assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![1, 2, 3]);
-        s.cycle_tab(Cycle::Prev);
-        assert_eq!(s.monitors[0].stacks[0], vec![2, 3, 1]);
-        assert_eq!(s.focused_window(), Some(1));
+        assert_eq!(current(&s, 0, 0), 2, "wraps back");
+        assert_eq!(tabs(&s, 0, 0), windows, "tabs never move");
         assert_invariants(&s);
     }
 
     #[test]
-    fn cycling_an_empty_slot_does_nothing() {
+    fn cycling_one_tab_or_an_empty_slot_does_nothing() {
         let mut s = wall_monitor();
         s.cycle_tab(Cycle::Next);
         s.cycle_tab(Cycle::Prev);
         assert_invariants(&s);
         assert_eq!(s, wall_monitor());
+        (1..=3).for_each(|w| s.open_stacked(w));
+        let before = s.clone();
+        s.cycle_tab(Cycle::Next);
+        s.cycle_tab(Cycle::Prev);
+        assert_eq!(s, before, "one tab, however deep");
     }
 
     #[test]
@@ -628,8 +965,8 @@ mod tests {
         assert_invariants(&s);
         assert_eq!((s.focused_monitor, s.monitors[1].focus), (1, 1));
         // An empty slot can take focus: a new window then opens there.
-        s.open(7);
-        assert_eq!(s.monitors[1].stacks[1], vec![7]);
+        s.open_stacked(7);
+        assert_eq!(tabs(&s, 1, 1), [vec![7]]);
         s.focus_monitor("winit");
         assert_invariants(&s);
         assert_eq!((s.focused_monitor, s.monitors[0].focus), (0, 0));
@@ -645,81 +982,137 @@ mod tests {
     }
 
     #[test]
-    fn move_tab_right_from_top_left_lands_on_the_hero_and_focus_follows() {
+    fn move_stack_takes_the_whole_current_tab_and_focus_follows() {
         let mut s = wall_monitor();
-        (1..=2).for_each(|w| s.open(w));
-        s.move_tab(Dir::Right);
+        (1..=2).for_each(|w| s.open_stacked(w));
+        s.move_stack(Dir::Right);
         assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![1]);
-        assert_eq!(s.monitors[0].stacks[3], vec![2]);
+        assert!(tabs(&s, 0, 0).is_empty());
+        assert_eq!(tabs(&s, 0, 3), [vec![1, 2]]);
         assert_eq!(s.monitors[0].focus, 3);
         assert_eq!(s.focused_window(), Some(2));
         let hero = s.tiles().into_iter().find(|t| t.win == 2).expect("hero tile");
         assert_eq!(hero.rect, rect(1280, 0, 2560, 1440));
         assert!(hero.focused);
-        // Onto an occupied slot: it goes on top.
-        s.focus_slot(Dir::Left);
-        s.move_tab(Dir::Right);
-        assert_eq!(s.monitors[0].stacks[3], vec![2, 1]);
-        assert_invariants(&s);
     }
 
     #[test]
-    fn move_tab_at_the_edge_or_from_an_empty_slot_does_nothing() {
-        let mut s = wall_monitor();
-        s.move_tab(Dir::Right);
-        assert_eq!(s.monitors[0].focus, 0);
-        s.open(1);
-        s.move_tab(Dir::Left);
-        s.move_tab(Dir::Up);
-        assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![1]);
-        assert_eq!(s.monitors[0].focus, 0);
-    }
-
-    #[test]
-    fn swap_slot_swaps_whole_stacks_and_focus_follows() {
-        let mut s = wall_monitor();
-        (1..=2).for_each(|w| s.open(w));
+    fn move_stack_lands_as_a_tab_after_the_neighbours_current() {
+        let mut s = three_tabs();
         s.focus_slot(Dir::Right);
-        s.open(3);
+        s.open_stacked(5);
+        s.open_tab(6, None, None);
+        s.cycle_tab(Cycle::Prev);
+        s.focus_slot(Dir::Left);
+        s.move_stack(Dir::Right);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 3), [vec![5], vec![2, 3], vec![6]]);
+        assert_eq!(current(&s, 0, 3), 1);
+        assert_eq!(s.focused_window(), Some(3));
+        // The source shows the tab that took the moved one's place.
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![4]]);
+        assert_eq!(s.tiles()[0].win, 4);
+    }
+
+    #[test]
+    fn move_stack_at_the_edge_or_from_an_empty_slot_does_nothing() {
+        let mut s = wall_monitor();
+        s.move_stack(Dir::Right);
+        assert_eq!(s.monitors[0].focus, 0);
+        s.open_stacked(1);
+        s.move_stack(Dir::Left);
+        s.move_stack(Dir::Up);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1]]);
+        assert_eq!(s.monitors[0].focus, 0);
+    }
+
+    #[test]
+    fn swap_slot_swaps_whole_slots_and_focus_follows() {
+        let mut s = three_tabs();
+        s.focus_slot(Dir::Right);
+        s.open_stacked(5);
         s.focus_slot(Dir::Left);
         s.swap_slot(Dir::Right);
         assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![3]);
-        assert_eq!(s.monitors[0].stacks[3], vec![1, 2]);
+        assert_eq!(tabs(&s, 0, 0), [vec![5]]);
+        assert_eq!(tabs(&s, 0, 3), [vec![1], vec![2, 3], vec![4]]);
+        assert_eq!(current(&s, 0, 3), 1, "the current tab goes along");
         assert_eq!(s.monitors[0].focus, 3);
-        assert_eq!(s.focused_window(), Some(2));
+        assert_eq!(s.focused_window(), Some(3));
         // At the edge: nothing.
         s.swap_slot(Dir::Up);
         assert_invariants(&s);
         assert_eq!(s.monitors[0].focus, 3);
     }
 
-    /// wall with windows in all six slots: slot i holds [10i+1, 10i+2].
+    #[test]
+    fn split_makes_the_top_a_tab_of_its_own_after_its_stack() {
+        let mut s = three_tabs();
+        s.open_stacked(5);
+        s.split();
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3], vec![5], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 2);
+        assert_eq!(s.focused_window(), Some(5));
+        s.cycle_tab(Cycle::Prev);
+        s.split();
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2], vec![3], vec![5], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 2);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn split_of_one_window_or_an_empty_slot_does_nothing() {
+        let mut s = wall_monitor();
+        s.split();
+        assert_eq!(s, wall_monitor());
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        let before = s.clone();
+        s.split();
+        assert_eq!(s, before);
+        assert_invariants(&s);
+    }
+
+    /// wall with windows in all six slots: slot i holds one tab [10i+1, 10i+2].
     fn full_wall() -> Stacks {
         let mut s = wall_monitor();
         for i in 0..6 {
             s.focus_at("winit", i);
-            s.open(10 * i as u64 + 1);
-            s.open(10 * i as u64 + 2);
+            s.open_stacked(10 * i as u64 + 1);
+            s.open_stacked(10 * i as u64 + 2);
         }
         assert_invariants(&s);
         s
     }
 
     #[test]
-    fn set_layout_merges_extra_stacks_into_the_last_slot() {
+    fn set_layout_appends_the_extra_slots_tabs_to_the_last_slot() {
         let mut s = full_wall();
+        s.focus_at("winit", 1);
+        s.open_tab(13, None, None);
+        s.focus_at("winit", 5);
         s.set_layout("winit", layout("halves"));
         assert_invariants(&s);
         let m = &s.monitors[0];
         assert_eq!(m.layout.name, "halves");
-        assert_eq!(m.stacks[0], vec![1, 2]);
-        assert_eq!(m.stacks[1], vec![11, 12, 21, 22, 31, 32, 41, 42, 51, 52]);
+        assert_eq!(tabs(&s, 0, 0), [vec![1, 2]]);
+        assert_eq!(
+            tabs(&s, 0, 1),
+            [
+                vec![11, 12],
+                vec![13],
+                vec![21, 22],
+                vec![31, 32],
+                vec![41, 42],
+                vec![51, 52]
+            ]
+        );
+        assert_eq!(current(&s, 0, 1), 1, "the last slot's current tab stays");
         // Focus was on slot 5, clamped to the last slot.
-        assert_eq!(m.focus, 1);
-        assert_eq!(s.focused_window(), Some(52));
+        assert_eq!(s.monitors[0].focus, 1);
+        assert_eq!(s.focused_window(), Some(13));
         assert_eq!(
             s.tiles().iter().map(|t| t.rect).collect::<Vec<_>>(),
             vec![rect(0, 0, 1920, 2160), rect(1920, 0, 1920, 2160)]
@@ -727,27 +1120,31 @@ mod tests {
     }
 
     #[test]
+    fn set_layout_into_an_empty_last_slot_shows_the_first_moved_tab() {
+        let mut s = wall_monitor();
+        s.focus_at("winit", 2);
+        s.open_stacked(1);
+        s.focus_at("winit", 3);
+        s.open_stacked(2);
+        s.set_layout("winit", layout("halves"));
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 1), [vec![1], vec![2]]);
+        assert_eq!(s.tiles()[0].win, 1);
+    }
+
+    #[test]
     fn set_layout_round_trip_is_not_an_identity() {
-        // Going back fills the new slots with the stacks in order; the merged stack stays merged in slot 1 and
-        // slots 2..5 come back empty. Nothing is closed, but the original spread is not restored.
+        // Going back fills the new slots in order; the merged tabs stay merged in slot 1 and slots 2..5 come back
+        // empty. Nothing is closed, but the original spread is not restored.
         let mut s = full_wall();
         s.set_layout("winit", layout("halves"));
         s.set_layout("winit", layout("wall"));
         assert_invariants(&s);
-        let m = &s.monitors[0];
-        assert_eq!(m.layout.name, "wall");
-        assert_eq!(
-            m.stacks,
-            vec![
-                vec![1, 2],
-                vec![11, 12, 21, 22, 31, 32, 41, 42, 51, 52],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-            ]
-        );
-        assert_eq!(m.focus, 1);
+        assert_eq!(s.monitors[0].layout.name, "wall");
+        assert_eq!(tabs(&s, 0, 0), [vec![1, 2]]);
+        assert_eq!(tabs(&s, 0, 1).concat(), [11, 12, 21, 22, 31, 32, 41, 42, 51, 52]);
+        assert!((2..6).all(|i| tabs(&s, 0, i).is_empty()));
+        assert_eq!(s.monitors[0].focus, 1);
     }
 
     #[test]
@@ -783,80 +1180,68 @@ mod tests {
     }
 
     #[test]
-    fn activate_focuses_the_slot_and_raises_the_window() {
-        let mut s = wall_monitor();
-        (1..=3).for_each(|w| s.open(w));
-        s.focus_slot(Dir::Right);
-        s.open(4);
-        s.activate(1);
-        assert_invariants(&s);
-        assert_eq!(s.monitors[0].focus, 0);
-        assert_eq!(s.monitors[0].stacks[0], vec![2, 3, 1]);
-        assert_eq!(s.focused_window(), Some(1));
-        s.activate(99);
-        assert_invariants(&s);
-        assert_eq!(s.focused_window(), Some(1));
-    }
-
-    #[test]
-    fn activate_switches_monitor() {
-        let mut s = wall_monitor();
-        s.open(1);
+    fn focus_window_focuses_a_top_and_raises_nothing() {
+        let mut s = three_tabs();
         s.add_monitor("second", UHD, single());
-        assert_eq!(s.focused_monitor, 0);
         s.focus_monitor("second");
-        s.open(2);
-        s.activate(1);
+        s.open_stacked(9);
+        assert!(s.focus_window(3), "the top of the current tab");
         assert_invariants(&s);
-        assert_eq!(s.focused_monitor, 0);
-        assert_eq!(s.focused_window(), Some(1));
-        let focused: Vec<_> = s.tiles().into_iter().filter(|t| t.focused).collect();
-        assert_eq!(focused.len(), 1);
-        assert_eq!(focused[0].win, 1);
+        assert_eq!((s.focused_monitor, s.monitors[0].focus), (0, 0));
+        assert_eq!(s.focused_window(), Some(3));
+        // Beneath its top, in a background tab, or unknown: nothing.
+        s.focus_monitor("second");
+        let before = s.clone();
+        assert!(!s.focus_window(2));
+        assert!(!s.focus_window(4));
+        assert!(!s.focus_window(99));
+        assert_eq!(s, before);
+        assert_invariants(&s);
     }
 
     #[test]
-    fn remove_the_focused_monitor_sends_its_windows_to_the_first() {
+    fn remove_the_focused_monitor_sends_its_tabs_to_the_first() {
         let mut s = wall_monitor();
-        s.open(1);
+        s.open_stacked(1);
         s.add_monitor("second", UHD, layout("halves"));
         s.focus_monitor("second");
-        s.open(2);
-        s.open(3);
+        s.open_stacked(2);
+        s.open_tab(3, None, None);
         s.focus_slot(Dir::Right);
-        s.open(4);
+        s.open_stacked(4);
         s.remove_monitor("second");
         assert_invariants(&s);
         assert_eq!(s.monitors.len(), 1);
         assert_eq!(s.focused_monitor, 0);
-        assert_eq!(s.monitors[0].stacks[0], vec![1, 2, 3, 4]);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2], vec![3], vec![4]]);
+        assert_eq!(s.focused_window(), Some(1), "the current tab stays");
         // Unknown names do nothing.
         s.remove_monitor("nope");
         assert_invariants(&s);
     }
 
     #[test]
-    fn remove_another_monitor_sends_its_windows_to_the_focused_one() {
+    fn remove_another_monitor_sends_its_tabs_to_the_focused_one() {
         let mut s = wall_monitor();
-        s.open(1);
+        s.open_stacked(1);
         s.add_monitor("b", UHD, single());
         s.add_monitor("c", UHD, layout("halves"));
         s.focus_at("c", 1);
-        s.open(2);
+        s.open_stacked(2);
         s.remove_monitor("winit");
         assert_invariants(&s);
         assert_eq!(s.monitors[s.focused_monitor].name, "c");
-        assert_eq!(s.monitors[s.focused_monitor].stacks[1], vec![2, 1]);
-        assert_eq!(s.focused_window(), Some(1));
-        assert!(s.monitors[0].stacks[0].is_empty(), "b got nothing");
+        assert_eq!(tabs(&s, s.focused_monitor, 1), [vec![2], vec![1]]);
+        assert_eq!(s.focused_window(), Some(2));
+        assert!(tabs(&s, 0, 0).is_empty(), "b got nothing");
     }
 
     #[test]
     fn windows_without_a_monitor_wait_for_one() {
         let mut s = Stacks::new();
         assert_invariants(&s);
-        s.open(1);
-        s.open(2);
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
         assert_invariants(&s);
         assert_eq!(s.pending, vec![1, 2]);
         assert_eq!(s.focused_window(), None);
@@ -864,13 +1249,13 @@ mod tests {
         s.close(1);
         s.add_monitor("winit", UHD, layout("wall"));
         assert_invariants(&s);
-        assert_eq!(s.monitors[0].stacks[0], vec![2]);
-        s.open(3);
+        assert_eq!(tabs(&s, 0, 0), [vec![2]]);
+        s.open_tab(3, None, None);
         s.remove_monitor("winit");
         assert_invariants(&s);
         assert_eq!(s.pending, vec![2, 3]);
         s.add_monitor("next", UHD, single());
-        assert_eq!(s.monitors[0].stacks[0], vec![2, 3]);
+        assert_eq!(tabs(&s, 0, 0), [vec![2, 3]], "one tab, as a stack");
         assert_invariants(&s);
     }
 
@@ -888,9 +1273,11 @@ mod tests {
     #[test]
     fn accessors_read_the_state() {
         let mut s = wall_monitor();
-        s.open(1);
+        s.open_stacked(1);
         s.focus_slot(Dir::Right);
-        s.open(2);
+        s.open_stacked(2);
+        s.open_stacked(3);
+        s.open_tab(4, None, None);
         assert_invariants(&s);
         assert_eq!(s.monitors().len(), 1);
         assert_eq!(s.focused_monitor(), 0);
@@ -900,10 +1287,15 @@ mod tests {
         assert_eq!(m.area(), UHD);
         assert_eq!(m.layout().name, "wall");
         assert_eq!(m.focus(), 3);
-        assert_eq!(m.stacks()[0], vec![1]);
-        assert_eq!(m.stacks()[3], vec![2]);
+        assert_eq!(m.slots()[0].tabs(), [vec![1]]);
+        let hero = &m.slots()[3];
+        assert_eq!(hero.tabs(), [vec![2, 3], vec![4]]);
+        assert_eq!((hero.current(), hero.top(), hero.len()), (1, Some(4), 3));
+        assert!(!hero.is_empty());
+        assert!(m.slots()[1].is_empty());
+        assert_eq!(m.slots()[1].top(), None);
         let mut empty = Stacks::new();
-        empty.open(5);
+        empty.open_stacked(5);
         assert_invariants(&empty);
         assert_eq!(empty.pending(), &[5]);
     }
@@ -911,7 +1303,7 @@ mod tests {
     #[test]
     fn set_area_moves_the_tiles() {
         let mut s = wall_monitor();
-        s.open(1);
+        s.open_stacked(1);
         let small = rect(0, 0, 1920, 1080);
         s.set_area("winit", small);
         s.set_area("nope", UHD);
@@ -940,15 +1332,12 @@ mod tests {
         }
     }
 
-    fn all_stacks(s: &Stacks) -> Vec<Vec<Vec<WinId>>> {
-        s.monitors.iter().map(|m| m.stacks.clone()).collect()
-    }
-
-    /// Each stack as a sorted list: what a rotation must keep.
-    fn multisets(s: &Stacks) -> Vec<Vec<Vec<WinId>>> {
-        let mut v = all_stacks(s);
-        v.iter_mut().flatten().for_each(|st| st.sort_unstable());
-        v
+    /// Every slot's tabs: what only focus and current-tab changes must keep.
+    fn all_tabs(s: &Stacks) -> Vec<Vec<Vec<Vec<WinId>>>> {
+        s.monitors
+            .iter()
+            .map(|m| m.slots.iter().map(|sl| sl.tabs.clone()).collect())
+            .collect()
     }
 
     /// One seeded walk of 1,000 operations; returns the most windows open at once.
@@ -985,11 +1374,17 @@ mod tests {
             let op = if live.len() > 12 && rng.below(2) == 0 {
                 3
             } else {
-                rng.below(14)
+                rng.below(18)
             };
             match op {
-                0..=2 => {
-                    s.open(next_id);
+                0 | 1 => {
+                    s.open_stacked(next_id);
+                    live.insert(next_id);
+                    next_id += 1;
+                }
+                2 => {
+                    let m = name(&mut rng, &s);
+                    s.open_tab(next_id, Some(&m), Some(rng.below(7) as usize));
                     live.insert(next_id);
                     next_id += 1;
                 }
@@ -1000,23 +1395,22 @@ mod tests {
                 }
                 4 => {
                     s.focus_slot(rng.dir());
-                    assert_eq!(
-                        all_stacks(&s),
-                        all_stacks(&before),
-                        "seed {seed} step {step}: focus_slot moved"
-                    );
+                    assert_eq!(all_tabs(&s), all_tabs(&before), "seed {seed} step {step}: focus_slot");
                 }
                 5 => {
                     s.cycle_tab(if rng.below(2) == 0 { Cycle::Next } else { Cycle::Prev });
-                    assert_eq!(multisets(&s), multisets(&before), "seed {seed} step {step}: cycle_tab");
+                    assert_eq!(all_tabs(&s), all_tabs(&before), "seed {seed} step {step}: cycle_tab");
                 }
-                6 => s.move_tab(rng.dir()),
+                6 => s.move_stack(rng.dir()),
                 7 => s.swap_slot(rng.dir()),
                 8 => {
                     let m = name(&mut rng, &s);
                     s.set_layout(&m, layouts[rng.below(3) as usize].clone());
                 }
-                9 => s.activate(pick(&mut rng, &live)),
+                9 => {
+                    s.focus_window(pick(&mut rng, &live));
+                    assert_eq!(all_tabs(&s), all_tabs(&before), "seed {seed} step {step}: focus_window");
+                }
                 10 => {
                     next_monitor += 1;
                     let l = layouts[rng.below(3) as usize].clone();
@@ -1030,10 +1424,20 @@ mod tests {
                     let m = name(&mut rng, &s);
                     s.focus_at(&m, rng.below(7) as usize);
                 }
-                _ => {
+                13 => {
                     let m = name(&mut rng, &s);
                     s.focus_monitor(&m);
                 }
+                14 | 15 => {
+                    let parent = pick(&mut rng, &live);
+                    if s.open_on(next_id, parent) {
+                        live.insert(next_id);
+                        next_id += 1;
+                    } else {
+                        assert_eq!(s, before, "seed {seed} step {step}: refused open_on changed things");
+                    }
+                }
+                _ => s.split(),
             }
             assert_invariants(&s);
             assert_eq!(ids(&s), live, "seed {seed} step {step}");

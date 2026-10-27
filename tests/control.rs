@@ -118,23 +118,21 @@ fn focus_slot_moves_focus_and_new_windows_open_there() {
 }
 
 #[test]
-fn move_tab_takes_the_top_to_the_neighbour() {
+fn move_tab_takes_the_whole_stack_to_the_neighbour() {
     let (orrery, mut client) = start();
     let [a, b, c] = open_three(&mut client);
     orrery.msg_ok(&["move-tab", "right"]);
     let hero = size(rects("wall")[3]);
-    let ok = client.wait_for(|s| {
-        s.windows[c].size == hero && s.windows[c].activated() && s.windows[b].mapped() && !s.windows[b].activated()
-    });
+    let ok = client.wait_for(|s| s.windows.iter().all(|w| w.size == hero) && s.windows[c].activated());
     assert!(
         ok,
-        "c moved to the hero with focus, b shows in slot 0: {:#?}",
+        "the stack moved to the hero with focus: {:#?}",
         client.state.windows
     );
-    assert!(!client.window(a).mapped());
+    assert!(!client.window(a).mapped() && !client.window(b).mapped());
     let state = orrery.state();
-    assert_eq!(tabs(&state)[0], strs(&["a", "b"]));
-    assert_eq!(tabs(&state)[3], strs(&["c"]));
+    assert!(tabs(&state)[0].is_empty());
+    assert_eq!(tabs(&state)[3], strs(&["a", "b", "c"]));
     assert_eq!(focused_slot(&state), Some(3));
     drop(client);
     assert!(orrery.stop().success());
@@ -156,19 +154,29 @@ fn swap_slot_swaps_whole_stacks() {
 }
 
 #[test]
-fn cycle_tab_rotates_the_focused_stack() {
+fn cycle_tab_shows_the_next_tab_and_moves_nothing() {
     let (orrery, mut client) = start();
-    let [a, b, c] = open_three(&mut client);
+    let a = client.create_window("a", "A");
+    let b = client.create_window("b", "B");
+    assert!(client.wait_for(|s| s.windows[b].mapped() && !s.windows[a].mapped()));
+    // One tab, however deep: nothing to cycle.
+    orrery.msg_ok(&["cycle-tab", "next"]);
+    client.roundtrip();
+    assert!(client.window(b).mapped() && !client.window(a).mapped());
+    // The hero gets two tabs, [a, b] and [c], the second current.
+    orrery.msg_ok(&["move-tab", "right"]);
+    orrery.msg_ok(&["focus-slot", "left"]);
+    let c = client.create_window("c", "C");
+    assert!(client.wait_for(|s| s.windows[c].mapped()));
+    orrery.msg_ok(&["move-tab", "right"]);
+    let hero = size(rects("wall")[3]);
+    assert!(client.wait_for(|s| s.windows[c].size == hero && s.windows[c].activated() && !s.windows[b].mapped()));
     orrery.msg_ok(&["cycle-tab", "next"]);
     assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated() && !s.windows[c].mapped()));
-    assert_eq!(
-        tabs(&orrery.state())[0],
-        strs(&["c", "a", "b"]),
-        "next: the top goes to the bottom"
-    );
+    assert_eq!(tabs(&orrery.state())[3], strs(&["a", "b", "c"]), "tabs never move");
     orrery.msg_ok(&["cycle-tab", "prev"]);
-    assert!(client.wait_for(|s| s.windows[c].mapped() && s.windows[c].activated() && !s.windows[a].mapped()));
-    assert_eq!(tabs(&orrery.state())[0], strs(&["a", "b", "c"]));
+    assert!(client.wait_for(|s| s.windows[c].mapped() && s.windows[c].activated() && !s.windows[b].mapped()));
+    assert!(!client.window(a).mapped());
     drop(client);
     assert!(orrery.stop().success());
 }

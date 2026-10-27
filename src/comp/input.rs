@@ -166,7 +166,7 @@ pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
 pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
     let (name, slot) = slot_at(stacks, x, y)?;
     let mon = stacks.monitors().iter().find(|m| m.name() == name)?;
-    let top = *mon.stacks().get(slot)?.last()?;
+    let top = mon.slots().get(slot)?.top()?;
     let rect = *mon.layout().rects(mon.area()).get(slot)?;
     Some((top, rect))
 }
@@ -496,10 +496,10 @@ mod tests {
         let rects = wall.rects(area);
         let mut s = Stacks::new();
         s.add_monitor("m", area, wall);
-        s.open(1);
-        s.open(2);
+        s.open_stacked(1);
+        s.open_stacked(2);
         s.focus_slot(Dir::Right);
-        s.open(3);
+        s.open_stacked(3);
         assert_eq!(top_at(&s, 10, 10), Some((2, rects[0])), "the top of slot 0");
         // Just across slot 0's right edge is the hero, whatever slot 0's window drew there.
         assert_eq!(top_at(&s, rects[0].w, 10), Some((3, rects[3])));
