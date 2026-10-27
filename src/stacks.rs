@@ -1,11 +1,12 @@
 //! Workspaces of slots, slots of tabs, tabs of stacked windows: the state machine behind every window move.
 //!
-//! Pure: windows are opaque ids, monitors are names with an area. Each monitor shows one workspace. With N
-//! monitors, workspaces 1..=N are locked to monitors 1..=N and always exist; any other lives on the monitor it was
-//! made on and goes away once it is not shown and holds no window. Every operation acts on the focused monitor's
-//! shown workspace unless it names another, keeps each window in exactly one place, and does nothing when it
-//! cannot apply (an edge, an empty slot, an unknown id). The state is private so nothing outside these methods can
-//! break that; callers read it through accessors.
+//! Pure: windows are opaque ids, monitors are numbered names with an area (a screen keeps its number while it
+//! lives; a new one takes the lowest free). Each monitor shows one workspace. Workspace k is locked to the screen
+//! numbered k while that screen exists, and exists meanwhile; any other lives on the monitor it was made on (or was
+//! moved to when its screen went) and goes away once it is not locked, not shown and holds no window. Every
+//! operation acts on the focused monitor's shown workspace unless it names another, keeps each window in exactly
+//! one place, and does nothing when it cannot apply (an edge, an empty slot, an unknown id). The state is private
+//! so nothing outside these methods can break that; callers read it through accessors.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +15,7 @@ use crate::layout::{Dir, Layout, Rect};
 
 pub type WinId = u64;
 
-/// Workspaces are numbered 1..=WORKSPACES. A monitor past that many has no workspace to lock and is ignored.
+/// Workspaces and screens are numbered 1..=WORKSPACES. A monitor past that many has no number and is ignored.
 pub const WORKSPACES: u8 = 10;
 
 /// One layout slot: its tabs, left to right, each a stack of windows (bottom to top), and the one shown. Only
@@ -31,7 +32,7 @@ pub struct Slot {
 pub struct Workspace {
     /// 1..=WORKSPACES.
     number: u8,
-    /// The monitor it lives on, by index: the one it is locked to, else the one it was made on.
+    /// The monitor it lives on, by index: the one it is locked to, else the one it was made on or moved to.
     monitor: usize,
     layout: Layout,
     /// One per layout slot, in slot order.
@@ -43,6 +44,8 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
     name: String,
+    /// Its screen number, 1..=WORKSPACES, kept while it lives; it locks the workspace of that number.
+    number: u8,
     area: Rect,
     /// What a workspace made on this monitor starts with.
     default_layout: Layout,
@@ -52,6 +55,7 @@ pub struct Monitor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Stacks {
+    /// In number order.
     monitors: Vec<Monitor>,
     /// The workspaces that exist, by number; none without a monitor.
     workspaces: Vec<Workspace>,
@@ -219,6 +223,11 @@ impl Monitor {
     }
 
     #[must_use]
+    pub fn number(&self) -> u8 {
+        self.number
+    }
+
+    #[must_use]
     pub fn area(&self) -> Rect {
         self.area
     }
@@ -328,31 +337,57 @@ impl Stacks {
         Self::default()
     }
 
-    /// Adds an output as monitor N+1, which locks workspace N+1 and shows it: moved here if it lived on another
-    /// monitor (which then shows its own locked one), else made from `default_layout`. Pending windows move into
-    /// it, as one tab of its first slot. Layouts must be valid (`Layout::validate`); one with no slots, a name
-    /// already present or a monitor past `WORKSPACES` is ignored.
+    /// Adds an output as the screen numbered the lowest number free, k, which locks workspace k and shows it:
+    /// moved here intact if it lived on another monitor (which, if it showed it, then shows its lowest remaining
+    /// one), else made from `default_layout`. Nothing else moves. Pending windows move into it, as one tab of its
+    /// first slot. Layouts must be valid (`Layout::validate`); one with no slots, a name already present or a
+    /// monitor past `WORKSPACES` is ignored.
     pub fn add_monitor(&mut self, name: &str, area: Rect, default_layout: Layout) {
+        let free = (1..=WORKSPACES).find(|&k| self.monitors.iter().all(|m| m.number != k));
         // Zero slots would break "one slot per layout slot" even in release; anything else invalid is a caller
         // bug.
-        if default_layout.slots.is_empty()
-            || self.monitors.len() >= usize::from(WORKSPACES)
-            || self.monitors.iter().any(|m| m.name == name)
-        {
+        let Some(number) = free.filter(|_| !default_layout.slots.is_empty()) else {
+            return;
+        };
+        if self.monitors.iter().any(|m| m.name == name) {
             return;
         }
         debug_assert!(
             default_layout.validate().is_ok(),
             "add_monitor needs a valid layout: {default_layout:?}"
         );
-        let number = self.monitors.len() as u8 + 1;
-        self.monitors.push(Monitor {
+        // Monitors stay in number order, so the ones after it shift up.
+        let at = self.monitors.partition_point(|m| m.number < number);
+        for w in &mut self.workspaces {
+            if w.monitor >= at {
+                w.monitor += 1;
+            }
+        }
+        if !self.monitors.is_empty() && self.focused_monitor >= at {
+            self.focused_monitor += 1;
+        }
+        let monitor = Monitor {
             name: name.to_owned(),
+            number,
             area,
             default_layout,
             shown: number,
-        });
-        self.lock();
+        };
+        self.monitors.insert(at, monitor);
+        match self.index_of_workspace(number) {
+            Some(wi) => {
+                let from = self.workspaces[wi].monitor;
+                self.workspaces[wi].monitor = at;
+                if self.monitors[from].shown == number {
+                    // Its own locked workspace is there at least.
+                    let lowest = self.workspaces.iter().find(|w| w.monitor == from);
+                    self.monitors[from].shown = lowest.map_or(self.monitors[from].number, |w| w.number);
+                }
+            }
+            None => {
+                self.make_workspace(number, at);
+            }
+        }
         let pending = std::mem::take(&mut self.pending);
         if !pending.is_empty()
             && let Some(wi) = self.index_of_workspace(number)
@@ -362,11 +397,9 @@ impl Stacks {
         self.settle();
     }
 
-    /// Its workspaces go with it, and the monitors after it shift down, so the locks are renumbered (see `lock`).
-    /// Then their tabs (workspace by workspace in number order, slot by slot) are appended to the focused
-    /// monitor's shown workspace's focused slot, or the first monitor's when the focused one is the one removed;
-    /// that slot keeps showing its current tab. With no monitor left their windows go to `pending`. The focused
-    /// monitor is where the user is looking, so orphans land in sight.
+    /// Its workspaces move intact (tabs, layout, focused slot) to the focused monitor, or the first one when the
+    /// focused one is the one removed, hidden there: that monitor keeps showing what it shows, and nothing else
+    /// moves. With no monitor left their windows go to `pending`, workspace by workspace in number order.
     pub fn remove_monitor(&mut self, name: &str) {
         let Some(i) = self.index_of(name) else {
             return;
@@ -377,23 +410,18 @@ impl Stacks {
         } else if self.focused_monitor == i {
             self.focused_monitor = 0;
         }
-        let (gone, kept): (Vec<Workspace>, Vec<Workspace>) = std::mem::take(&mut self.workspaces)
-            .into_iter()
-            .partition(|w| w.monitor == i);
-        self.workspaces = kept;
-        for w in &mut self.workspaces {
-            if w.monitor > i {
-                w.monitor -= 1;
+        if self.monitors.is_empty() {
+            let workspaces = std::mem::take(&mut self.workspaces);
+            let windows = workspaces.into_iter().flat_map(|w| w.slots).flat_map(|s| s.tabs);
+            self.pending.extend(windows.flatten());
+        } else {
+            for w in &mut self.workspaces {
+                if w.monitor == i {
+                    w.monitor = self.focused_monitor;
+                } else if w.monitor > i {
+                    w.monitor -= 1;
+                }
             }
-        }
-        self.lock();
-        let tabs = gone.into_iter().flat_map(|w| w.slots).flat_map(|s| s.tabs);
-        match self.focused_index() {
-            Some(wi) => {
-                let ws = &mut self.workspaces[wi];
-                ws.slots[ws.focus].tabs.extend(tabs);
-            }
-            None => self.pending.extend(tabs.flatten()),
         }
         self.settle();
     }
@@ -567,31 +595,50 @@ impl Stacks {
         self.settle();
     }
 
-    /// Lays out the workspace `monitor` shows; the others keep theirs. Slots keep their order and fill the new
-    /// layout's in sequence; with fewer slots the extras' tabs are appended, in order, to the last slot, which
-    /// keeps its current tab; with more, the new slots start empty. Focus is clamped. So a round trip through a
-    /// smaller layout is not an identity: merged tabs stay merged. An unknown monitor or a layout with no slots
-    /// does nothing.
+    /// Lays out the workspace `monitor` shows (see `set_workspace_layout`); the others keep theirs. An unknown
+    /// monitor does nothing.
     pub fn set_layout(&mut self, monitor: &str, l: Layout) {
-        let n = l.slots.len();
-        let Some(wi) = self.index_of(monitor).and_then(|m| self.shown_index(m)) else {
+        if let Some(m) = self.index_of(monitor) {
+            self.set_workspace_layout(self.monitors[m].shown, l);
+        }
+    }
+
+    /// Lays out workspace `n`, shown or not. Slots keep their order and fill the new layout's in sequence; with
+    /// fewer slots the extras' tabs are appended, in order, to the last slot, which keeps its current tab; with
+    /// more, the new slots start empty. Focus is clamped. So a round trip through a smaller layout is not an
+    /// identity: merged tabs stay merged. An unknown workspace or a layout with no slots does nothing.
+    pub fn set_workspace_layout(&mut self, n: u8, l: Layout) {
+        let count = l.slots.len();
+        let Some(wi) = self.index_of_workspace(n) else {
             return;
         };
-        if n == 0 {
+        if count == 0 {
             return;
         }
         debug_assert!(l.validate().is_ok(), "set_layout needs a valid layout: {l:?}");
         let ws = &mut self.workspaces[wi];
-        let extras: Vec<Vec<WinId>> = if ws.slots.len() > n {
-            ws.slots.drain(n..).flat_map(|s| s.tabs).collect()
+        let extras: Vec<Vec<WinId>> = if ws.slots.len() > count {
+            ws.slots.drain(count..).flat_map(|s| s.tabs).collect()
         } else {
             Vec::new()
         };
-        ws.slots.resize_with(n, Slot::default);
-        ws.slots[n - 1].tabs.extend(extras);
-        ws.focus = ws.focus.min(n - 1);
+        ws.slots.resize_with(count, Slot::default);
+        ws.slots[count - 1].tabs.extend(extras);
+        ws.focus = ws.focus.min(count - 1);
         ws.layout = l;
         self.settle();
+    }
+
+    /// What workspaces made on `monitor` from now on start with; those that exist keep theirs. An unknown monitor
+    /// or a layout with no slots does nothing.
+    pub fn set_default_layout(&mut self, monitor: &str, l: Layout) {
+        if l.slots.is_empty() {
+            return;
+        }
+        debug_assert!(l.validate().is_ok(), "set_default_layout needs a valid layout: {l:?}");
+        if let Some(m) = self.index_of(monitor) {
+            self.monitors[m].default_layout = l;
+        }
     }
 
     /// Focuses the slot (and monitor) holding `w` when `w` is what it shows, the top of its current tab in a shown
@@ -713,10 +760,10 @@ impl Stacks {
     /// a shown workspace ends with this (their early returns change nothing); the random walk checks both rules
     /// after every operation, so a method that forgets it fails there.
     fn settle(&mut self) {
-        let locked = self.monitors.len();
         let monitors = &self.monitors;
+        let locked = |n: u8| monitors.iter().any(|m| m.number == n);
         self.workspaces
-            .retain(|w| usize::from(w.number) <= locked || monitors[w.monitor].shown == w.number || !w.is_empty());
+            .retain(|w| locked(w.number) || monitors[w.monitor].shown == w.number || !w.is_empty());
         if self.attention.is_empty() {
             return;
         }
@@ -727,28 +774,6 @@ impl Stacks {
                 Mark::Unfocused => !p.focused,
             })
         });
-    }
-
-    /// Restores the locks: workspace k ≤ N lives on monitor k, moved there from wherever it was or made from that
-    /// monitor's default layout; then a monitor whose shown workspace is no longer on it shows its locked one,
-    /// which is also the lowest it has. Workspaces left unlocked, hidden and empty go in `settle`.
-    fn lock(&mut self) {
-        for m in 0..self.monitors.len() {
-            let n = m as u8 + 1;
-            match self.index_of_workspace(n) {
-                Some(wi) => self.workspaces[wi].monitor = m,
-                None => {
-                    self.make_workspace(n, m);
-                }
-            }
-        }
-        for m in 0..self.monitors.len() {
-            let on_it =
-                (self.index_of_workspace(self.monitors[m].shown)).is_some_and(|wi| self.workspaces[wi].monitor == m);
-            if !on_it {
-                self.monitors[m].shown = m as u8 + 1;
-            }
-        }
     }
 
     /// A fresh workspace `n` on monitor `m` from its default layout, in number order; its index.
@@ -908,21 +933,20 @@ mod tests {
         shown(s, m).slots[slot].current
     }
 
-    /// Each id exactly once; workspaces 1..=N exist, each locked to its monitor, numbered within range and in
-    /// order; each monitor shows one workspace on it; no workspace is unlocked, hidden and empty; every workspace
-    /// has one slot per layout slot and its focus in range; no tab is empty and every slot's current tab is in range
-    /// (0 when it has none); tiles and placements agree with the slots, with what is shown and with focus.
+    /// Each id exactly once; screen numbers unique, in range and in order; workspace numbers too; workspace k
+    /// exists on the screen numbered k for every screen; each monitor shows one workspace on it; no workspace is
+    /// unlocked, hidden and empty; every workspace has one slot per layout slot and its focus in range; no tab is
+    /// empty and every slot's current tab is in range (0 when it has none); tiles and placements agree with the
+    /// slots, with what is shown and with focus.
     fn assert_invariants(s: &Stacks) {
         let n = s.monitors.len();
-        assert!(n <= usize::from(WORKSPACES), "{n} monitors");
+        let in_order = |k: &[u8]| k.windows(2).all(|p| p[0] < p[1]) && k.iter().all(|k| (1..=WORKSPACES).contains(k));
+        let screens = numbers(s);
+        assert!(in_order(&screens), "screen numbers {screens:?}");
         let numbers: Vec<u8> = s.workspaces.iter().map(|w| w.number).collect();
-        assert!(
-            numbers.windows(2).all(|p| p[0] < p[1]),
-            "workspaces out of order: {numbers:?}"
-        );
-        assert!(numbers.iter().all(|k| (1..=WORKSPACES).contains(k)), "{numbers:?}");
+        assert!(in_order(&numbers), "workspace numbers {numbers:?}");
         for (m, mon) in s.monitors.iter().enumerate() {
-            let locked = s.workspaces.iter().find(|w| usize::from(w.number) == m + 1);
+            let locked = s.workspaces.iter().find(|w| w.number == mon.number);
             assert_eq!(locked.map(|w| w.monitor), Some(m), "{}: its locked workspace", mon.name);
             let shown = s.workspaces.iter().find(|w| w.number == mon.shown);
             assert_eq!(
@@ -939,7 +963,7 @@ mod tests {
             assert!(w.monitor < n, "{name}: monitor {} out of range", w.monitor);
             let shown = s.monitors[w.monitor].shown == w.number;
             assert!(
-                usize::from(w.number) <= n || shown || !w.is_empty(),
+                screens.contains(&w.number) || shown || !w.is_empty(),
                 "{name}: unlocked, hidden and empty"
             );
             assert!(!w.slots.is_empty(), "{name}: no slots");
@@ -1636,28 +1660,41 @@ mod tests {
     }
 
     #[test]
-    fn remove_the_focused_monitor_sends_its_tabs_to_the_first() {
+    fn removing_the_focused_screen_moves_its_workspaces_intact_to_the_first_hidden() {
         let mut s = wall_monitor();
         s.open_stacked(1);
-        s.add_monitor("second", UHD, layout("halves"));
+        s.add_monitor("second", SIDE, layout("halves"));
         s.focus_monitor("second");
         s.open_stacked(2);
         s.open_tab(3, None, None);
         s.focus_slot(Dir::Right);
         s.open_stacked(4);
+        let moved = shown(&s, 1).clone();
         s.remove_monitor("second");
         assert_invariants(&s);
         assert_eq!(s.monitors.len(), 1);
         assert_eq!(s.focused_monitor, 0);
-        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2], vec![3], vec![4]]);
-        assert_eq!(s.focused_window(), Some(1), "the current tab stays");
-        // Unknown names do nothing.
-        s.remove_monitor("nope");
+        assert_eq!(workspaces(&s), [(1, 0), (2, 0)]);
+        assert_eq!(shown_numbers(&s), [1], "it keeps showing what it shows");
+        let w = &s.workspaces[1];
+        assert_eq!(
+            (&w.layout, &w.slots, w.focus),
+            (&moved.layout, &moved.slots, moved.focus),
+            "intact"
+        );
+        assert_eq!(s.focused_window(), Some(1));
+        assert!(!placement(&s, 4).shown);
+        s.workspace(2);
+        assert_eq!(s.focused_window(), Some(4));
         assert_invariants(&s);
+        // Unknown names do nothing.
+        let before = s.clone();
+        s.remove_monitor("nope");
+        assert_eq!(s, before);
     }
 
     #[test]
-    fn remove_another_monitor_sends_its_tabs_to_the_focused_one() {
+    fn removing_another_screen_moves_its_workspaces_to_the_focused_one() {
         let mut s = wall_monitor();
         s.open_stacked(1);
         s.add_monitor("b", UHD, single());
@@ -1666,10 +1703,11 @@ mod tests {
         s.open_stacked(2);
         s.remove_monitor("winit");
         assert_invariants(&s);
-        assert_eq!(s.monitors[s.focused_monitor].name, "c");
-        assert_eq!(tabs(&s, s.focused_monitor, 1), [vec![2], vec![1]]);
+        assert_eq!(numbers(&s), [2, 3]);
+        assert_eq!(workspaces(&s), [(1, 1), (2, 0), (3, 1)]);
+        assert_eq!(shown_numbers(&s), [2, 3], "nothing else moves");
+        assert_eq!(ws_tabs(&s, 1, 0), [vec![1]]);
         assert_eq!(s.focused_window(), Some(2));
-        assert!(tabs(&s, 0, 0).is_empty(), "b got nothing");
     }
 
     #[test]
@@ -1860,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_merges_and_monitor_loss_clear_what_they_show() {
+    fn layout_merges_clear_what_they_show_and_monitor_loss_only_pending() {
         // Slot 4 holds the tabs [1], [2, 3], the second current; 1 and 2 are marked.
         let mut s = wall_monitor();
         s.focus_at("winit", 4);
@@ -1876,17 +1914,11 @@ mod tests {
         assert!(!s.is_marked(1) && s.is_marked(2));
         assert_invariants(&s);
 
-        // The same when a monitor's tabs land in an empty focused slot.
-        s.focus_at("winit", 1);
-        s.cycle_tab(Cycle::Next);
-        s.mark(1);
-        assert!(s.is_marked(1));
-        s.add_monitor("other", UHD, layout("wall"));
+        // A screen lost hides its workspaces: what was marked stays marked.
+        s.add_monitor("other", SIDE, layout("wall"));
         s.focus_monitor("other");
         s.remove_monitor("winit");
-        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3]]);
-        assert_eq!(current(&s, 0, 0), 0);
-        assert!(!s.is_marked(1) && s.is_marked(2));
+        assert!(s.is_marked(2) && !placement(&s, 2).shown);
         assert_invariants(&s);
 
         // With no monitor left the windows wait in `pending`, which holds no marks.
@@ -1908,6 +1940,11 @@ mod tests {
     /// Every existing workspace as (number, monitor).
     fn workspaces(s: &Stacks) -> Vec<(u8, usize)> {
         s.workspaces.iter().map(|w| (w.number, w.monitor)).collect()
+    }
+
+    /// Each monitor's number.
+    fn numbers(s: &Stacks) -> Vec<u8> {
+        s.monitors.iter().map(|m| m.number).collect()
     }
 
     /// What each monitor shows.
@@ -2061,8 +2098,8 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_monitors_workspaces_land_in_sight_and_locks_are_renumbered() {
-        // a: 1 shows [1], 4 hides [4]; b: 2 shows [2]; c: 3 shows [3]. b has focus.
+    fn screens_keep_their_numbers_and_the_lowest_free_one_is_reused() {
+        // winit (1): 1 shows [1], 4 hides [4]; b (2): 2 shows [2]; c (3): 3 shows [3]. b has focus.
         let mut s = wall_monitor();
         s.add_monitor("b", SIDE, layout("halves"));
         s.add_monitor("c", UHD, single());
@@ -2076,19 +2113,65 @@ mod tests {
         s.open_stacked(2);
         s.remove_monitor("winit");
         assert_invariants(&s);
-        // b is monitor 0 now and locks 1, made fresh there; 2 moves on to c, hidden; c keeps showing 3.
-        assert_eq!(workspaces(&s), [(1, 0), (2, 1), (3, 1)]);
-        assert_eq!(shown_numbers(&s), [1, 3]);
-        assert_eq!(s.workspaces[0].layout.name, "halves", "b's default");
-        assert_eq!(ws_tabs(&s, 2, 0), [vec![2]]);
-        // The removed tabs, workspace by workspace, in b's shown workspace's focused slot.
-        assert_eq!(ws_tabs(&s, 1, 0), [vec![1], vec![4]]);
-        assert_eq!((s.focused_monitor, s.focused_window()), (0, Some(1)));
-        // c goes: 2 and 3 (and their windows) come to b's 1.
-        s.remove_monitor("c");
+        // b keeps 2 and c keeps 3; winit's 1 and 4 go to b, hidden and intact.
+        assert_eq!(numbers(&s), [2, 3]);
+        assert_eq!(workspaces(&s), [(1, 0), (2, 0), (3, 1), (4, 0)]);
+        assert_eq!(shown_numbers(&s), [2, 3]);
+        assert_eq!((ws_tabs(&s, 1, 0), ws_tabs(&s, 4, 0)), (vec![vec![1]], vec![vec![4]]));
+        assert_eq!(s.workspaces[0].layout.name, "wall");
+        assert_eq!((s.focused_monitor, s.focused_window()), (0, Some(2)));
+        // A new screen takes the lowest free number and its workspace, shown; b keeps showing 2, focus stays.
+        s.add_monitor("d", UHD, single());
         assert_invariants(&s);
-        assert_eq!(workspaces(&s), [(1, 0)]);
-        assert_eq!(ws_tabs(&s, 1, 0), [vec![1], vec![4], vec![2], vec![3]]);
+        assert_eq!(numbers(&s), [1, 2, 3], "monitors in number order");
+        assert_eq!(s.monitors[0].name, "d");
+        assert_eq!(workspaces(&s), [(1, 0), (2, 1), (3, 2), (4, 1)]);
+        assert_eq!(shown_numbers(&s), [1, 2, 3]);
+        assert_eq!(s.workspaces[0].layout.name, "wall", "it keeps its own layout");
+        assert_eq!((s.focused_monitor, s.focused_window()), (1, Some(2)));
+        // The screen a workspace is taken from while showing it shows its lowest remaining one.
+        s.remove_monitor("d");
+        s.workspace(1);
+        s.focus_monitor("c");
+        s.add_monitor("e", UHD, single());
+        assert_invariants(&s);
+        assert_eq!(numbers(&s), [1, 2, 3]);
+        assert_eq!(shown_numbers(&s), [1, 2, 3]);
+        assert!(placement(&s, 1).shown);
+        // The last screen goes: every window waits.
+        for name in ["b", "c", "e"] {
+            s.remove_monitor(name);
+            assert_invariants(&s);
+        }
+        assert_eq!(s.pending, [1, 2, 3, 4]);
+        assert!(s.workspaces.is_empty());
+    }
+
+    #[test]
+    fn set_workspace_layout_reaches_a_hidden_one_and_set_default_layout_the_next_made() {
+        let mut s = wall_monitor();
+        s.workspace(2);
+        s.open_stacked(1);
+        s.workspace(1);
+        s.set_workspace_layout(2, layout("halves"));
+        assert_invariants(&s);
+        assert_eq!(s.workspaces[1].layout.name, "halves");
+        assert_eq!(s.workspaces[0].layout.name, "wall");
+        assert_eq!(shown_numbers(&s), [1]);
+        let mut empty = single();
+        empty.slots.clear();
+        let before = s.clone();
+        s.set_workspace_layout(3, single());
+        s.set_workspace_layout(2, empty.clone());
+        s.set_default_layout("nope", single());
+        s.set_default_layout("winit", empty);
+        assert_eq!(s, before);
+        s.set_default_layout("winit", single());
+        assert_eq!(s.monitors[0].default_layout.name, "single");
+        assert_eq!(s.workspaces[0].layout.name, "wall", "what exists keeps its layout");
+        s.workspace(5);
+        assert_eq!(shown(&s, 0).layout.name, "single");
+        assert_invariants(&s);
     }
 
     #[test]
@@ -2282,6 +2365,14 @@ mod tests {
             .collect()
     }
 
+    /// Each workspace holding a window, and the name of the monitor it lives on.
+    fn homes(s: &Stacks) -> BTreeMap<u8, String> {
+        (s.workspaces.iter())
+            .filter(|w| !w.is_empty())
+            .map(|w| (w.number, s.monitors[w.monitor].name.clone()))
+            .collect()
+    }
+
     /// One seeded walk of 1,000 operations; returns the most windows open at once, the steps ending with a mark
     /// and those ending with a window in a hidden workspace.
     fn walk(seed: u64) -> (usize, usize, usize) {
@@ -2361,11 +2452,36 @@ mod tests {
                 10 => {
                     next_monitor += 1;
                     let l = layouts[rng.below(3) as usize].clone();
-                    s.add_monitor(&format!("m{next_monitor}"), UHD, l);
+                    let m = format!("m{next_monitor}");
+                    s.add_monitor(&m, UHD, l);
+                    // Only the new screen's own workspace moves, intact.
+                    let k = s.monitors.iter().find(|x| x.name == m).map(|x| x.number);
+                    if !before.monitors.is_empty() {
+                        assert_eq!(all_tabs(&s), all_tabs(&before), "seed {seed} step {step}: add_monitor");
+                        let (now, then) = (homes(&s), homes(&before));
+                        assert!(
+                            then.iter().all(|(w, home)| Some(*w) == k || now[w] == *home),
+                            "seed {seed} step {step}: add_monitor moved another's workspace"
+                        );
+                    }
                 }
                 11 => {
                     let m = name(&mut rng, &s);
                     s.remove_monitor(&m);
+                    // Its workspaces go intact to the focused screen; nothing else moves.
+                    if let Some(focused) = s.monitors.get(s.focused_monitor) {
+                        assert_eq!(
+                            all_tabs(&s),
+                            all_tabs(&before),
+                            "seed {seed} step {step}: remove_monitor"
+                        );
+                        let (now, then) = (homes(&s), homes(&before));
+                        assert!(
+                            then.iter()
+                                .all(|(w, home)| &now[w] == if *home == m { &focused.name } else { home }),
+                            "seed {seed} step {step}: remove_monitor moved the wrong workspaces"
+                        );
+                    }
                 }
                 12 => {
                     let m = name(&mut rng, &s);

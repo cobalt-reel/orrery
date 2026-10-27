@@ -20,7 +20,8 @@ pub struct Launch {
     pub pid: u32,
     /// The xdg-activation token handed to the program.
     pub token: String,
-    /// The workspace (by number) and slot focused when it was started.
+    /// The workspace (by number) and slot focused when it was started. The number may name a later workspace (one
+    /// disposed and made again); acceptable, as launches expire after `LAUNCH_WAIT`.
     pub workspace: u8,
     pub slot: usize,
     pub at: Instant,

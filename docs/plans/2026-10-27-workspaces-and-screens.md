@@ -26,22 +26,28 @@ extra screens for tests.
 ### Task 1: workspaces in the core (`src/stacks.rs`) and its callers
 
 **Model:** `Workspace { number: u8 (1..=10), monitor: usize, layout, slots: Vec<Slot>, focus: usize }`,
-`Monitor { name, area, default_layout: Layout, shown: u8 }`, `Stacks { monitors, workspaces: Vec<Workspace>
-(existing ones, sorted by number), focused_monitor, pending, attention, … }`.
+`Monitor { name, number: u8, area, default_layout: Layout, shown: u8 }`, `Stacks { monitors (sorted by number),
+workspaces: Vec<Workspace> (existing ones, sorted by number), focused_monitor, pending, attention, … }`.
 
-- `add_monitor(name, area, default_layout)`: monitor N (1-based) locks workspace N. If workspace N exists on
-  another monitor it moves here and is shown (its old monitor shows its lowest remaining workspace, or a fresh
-  locked one); else it is created from `default_layout`. Pending windows go to it as one tab (as today).
-- `remove_monitor(name)`: its workspaces' tabs go to the focused remaining monitor's shown workspace's focused
-  slot (slot by slot, workspace by workspace in number order); monitors after it shift down and locks are
-  renumbered (workspace k ≤ N is locked to monitor k: a locked workspace whose monitor index changed moves to its
-  new monitor; a monitor that lost its shown workspace shows its locked one). None left → pending, as today.
+- Screens keep their number (i3-like): workspace k is locked to the screen numbered k while that screen exists.
+- `add_monitor(name, area, default_layout)`: the new screen takes the lowest free number k and locks workspace k.
+  If workspace k exists on another monitor it moves here intact and is shown (that monitor, if it showed it, shows
+  its lowest remaining workspace, at worst its own locked one); else it is created from `default_layout`. No other
+  screen's content moves. Pending windows go to it as one tab (as today).
+- `remove_monitor(name)`: its workspaces move intact (tabs, layouts, focused slot) to the focused remaining
+  screen (the first when the focused one is removed), hidden: that screen keeps showing what it shows. Other
+  screens keep their numbers (closing screen 1 of 3 leaves 2 and 3; the next screen opened is 1 again). None
+  left → pending, as today.
 - `workspace(n)`: exists → show it on its monitor, focus that monitor; else create it on the focused monitor
   from that monitor's `default_layout`, show it. The workspace left behind is dropped if not locked and empty.
 - `move_to_workspace(n)`: focused stack → workspace n (created on the focused monitor if needed, not shown) as a
   new tab after its focused slot's current one; focus stays. Same workspace → nothing. The source workspace is
   not dropped (it is shown).
-- `set_layout(monitor, l)` acts on that monitor's shown workspace; `set_area` unchanged.
+- `set_layout(monitor, l)` acts on that monitor's shown workspace through `set_workspace_layout(n, l)`;
+  `set_default_layout(monitor, l)` sets what new workspaces there start with; `set_area` unchanged.
+- Reload: a layout redefined by name updates every workspace using it (hidden too) and every monitor's
+  `default_layout`; the fallback → file path sets each monitor's `default_layout` from its rule, plus its shown
+  workspace and its hidden ones still on the old default.
 - `placements()` covers every window in every workspace; `Placement` gains `shown: bool` (its workspace is shown)
   and `on_top` stays "top of its slot's current tab"; the compositor maps only `shown && on_top`. Rects come from
   the workspace's monitor's area.
@@ -49,8 +55,9 @@ extra screens for tests.
   caller. Marks: a window in a hidden workspace counts as not seen (a buried-style mark clears when it is shown
   on top).
 - Unit tests for every bullet + extend the random walk (switch, move_to_workspace, add/remove monitor) and the
-  invariants (each window once; workspaces 1..N exist and are locked to 1..N; each monitor shows exactly one
-  workspace that is on it; no unlocked hidden empty workspace).
+  invariants (each window once; screen and workspace numbers unique; workspace k exists on screen k for every
+  screen number k; each monitor shows exactly one workspace that is on it; no unlocked hidden empty workspace;
+  adding or removing a screen moves workspaces intact and no other screen's).
 - Callers (`comp/`, `ipc.rs`, `render.rs`, `input.rs`, `placement` targets): behaviour-preserving with one
   monitor; `arrange` unmaps windows of hidden workspaces; render draws the shown workspace. Launch targets record
   the workspace number + slot instead of the monitor name (target gone → focused slot). `move_window_to_tab`
@@ -73,15 +80,16 @@ Commit `msg and binds: workspaces`.
 
 ### Task 3: several headless screens + `orrery run` joins a running orrery
 
-- Headless: `open-screen` adds an output named `headless-2`, `headless-3`, … (first stays as today), same size as
-  `--size`, placed after the previous one in global space; `close-screen <name>` (msg, headless only, for tests)
-  removes it.
+- Headless: `open-screen` adds an output named after the screen number the core will give it (the lowest free:
+  the first stays as today, then `headless-<k>`), same size as `--size`, placed after the previous one in global
+  space; `close-screen <name>` (msg, headless only, for tests) removes it.
 - `orrery run`: when the control socket answers, send `open-screen`, print the answer, exit 0 (non-zero if it
   refused); otherwise start as today. Unit/e2e test with headless (`orrery run --backend headless` twice on the
   same socket → one process, two monitors).
 - e2e: two screens → workspaces 1 and 2 locked; `workspace 3` from screen 2 creates it there; `move-to-workspace
-  1` from screen 2 moves a window to screen 1's workspace; closing screen 2 brings its windows to screen 1;
-  keyboard focus follows `workspace N` across screens (test client `activated` flags).
+  1` from screen 2 moves a window to screen 1's workspace; closing screen 2 brings its workspaces to screen 1,
+  hidden and intact; a screen opened next is screen 2 again and takes workspace 2 back; keyboard focus follows
+  `workspace N` across screens (test client `activated` flags).
 
 Commit `screens: several per orrery, run joins a running one`.
 
@@ -94,8 +102,8 @@ Commit `screens: several per orrery, run joins a running one`.
   `OutputDamageTracker` + `Decorations` per window. Keep every rule in today's module doc (swap only on that
   window's `RedrawRequested` with `pre_present_notify`, swap interval 0, frame age after idle frames, the 16 ms
   timer requesting redraws for every window).
-- Windows: the first opens at start; `open-screen` opens another (named `winit-2`, …, app id and title as today
-  so host rules match); `CloseRequested` on a window removes its screen (`remove_monitor`, destroy the output
+- Windows: the first opens at start; `open-screen` opens another, named after its screen number (the lowest
+  free: `winit` for 1, `winit-<k>` else; app id and title as today so host rules match); `CloseRequested` on a window removes its screen (`remove_monitor`, destroy the output
   global) and quits only when it was the last; `Resized` per window; input per window: pointer positions are
   window-local, so add the window's output offset in global space; `Focus(false)` per window as today, and a
   `Focus(true)` focuses that window's monitor.

@@ -46,7 +46,7 @@ use crate::config::{self, Config};
 use crate::ipc::{LaunchView, Request, Response, StateView};
 use crate::layout::{Layout, Rect};
 use crate::placement::{self, Landing, Launches};
-use crate::stacks::{Stacks, WinId};
+use crate::stacks::{Stacks, WinId, Workspace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Backend {
@@ -159,33 +159,52 @@ pub fn config_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
 }
 
 /// The first good config after a fallback start: each monitor takes the layout its monitor rule (or the first
-/// layout) names, as if orrery had started with this config. Stacks follow `set_layout`'s rules.
+/// layout) names as its default, and so do its shown workspace and its hidden ones still on the old default, as if
+/// orrery had started with this config. Stacks follow `set_layout`'s rules.
 pub fn apply_monitor_rules(stacks: &mut Stacks, config: &Config) {
-    let names: Vec<String> = stacks.monitors().iter().map(|m| m.name().to_owned()).collect();
-    for (mi, name) in names.iter().enumerate() {
-        let current = stacks.shown(mi).map(|w| w.layout().clone());
-        if let Some(layout) = layout_for_output(config, name)
-            && current.as_ref() != Some(&layout)
-        {
-            stacks.set_layout(name, layout);
+    let monitors: Vec<(String, Layout)> = (stacks.monitors().iter())
+        .map(|m| (m.name().to_owned(), m.default_layout().clone()))
+        .collect();
+    for (mi, (name, old)) in monitors.into_iter().enumerate() {
+        let Some(layout) = layout_for_output(config, &name) else {
+            continue;
+        };
+        let shown = stacks.monitors()[mi].shown();
+        let follow: Vec<u8> = (stacks.workspaces().iter())
+            .filter(|w| w.monitor() == mi && w.layout() != &layout)
+            .filter(|w| w.number() == shown || w.layout() == &old)
+            .map(Workspace::number)
+            .collect();
+        for n in follow {
+            stacks.set_workspace_layout(n, layout.clone());
         }
+        stacks.set_default_layout(&name, layout);
     }
 }
 
-/// After a reload, each monitor's shown workspace takes the new definition of its layout, by name. A monitor whose
-/// layout the new config no longer has keeps the one it shows (not an error); those are returned as (monitor,
-/// layout).
-pub fn reapply_layouts(stacks: &mut Stacks, config: &Config) -> Vec<(String, String)> {
+/// After a reload, every workspace (hidden ones too) and every monitor's default takes the new definition of its
+/// layout, by name. One whose layout the new config no longer has keeps it (not an error); the workspaces that do
+/// are returned as (workspace, layout).
+pub fn reapply_layouts(stacks: &mut Stacks, config: &Config) -> Vec<(u8, String)> {
+    let by_name = |l: &Layout| config.layouts.iter().find(|x| x.name == l.name);
     let mut kept = Vec::new();
-    let current: Vec<(String, Layout)> = (stacks.monitors().iter().enumerate())
-        .filter_map(|(mi, m)| Some((m.name().to_owned(), stacks.shown(mi)?.layout().clone())))
+    let workspaces: Vec<(u8, Layout)> = (stacks.workspaces().iter())
+        .map(|w| (w.number(), w.layout().clone()))
         .collect();
-    for (monitor, layout) in current {
-        match config.layouts.iter().find(|l| l.name == layout.name) {
-            // Unchanged: nothing to do (set_layout would keep the stacks anyway, but this is plainly a no-op).
+    for (n, layout) in workspaces {
+        match by_name(&layout) {
+            // Unchanged: nothing to do (the layout would keep the stacks anyway, but this is plainly a no-op).
             Some(new) if *new == layout => {}
-            Some(new) => stacks.set_layout(&monitor, new.clone()),
-            None => kept.push((monitor, layout.name)),
+            Some(new) => stacks.set_workspace_layout(n, new.clone()),
+            None => kept.push((n, layout.name)),
+        }
+    }
+    let defaults: Vec<(String, Layout)> = (stacks.monitors().iter())
+        .map(|m| (m.name().to_owned(), m.default_layout().clone()))
+        .collect();
+    for (monitor, layout) in defaults {
+        if let Some(new) = by_name(&layout).filter(|new| **new != layout) {
+            stacks.set_default_layout(&monitor, new.clone());
         }
     }
     kept
@@ -725,8 +744,8 @@ impl Orrery {
                 if std::mem::take(&mut self.config_is_fallback) {
                     apply_monitor_rules(&mut self.stacks, &config);
                 } else {
-                    for (monitor, layout) in reapply_layouts(&mut self.stacks, &config) {
-                        tracing::info!("the new config has no layout {layout:?}; monitor {monitor} keeps it");
+                    for (workspace, layout) in reapply_layouts(&mut self.stacks, &config) {
+                        tracing::info!("the new config has no layout {layout:?}; workspace {workspace} keeps it");
                     }
                 }
                 self.stacking = stacking_after_reload(self.stacking, &self.config, &config);
@@ -1022,6 +1041,13 @@ mod tests {
         s.add_monitor("a", area, wall.clone());
         s.add_monitor("b", area, halves.clone());
         s.open_stacked(1);
+        // Hidden on a: 3 on wall, 4 on halves.
+        s.workspace(3);
+        s.open_stacked(2);
+        s.workspace(4);
+        s.set_layout("a", halves.clone());
+        s.open_stacked(3);
+        s.workspace(1);
 
         // Unchanged layouts: nothing moves, nothing kept.
         assert!(reapply_layouts(&mut s, &c).is_empty());
@@ -1038,10 +1064,20 @@ mod tests {
             binds: vec![],
             ..c
         };
-        assert_eq!(reapply_layouts(&mut s, &new), [("b".to_owned(), "halves".to_owned())]);
+        let kept = [(2, "halves".to_owned()), (4, "halves".to_owned())];
+        assert_eq!(reapply_layouts(&mut s, &new), kept);
+        let layouts: Vec<(u8, &str)> = (s.workspaces().iter())
+            .map(|w| (w.number(), w.layout().name.as_str()))
+            .collect();
+        assert_eq!(layouts, [(1, "wall"), (2, "halves"), (3, "wall"), (4, "halves")]);
         assert_eq!(s.shown(0).unwrap().layout(), &wide);
+        assert_eq!(s.workspaces()[2].layout(), &wide, "hidden, redefined all the same");
         assert_eq!(s.shown(1).unwrap().layout(), &halves);
-        assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
+        // Defaults follow too; a vanished one is kept.
+        assert_eq!(s.monitors()[0].default_layout(), &wide);
+        assert_eq!(s.monitors()[1].default_layout(), &halves);
+        let shown: Vec<(usize, WinId)> = s.placements().filter(|p| p.shown).map(|p| (p.monitor, p.win)).collect();
+        assert_eq!(shown, [(0, 1)]);
     }
 
     #[test]
@@ -1084,13 +1120,41 @@ mod tests {
             h: 600,
         };
         let halves = c.layouts.iter().find(|l| l.name == "halves").unwrap().clone();
+        let one = Layout {
+            name: "one".into(),
+            cols: 1,
+            rows: 1,
+            col_weights: vec![],
+            row_weights: vec![],
+            slots: vec![crate::layout::SlotSpec {
+                name: None,
+                col: 0,
+                row: 0,
+                cols: 1,
+                rows: 1,
+            }],
+        };
         let mut s = Stacks::new();
         s.add_monitor("winit", area, halves.clone());
         s.add_monitor("other", area, halves.clone());
         s.open_stacked(1);
+        // Hidden on winit: 3 still on the old default, 4 on a layout of its own.
+        s.workspace(3);
+        s.open_stacked(2);
+        s.workspace(4);
+        s.set_layout("winit", one);
+        s.open_stacked(3);
+        s.workspace(1);
         apply_monitor_rules(&mut s, &c);
         assert_eq!(s.shown(0).unwrap().layout().name, "wall", "the winit rule");
         assert_eq!(s.shown(1).unwrap().layout().name, "wall", "no rule: the first layout");
-        assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
+        let layouts: Vec<(u8, &str)> = (s.workspaces().iter())
+            .map(|w| (w.number(), w.layout().name.as_str()))
+            .collect();
+        assert_eq!(layouts, [(1, "wall"), (2, "wall"), (3, "wall"), (4, "one")]);
+        let defaults: Vec<&str> = s.monitors().iter().map(|m| m.default_layout().name.as_str()).collect();
+        assert_eq!(defaults, ["wall", "wall"]);
+        let shown: Vec<(usize, WinId)> = s.placements().filter(|p| p.shown).map(|p| (p.monitor, p.win)).collect();
+        assert_eq!(shown, [(0, 1)]);
     }
 }
