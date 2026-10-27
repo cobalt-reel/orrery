@@ -18,7 +18,7 @@ layout "halves" {
 
 monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
 
-stacking #true            // a new window goes on top of the focused stack; #false: a new tab there
+stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
 
 colors {
     focus "#ff7edb"

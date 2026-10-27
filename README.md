@@ -2,11 +2,13 @@
 
 orrery is a Wayland compositor and static tiling window manager written in Rust on
 [Smithay](https://github.com/Smithay/smithay). Each monitor shows a fixed **layout** of **slots** (rectangles of a
-weighted grid); every slot holds **tabs**, and each tab is a **stack** of windows. A slot shows its current tab,
-and of that tab only the top window is drawn. A new window opens on top of the focused slot's current stack (or,
-with stacking toggled off, as a new tab there). Windows never move by themselves: you move stacks between slots,
-split a window off into a tab of its own, cycle tabs and switch layouts, with keys from a KDL config or with
-`orrery msg` over a control socket.
+weighted grid); every slot holds **tabs**, and each tab is a **stack** of windows. A slot shows its current tab, and
+of that tab only the top window is drawn. A new window opens by three rules: a dialog on top of its parent's stack; a
+window of a program orrery launched (a `spawn` bind or `orrery msg spawn`) as a new tab in the slot focused at the
+launch (matched by process, else the first window within 5 s); anything else by `stacking`, on top of the focused
+slot's current stack (on, the default) or as a new tab there (off). Windows never move by themselves: you move stacks
+between slots, split a window off into a tab of its own, cycle tabs and switch layouts, with keys from a KDL config
+or with `orrery msg` over a control socket.
 
 For now orrery runs **nested**, as a window inside another Wayland compositor, or **headless** (no screen) for
 tests. The design and the build order ahead are in `docs/plans/2026-10-26-orrery-design.md`.
@@ -84,24 +86,25 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Ctrl+H` / `J` / `K` / `L` | swap everything (all tabs) with the slot left / down / up / right (focus follows) |
 | `Super+Tab` / `Super+Shift+Tab` | show the focused slot's next / previous tab (wrapping; tabs never move) |
 | `Super+S` | split: the top window leaves its stack for a new tab of its own, right after |
-| `Super+Shift+S` | toggle stacking: a new window goes on top of the focused stack (on) or opens as a new tab (off) |
+| `Super+Shift+S` | toggle stacking: a window orrery did not launch and with no parent goes on top of the focused stack (on) or opens as a new tab (off) |
 | `Super+1` / `Super+2` | layout `wall` / `halves` |
 | `Super+Return` | spawn `kitty` |
 | `Super+Shift+Q` | close the focused window (asks it to close) |
-| `Super+Space` (held) | show tab strips: one segment per tab along each multi-tab slot's top, the top tab bright |
+| `Super+Space` (held) | show tab strips along the top of each slot holding more than one window: one segment per tab, the current tab bright, pips for its depth |
 | `Super+Shift+E` | quit orrery |
 
 A slot holding more than one window (in any tab, at any depth), or a marked one (below), shows a small badge in its
 top-right corner. A click focuses the slot under the pointer.
 
-A window asking to be seen (xdg-activation) is never raised, and takes focus only with input behind it: when it
-is what its slot shows and its token came from input to the focused program (a token carrying a serial given since
-that program got the keyboard, used within 5 s, once), its slot is focused. Otherwise it is marked for attention:
-its slot shows the badge in the `attention` colour (its tab's strip segment too) until the window is seen:
-brought on top (a `cycle-tab`, a close above it) if it was beneath, focused if it was already shown. The mark does not come back. One exception: each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`,
-`DESKTOP_STARTUP_ID`), and a window asking with the token of a spawn under 5 s old that no window has taken yet
-moves to where the spawn was made, as a new tab there (a single-instance program opening its existing window from
-a new launch, say).
+A window asking to be seen (xdg-activation) is never raised, and takes focus only with input behind it: when it is
+what its slot shows and its token came from input to the focused program (a token carrying a serial given since that
+program got the keyboard, used within 5 s, once), its slot is focused. Otherwise it is marked for attention: its slot
+shows the badge in the `attention` colour (its tab's strip segment too) until the window is seen: brought on top (a
+`cycle-tab`, a close above it) if it was beneath, focused if it was already shown. The mark does not come back. A
+dialog opening where it is not seen (on a parent in a background tab, or in a slot without focus) is marked the same
+way. One exception: each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), and a window
+asking with the token of a spawn under 5 s old that no window has taken yet moves to where the spawn was made, as a
+new tab there (a single-instance program opening its existing window from a new launch, say).
 
 ## `orrery msg`
 
@@ -179,8 +182,10 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   questions are answered in grid cells, whatever the weights.
 - `monitor "OUTPUT" layout="NAME"`: the layout an output starts with. The nested output is `winit`, the headless
   one `headless`; an output without a rule gets the first layout.
-- `stacking #true|#false`: where a new window opens, on top of the focused slot's current stack (`#true`, the
-  default) or as a new tab there; `toggle-stacking` flips it while running.
+- `stacking #true|#false`: where a window that orrery did not launch and that has no parent opens: on top of the
+  focused slot's current stack (`#true`, the default) or as a new tab there; `toggle-stacking` flips it while
+  running. Dialogs go on their parent's stack and launched programs' windows open as new tabs where the launch was
+  made, whatever `stacking` says.
 - `colors { focus "#rrggbb"; badge "#rrggbb"; attention "#rrggbb"; background "#rrggbb" }`: each also
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
   one window and the tab strips, `attention` the badge of a slot holding a window that asked for attention,
@@ -197,7 +202,7 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   | `swap-slot` | a direction | swap everything (all tabs) of the focused slot and its neighbour |
   | `cycle-tab` | `"next"`/`"prev"` | show the focused slot's next / previous tab |
   | `split` | | the top window leaves its stack for a new tab right after it |
-  | `toggle-stacking` | | flip `stacking` |
+  | `toggle-stacking` | | flip `stacking` (windows orrery did not launch, with no parent) |
   | `layout` | a layout name | switch the focused monitor's layout (fewer slots: the extra slots' tabs join the last) |
   | `spawn` | program, then its arguments | run it (no shell) with `WAYLAND_DISPLAY` set to orrery and no `DISPLAY` |
   | `close` | | ask the focused window to close |
@@ -228,7 +233,7 @@ layout "halves" {
 
 monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
 
-stacking #true            // a new window goes on top of the focused stack; #false: a new tab there
+stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
 
 colors {
     focus "#ff7edb"
@@ -291,19 +296,23 @@ cp examples/config.kdl /tmp/orrery-try.kdl
       `WAYLAND_DISPLAY=...`.
 - [ ] Hand orrery the keys (a passthrough submap in Hyprland, see Default keys). Press `Super+H`:
       `orrery msg state` shows it under `last_key`.
-- [ ] `Super+Return` three times: three kittys in one stack in the top-left slot, only the last visible; the slot
-      shows the badge; `orrery msg state` lists one tab there holding three windows.
-- [ ] `Super+S` twice: the top two kittys leave the stack, each a tab of its own (three tabs). `Super+Tab` shows
-      the next tab (typing goes to the visible one); `Super+Shift+Tab` goes back; holding `Super+Space` shows the
-      tab strip.
-- [ ] `Super+Shift+L`: the current tab moves to the hero (the big 2x2 slot) and the focus follows; it fills the
-      hero.
+- [ ] `Super+Return`: a kitty opens in the top-left slot. In it run `kitty &` twice: three kittys in one stack there,
+      only the last visible; the slot shows the badge; `orrery msg state` lists one tab there holding three windows.
+      (A window orrery did not launch goes by `stacking`; one that appears while a spawn under 5 s old still waits
+      for its window opens as that spawn's tab instead, so wait for each `Super+Return` kitty first.)
+- [ ] `Super+S` twice: the top two kittys leave the stack, each a tab of its own (three tabs). `Super+Tab` shows the
+      next tab (typing goes to the visible one); `Super+Shift+Tab` goes back; holding `Super+Space` shows the tab
+      strip, one segment per tab.
+- [ ] `Super+Return` twice: each new kitty opens as a new tab right after the current one (five tabs), and has the
+      focus.
+- [ ] `Super+Shift+L`: the current tab moves to the hero (the big 2x2 slot) and the focus follows; it fills the hero.
 - [ ] `Super+Ctrl+H` from the hero swaps everything in the hero with the top-left slot.
-- [ ] `Super+2`: layout `halves`, every kitty resizes (the left half keeps slot 0's tabs, the right half gets
-      every other slot's tabs); `Super+1`: back to `wall`, with the tabs now in slots 0 and 1 only (they stay
-      there: the round trip is not an identity, by design).
-- [ ] `Super+Shift+S`, then `Super+Return`: the new kitty opens as a new tab, not on top of the stack;
-      `orrery msg state` shows `"stacking": false`.
+- [ ] `Super+2`: layout `halves`, every kitty resizes (the left half keeps slot 0's tabs, the right half gets every
+      other slot's tabs); `Super+1`: back to `wall`, with the tabs now in slots 0 and 1 only (they stay there: the
+      round trip is not an identity, by design).
+- [ ] `Super+Shift+S`, then `kitty &` in the focused kitty: the new kitty opens as a new tab, not on top of the
+      stack; `orrery msg state` shows `"stacking": false`. `Super+Shift+S` again and `kitty &` once more: it goes on
+      top of the stack (as in the first step).
 - [ ] Hold `Super`, click a window outside orrery, then click back into orrery: no stuck Super (typing in kitty is
       plain text).
 - [ ] Move orrery to another workspace and, from a terminal outside it, run `orrery msg state` a few times: it

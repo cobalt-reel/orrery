@@ -191,3 +191,34 @@ Commit `xdg-activation: launch tokens and attention`.
 Commit `stacks and tabs: as built`.
 
 ---
+
+## As built
+
+250 tests (193 unit, 57
+integration, most of them headless end to end), one more ignored (slow: every prefix of the example config); fmt and
+clippy clean.
+
+Deviations from the plan:
+- `Landing::NewTab { monitor: String, slot: usize }` and `Launch::token: String`: fields required, not `Option`
+  (every launch has a target and a token).
+- Launches live until they expire (5 s), outliving their program: a launcher that hands off and exits still gets
+  its window placed. Pid matching ends with the launch, not with the process.
+- A window mapped again (unmap, then a new buffer) sees no launches: only its parent or `stacking` place it.
+- xdg-activation: Smithay's global and token dispatch, but `activate` dispatched by orrery itself instead of the
+  `delegate_xdg_activation!` macro. Smithay passes on only tokens in its pool and drops the rest silently; to
+  orrery every request counts, if only for a mark.
+- Only input-backed client tokens can focus: a serial of orrery's seat no older than the keyboard's latest enter,
+  from the client with keyboard focus; 64 kept at most, single use, 5 s. Any other token only marks.
+- A mark on a window shown in a slot without focus (`Mark::Unfocused`) as well as one beneath (`Mark::Waiting`);
+  each clears on its own rule. The badge shows for a single marked window too (it has nothing else to say so).
+- `orrery msg spawn` is a clap subcommand so its argv is taken verbatim, flags included; `--socket` goes before
+  `spawn`.
+- A dialog that lands out of sight (its parent's tab in the background, or a slot without focus) is marked
+  (the design's placement rule 1 says so now).
+- `Stacks::clear_mark` is test-only: in the compositor `settle` drops the marks of windows seen.
+
+Known limits:
+- A waiting window (no buffer yet) is configured to the focused slot, so a launch's window aimed at another slot
+  (focus moved since the launch) needs one more configure once placed.
+- Monitor removal (tabs to the focused slot, else pending) is in the core only: nested there is one output, which
+  never goes while orrery runs.
