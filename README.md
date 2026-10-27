@@ -91,15 +91,18 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Space` (held) | show tab strips: one segment per tab along each multi-tab slot's top, the top tab bright |
 | `Super+Shift+E` | quit orrery |
 
-A slot holding more than one window (in any tab, at any depth) shows a small badge in its top-right corner. A
-click focuses the slot under the pointer.
+A slot holding more than one window (in any tab, at any depth), or a marked one (below), shows a small badge in its
+top-right corner. A click focuses the slot under the pointer.
 
-A window asking to be seen (xdg-activation) is never raised. When it is what its slot shows, that slot is focused;
-otherwise it is marked for attention: its slot's badge and its tab's strip segment take the `attention` colour
-until the window comes on top (a `cycle-tab`, a close above it), and the mark does not come back. One exception:
-each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), and a window asking with the
-token of a spawn under 5 s old that no window has taken yet moves to where the spawn was made, as a new tab there
-(a single-instance program opening its existing window from a new launch, say).
+A window asking to be seen (xdg-activation) is never raised, and takes focus only with input behind it: when it
+is what its slot shows and its token came from input to the focused program (a token carrying the serial of a key
+press or click since that program got the keyboard, used within 5 s, once), its slot is focused. Otherwise it is
+marked for attention: its slot shows the badge in the `attention` colour (its tab's strip segment too) until the
+window is seen: brought on top (a `cycle-tab`, a close above it) if it was beneath, focused if it was already
+shown. The mark does not come back. One exception: each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`,
+`DESKTOP_STARTUP_ID`), and a window asking with the token of a spawn under 5 s old that no window has taken yet
+moves to where the spawn was made, as a new tab there (a single-instance program opening its existing window from
+a new launch, say).
 
 ## `orrery msg`
 

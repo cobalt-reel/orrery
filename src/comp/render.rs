@@ -91,20 +91,21 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
         if mi == stacks.focused_monitor() && i == mon.focus() {
             borders.extend(border(rect, colors.focus));
         }
-        if slot.len() > 1 {
-            let tabs: Vec<StripTab> = slot
-                .tabs()
-                .iter()
-                .map(|stack| StripTab {
-                    depth: stack.len(),
-                    attention: stack.iter().any(|&w| stacks.is_marked(w)),
-                })
-                .collect();
-            let marked = tabs.iter().any(|t| t.attention);
+        let tabs: Vec<StripTab> = slot
+            .tabs()
+            .iter()
+            .map(|stack| StripTab {
+                depth: stack.len(),
+                attention: stack.iter().any(|&w| stacks.is_marked(w)),
+            })
+            .collect();
+        let marked = tabs.iter().any(|t| t.attention);
+        // A lone window marked (shown, in a slot without focus) has only the badge to say so.
+        if slot.len() > 1 || marked {
             badges.extend(badge(rect, if marked { colors.attention } else { colors.badge }));
-            if show_tabs {
-                strips.extend(strip(rect, &tabs, slot.current(), colors));
-            }
+        }
+        if slot.len() > 1 && show_tabs {
+            strips.extend(strip(rect, &tabs, slot.current(), colors));
         }
     }
     let bar = config_error
@@ -659,6 +660,29 @@ mod tests {
         let after = scene(&s, "m", &colors, true, false);
         assert!(of_color(&after, colors.attention).is_empty());
         assert!(of_color(&after, waiting).is_empty());
+    }
+
+    #[test]
+    fn a_marked_window_alone_in_its_slot_still_gets_the_badge() {
+        let (mut s, rects, colors) = wall();
+        s.open_stacked(1);
+        s.focus_slot(crate::layout::Dir::Right);
+        s.open_stacked(2);
+        s.mark(1);
+        let r = rects[0];
+        let badge = Rect {
+            x: r.x + r.w - 14,
+            y: r.y + 6,
+            w: 8,
+            h: 8,
+        };
+        let held = scene(&s, "m", &colors, true, false);
+        assert_eq!(
+            of_color(&held, colors.attention),
+            [badge],
+            "a badge, but no strip for one window"
+        );
+        assert!(of_color(&held, colors.badge).is_empty());
     }
 
     #[test]

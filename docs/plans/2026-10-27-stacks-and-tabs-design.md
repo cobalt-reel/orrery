@@ -39,19 +39,25 @@ Fills in section 2 of `2026-10-26-orrery-design.md` with the decisions it leaves
 3. **Anything else:** with stacking on, on top of the focused slot's current stack; off, a new tab there. An empty
    focused slot gets it as its first tab either way.
 
-xdg-activation (new): a placed window that activates with an unclaimed launch's token moves to that launch's
-target as a new tab (the launch is then claimed). Any other activation request:
-- the window is the top of its slot's current tab: that slot is focused;
-- otherwise it is never raised: it is marked **attention**, and its slot shows the badge in the new
-  `attention` colour. The mark clears when the window becomes the top of its slot's current tab.
+xdg-activation (new). A request names a surface (a popup's or subsurface's counts for its toplevel) and a token:
+- an unclaimed launch's token under 5 s old, for a placed window: the window moves to that launch's target as a
+  new tab, shown and focused (the launch is then claimed);
+- a client's own token (`get_activation_token`) that orrery kept, for a window that is the top of its slot's
+  current tab: that slot is focused. A client token is kept only when it carries a serial of orrery's seat no
+  older than the keyboard's latest enter and its client has keyboard focus (input to the focused client), for 5 s
+  and one use;
+- anything else (an unknown, old, spent or unbacked token, or a window beneath its slot's top) never focuses and
+  never raises: the window is marked **attention** (unless it is the focused window), and its slot shows the badge
+  in the new `attention` colour. A window marked while beneath loses the mark when it becomes the top of its slot's
+  current tab; one marked while shown in a slot without focus loses it when it becomes the focused window.
 - A mark is also dropped when its window closes or loses its monitor (goes pending); it does not come back.
 
 `stacking` toggled at runtime survives a reload unless the config's own `stacking` value changed.
 
 ## Drawing
 
-- The corner badge shows when a slot holds more than one window (any tab or depth), in `attention` colour when a
-  window of the slot is marked.
+- The corner badge shows when a slot holds more than one window (any tab or depth) or a marked one, in `attention`
+  colour when a window of the slot is marked.
 - The held `show-tabs` strip has one segment per tab, the current one bright, each with small pips for its depth
   when the stack has more than one window, and attention-coloured when its stack holds a marked window.
 

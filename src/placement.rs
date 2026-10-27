@@ -18,8 +18,8 @@ pub const CHAIN_MAX: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub pid: u32,
-    /// The xdg-activation token handed to the program, if any.
-    pub token: Option<String>,
+    /// The xdg-activation token handed to the program.
+    pub token: String,
     /// The monitor (by name) and slot focused when it was started.
     pub monitor: String,
     pub slot: usize,
@@ -76,7 +76,7 @@ impl Launches {
         let i = self
             .launches
             .iter()
-            .position(|l| !l.claimed && young(l, now) && l.token.as_deref() == Some(token))?;
+            .position(|l| !l.claimed && young(l, now) && l.token == token)?;
         Some(self.claim(i))
     }
 
@@ -167,7 +167,7 @@ mod tests {
     fn launch(pid: u32, slot: usize, at: Instant) -> Launch {
         Launch {
             pid,
-            token: None,
+            token: format!("token-{pid}"),
             monitor: "m".into(),
             slot,
             at,
@@ -300,7 +300,7 @@ mod tests {
 
     fn with_token(pid: u32, slot: usize, at: Instant, token: &str) -> Launch {
         Launch {
-            token: Some(token.into()),
+            token: token.into(),
             ..launch(pid, slot, at)
         }
     }
@@ -316,9 +316,11 @@ mod tests {
         assert_eq!(l.claim_token("bb", t0 + MS).map(|x| x.slot), Some(2));
         assert!(l.all()[1].claimed && !l.all()[0].claimed);
         assert_eq!(l.claim_token("bb", t0 + MS), None, "claimed once");
-        // Unknown tokens, and the empty one a launch without a token cannot match.
+        // Unknown tokens; only the whole token matches.
         assert_eq!(l.claim_token("cc", t0 + MS), None);
         assert_eq!(l.claim_token("", t0 + MS), None);
+        assert_eq!(l.claim_token("a", t0 + MS), None);
+        assert_eq!(l.claim_token("token-30", t0 + MS).map(|x| x.pid), Some(30));
         assert_eq!(l.claim_token("aa", t0 + MS).map(|x| x.pid), Some(10));
     }
 

@@ -126,7 +126,7 @@ pub struct StateView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchView {
     pub pid: u32,
-    pub token: Option<String>,
+    pub token: String,
     pub age_ms: u64,
     pub claimed: bool,
 }
@@ -569,7 +569,7 @@ mod tests {
             }),
             launches: vec![LaunchView {
                 pid: 4242,
-                token: Some("tok".into()),
+                token: "tok".into(),
                 age_ms: 120,
                 claimed: false,
             }],

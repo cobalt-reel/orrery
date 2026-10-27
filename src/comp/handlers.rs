@@ -232,10 +232,12 @@ impl XdgActivationHandler for Orrery {
     }
 
     // A client's own token (xdg_activation_v1.get_activation_token, to pass focus to another of its windows or to
-    // a program it starts) is never a launch's: an activation with it is a plain request, like one with any token
-    // orrery did not hand out. Nothing looks it up again, so it is not kept.
-    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
-        false
+    // a program it starts) is never a launch's. It is kept, and can then focus a shown window once, only when it
+    // comes from input to the focused client (`Orrery::input_backed`); any other is answered but not kept, so
+    // activating with it only marks. Old ones are dropped here and on each activation.
+    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        self.forget_old_tokens(std::time::Instant::now());
+        self.input_backed(&data)
     }
 
     // Unreached: orrery dispatches xdg_activation_v1 itself (below). Routed the same way should that change.
@@ -245,7 +247,8 @@ impl XdgActivationHandler for Orrery {
 }
 
 /// Smithay's dispatch, except `activate`: Smithay passes on only tokens in its pool and drops the rest silently,
-/// but to orrery every request counts (`Orrery::activation_requested` decides what a token is worth).
+/// but to orrery every request counts, if only for a mark (`Orrery::activation_requested` decides what a token is
+/// worth).
 impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for Orrery {
     fn request(
         state: &mut Self,

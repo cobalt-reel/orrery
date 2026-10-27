@@ -4,7 +4,7 @@
 //! one place, and an operation that cannot apply (an edge, an empty slot, an unknown id) does nothing. The state
 //! is private so nothing outside these methods can break that; callers read it through accessors.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use crate::config::Cycle;
 use crate::layout::{Dir, Layout, Rect};
@@ -38,9 +38,18 @@ pub struct Stacks {
     /// Windows with no monitor to live on (none yet, or the last one went away), oldest first. The next monitor
     /// added takes them, as one stack, into its focused slot.
     pending: Vec<WinId>,
-    /// Windows that asked to be seen while waiting: placed, never the top of their slot's current tab. A mark
-    /// goes for good once its window is shown (see `settle`), or when it closes or loses its monitor.
-    attention: BTreeSet<WinId>,
+    /// Windows that asked to be seen while not focused, and how they were then (see `Mark`, which says what clears
+    /// each). A mark also goes when its window closes or loses its monitor, and never comes back by itself.
+    attention: BTreeMap<WinId, Mark>,
+}
+
+/// What a window was when it was marked, which decides what clears the mark (see `settle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// Beneath its slot's top: cleared once it is shown, focused or not.
+    Waiting,
+    /// Shown in a slot without focus: cleared once it is focused. Covered meanwhile, it stays marked.
+    Unfocused,
 }
 
 /// What is drawn: the top window of a non-empty slot's current tab, at the slot's rectangle.
@@ -192,6 +201,7 @@ impl Stacks {
             self.focused_monitor = i;
             self.monitors[i].focus = slot;
         }
+        self.settle();
     }
 
     /// Focuses a monitor, keeping its focused slot; unknown names do nothing.
@@ -199,6 +209,7 @@ impl Stacks {
         if let Some(i) = self.index_of(monitor) {
             self.focused_monitor = i;
         }
+        self.settle();
     }
 
     /// Every window in a slot, in one pass: monitor by monitor, slot by slot, tab by tab, bottom to top.
@@ -344,6 +355,7 @@ impl Stacks {
         if let Some((m, to)) = self.neighbour(d) {
             self.monitors[m].focus = to;
         }
+        self.settle();
     }
 
     /// Shows the focused slot's next or previous tab, wrapping. Tabs never move.
@@ -436,6 +448,7 @@ impl Stacks {
         }
         self.focused_monitor = m;
         self.monitors[m].focus = s;
+        self.settle();
         true
     }
 
@@ -463,11 +476,16 @@ impl Stacks {
         self.settle();
     }
 
-    /// Marks `w` as asking for attention. Only a waiting window can be: one on top is already seen, and one not
-    /// placed has no slot to show it.
+    /// Marks `w` as asking for attention. Any placed window but the focused one can be: that one is already seen,
+    /// and one not placed has no slot to show it.
     pub fn mark(&mut self, w: WinId) {
-        self.attention.insert(w);
-        self.settle();
+        let Some(p) = self.placements().find(|p| p.win == w) else {
+            return;
+        };
+        if !p.focused {
+            self.attention
+                .insert(w, if p.on_top { Mark::Unfocused } else { Mark::Waiting });
+        }
     }
 
     /// Drops `w`'s mark, if it has one.
@@ -477,7 +495,7 @@ impl Stacks {
 
     #[must_use]
     pub fn is_marked(&self, w: WinId) -> bool {
-        self.attention.contains(&w)
+        self.attention.contains_key(&w)
     }
 
     /// One per non-empty slot: the top of its current tab at the slot's rectangle.
@@ -529,16 +547,21 @@ impl Stacks {
         })
     }
 
-    /// Keeps only the marks of windows waiting in a slot: a window shown (whatever showed it), closed or gone to
-    /// `pending` loses its mark for good. Every method that changes a slot's tabs or current tab ends with this
-    /// (their early returns change nothing); the random walk checks the rule after every operation, so a method
-    /// that forgets it fails there.
+    /// Drops the marks `Mark` says are seen: a waiting window now shown (whatever showed it), one marked while
+    /// shown now focused; and the marks of windows closed or gone to `pending`, for good. Every method that changes
+    /// a slot's tabs, current tab or focus ends with this (their early returns change nothing); the random walk
+    /// checks the rule after every operation, so a method that forgets it fails there.
     fn settle(&mut self) {
         if self.attention.is_empty() {
             return;
         }
-        let waiting: BTreeSet<WinId> = self.placements().filter(|p| !p.on_top).map(|p| p.win).collect();
-        self.attention.retain(|w| waiting.contains(w));
+        let placed: BTreeMap<WinId, Placement> = self.placements().map(|p| (p.win, p)).collect();
+        self.attention.retain(|w, mark| {
+            placed.get(w).is_some_and(|p| match mark {
+                Mark::Waiting => !p.on_top,
+                Mark::Unfocused => !p.focused,
+            })
+        });
     }
 
     /// Placed or pending: every open refuses such an id, so a window can never be in two places.
@@ -741,12 +764,13 @@ mod tests {
             .collect();
         assert_eq!(tops, from_tiles, "tiles are the top placements");
 
-        for &w in &s.attention {
+        for (&w, &mark) in &s.attention {
             let p = placements.iter().find(|p| p.win == w);
-            assert!(
-                p.is_some_and(|p| !p.on_top),
-                "window {w} marked but not waiting in a slot"
-            );
+            let unseen = match mark {
+                Mark::Waiting => p.is_some_and(|p| !p.on_top),
+                Mark::Unfocused => p.is_some_and(|p| !p.focused),
+            };
+            assert!(unseen, "window {w} marked {mark:?} but seen or not placed");
         }
     }
 
@@ -1469,10 +1493,10 @@ mod tests {
     }
 
     #[test]
-    fn only_a_waiting_window_can_be_marked() {
+    fn the_focused_window_and_unplaced_ones_cannot_be_marked() {
         let mut s = three_tabs();
         s.mark(3);
-        assert!(!s.is_marked(3), "the top of the current tab is already seen");
+        assert!(!s.is_marked(3), "the focused window is already seen");
         s.mark(99);
         assert!(!s.is_marked(99), "unknown");
         s.mark(2);
@@ -1491,6 +1515,43 @@ mod tests {
         none.open_stacked(5);
         none.mark(5);
         assert!(!none.is_marked(5), "pending is not placed");
+    }
+
+    #[test]
+    fn a_shown_window_without_focus_keeps_its_mark_until_it_is_focused() {
+        // Tabs [1], [2, 3], [4] in slot 0, showing 3; slot 3 holds 5 and has focus.
+        let mut s = three_tabs();
+        s.focus_slot(Dir::Right);
+        s.open_stacked(5);
+        s.mark(5);
+        assert!(!s.is_marked(5), "the focused window is seen");
+        s.mark(3);
+        assert!(s.is_marked(3), "shown, but in a slot without focus");
+        assert_invariants(&s);
+        // Covered and shown again, never focused: still marked.
+        assert!(s.open_on(6, 3));
+        assert!(s.is_marked(3));
+        s.close(6);
+        assert!(s.is_marked(3));
+        assert_invariants(&s);
+        // Its slot takes focus: gone for good.
+        s.focus_slot(Dir::Left);
+        assert!(!s.is_marked(3));
+        s.focus_slot(Dir::Right);
+        assert!(!s.is_marked(3), "it does not come back");
+        // Any way of focusing it clears it.
+        s.mark(3);
+        assert!(s.focus_window(3) && !s.is_marked(3));
+        s.focus_at("winit", 3);
+        s.mark(3);
+        s.focus_at("winit", 0);
+        assert!(!s.is_marked(3));
+        s.add_monitor("second", UHD, single());
+        s.focus_monitor("second");
+        s.mark(3);
+        s.focus_monitor("winit");
+        assert!(!s.is_marked(3));
+        assert_invariants(&s);
     }
 
     #[test]
@@ -1701,14 +1762,14 @@ mod tests {
                 17 | 18 => {
                     let w = pick(&mut rng, &live);
                     s.mark(w);
-                    let waiting = before.placements().any(|p| p.win == w && !p.on_top);
-                    assert_eq!(s.is_marked(w), waiting, "seed {seed} step {step}: mark {w}");
+                    let unseen = before.placements().any(|p| p.win == w && !p.focused);
+                    assert_eq!(s.is_marked(w), unseen, "seed {seed} step {step}: mark {w}");
                 }
                 _ => s.clear_mark(pick(&mut rng, &live)),
             }
             if !matches!(op, 17 | 18) {
                 assert!(
-                    s.attention.is_subset(&before.attention),
+                    s.attention.keys().all(|w| before.attention.contains_key(w)),
                     "seed {seed} step {step}: only mark marks"
                 );
             }

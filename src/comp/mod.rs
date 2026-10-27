@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
-use smithay::desktop::{PopupManager, Space, Window};
+use smithay::desktop::{PopupManager, Space, Window, find_popup_root_surface};
 use smithay::input::pointer::MotionEvent;
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
@@ -32,14 +32,14 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
-use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
+use smithay::wayland::compositor::{CompositorClientState, CompositorState, get_parent, with_states};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState, XdgToplevelSurfaceData};
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
-use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::wayland::xdg_activation::{XdgActivationState, XdgActivationToken, XdgActivationTokenData};
 
 use crate::NAME;
 use crate::config::{self, Config};
@@ -441,31 +441,76 @@ impl Orrery {
         }
     }
 
-    /// An xdg-activation request for `surface` with `token`. A placed window bringing the token of a launch still
-    /// waiting (`Launches::claim_token`) moves to that launch's target as a new tab, shown and focused, and the
-    /// launch is claimed. Any other request (another token, an old or unknown one, a client's own) focuses the
-    /// window's slot when the window is what it shows, else marks the window for attention: nothing beneath is ever
-    /// raised.
+    /// An xdg-activation request for the window of `surface` (its own, a subsurface's or a popup's) with `token`:
+    /// - a placed window bringing the token of a launch still waiting (`Launches::claim_token`) moves to that
+    ///   launch's target as a new tab, shown and focused, and the launch is claimed;
+    /// - a client token kept by `token_created` (input to the focused client, under `LAUNCH_WAIT` old) focuses the
+    ///   window's slot when the window is what it shows; the token is spent either way;
+    /// - anything else (no such token, an old, spent or unbacked one, or a window beneath) only marks the window.
+    ///
+    /// Nothing beneath is ever raised, and without input behind it no request takes focus.
     pub fn activation_requested(&mut self, token: &str, surface: &WlSurface) {
-        let Some(id) = self.id_of_surface(surface) else {
+        let Some(id) = self.window_of(surface) else {
             return;
         };
         let now = Instant::now();
         self.launches.expire(now);
+        self.forget_old_tokens(now);
         let placed = self.stacks.where_is(id).is_some();
         let target = placed
             .then(|| self.launches.claim_token(token, now))
             .flatten()
             .map(|l| (l.monitor.clone(), l.slot));
-        match target {
-            Some((monitor, slot)) => self.stacks.move_window_to_tab(id, &monitor, slot),
-            None => {
-                if !self.stacks.focus_window(id) {
-                    self.stacks.mark(id);
-                }
+        if let Some((monitor, slot)) = target {
+            self.stacks.move_window_to_tab(id, &monitor, slot);
+        } else {
+            let backed = (self.xdg_activation_state).remove_token(&XdgActivationToken::from(token.to_owned()));
+            if !(backed && self.stacks.focus_window(id)) {
+                self.stacks.mark(id);
             }
         }
         self.arrange();
+    }
+
+    /// Whether a client's new token comes from input to the client with keyboard focus: it carries a serial on
+    /// orrery's seat no older than the keyboard's latest enter (so given since the focus came), and the client
+    /// asking for it owns the focused surface. Only such tokens are kept (`token_created`).
+    pub fn input_backed(&self, data: &XdgActivationTokenData) -> bool {
+        let Some((serial, seat)) = &data.serial else {
+            return false;
+        };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        let ours = Seat::<Self>::from_resource(seat).is_some_and(|s| s == self.seat);
+        let fresh = keyboard
+            .last_enter()
+            .is_some_and(|enter| serial.is_no_older_than(&enter));
+        let focused = (keyboard.current_focus())
+            .and_then(|s| self.display_handle.get_client(s.id()).ok())
+            .map(|c| c.id());
+        ours && fresh && focused.is_some() && focused == data.client_id
+    }
+
+    /// Drops the kept client tokens `LAUNCH_WAIT` old or older, so the pool stays small and old tokens focus nothing.
+    pub fn forget_old_tokens(&mut self, now: Instant) {
+        (self.xdg_activation_state)
+            .retain_tokens(|_, data| now.saturating_duration_since(data.timestamp) < placement::LAUNCH_WAIT);
+    }
+
+    /// The window `surface` belongs to: its own toplevel surface, or a subsurface or popup (or chain of them) on
+    /// one.
+    fn window_of(&self, surface: &WlSurface) -> Option<WinId> {
+        let mut root = surface.clone();
+        loop {
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            if let Some(id) = self.id_of_surface(&root) {
+                return Some(id);
+            }
+            root = find_popup_root_surface(&self.popups.find_popup(&root)?).ok()?;
+        }
     }
 
     /// The pid of the client owning `surface`, from its socket's credentials.

@@ -4,8 +4,10 @@
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -66,6 +68,11 @@ pub struct State {
     activation: Option<xdg_activation_v1::XdgActivationV1>,
     /// The token the compositor gave for the last `activation_token` request.
     token: Option<String>,
+    seat: Option<wl_seat::WlSeat>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// The window with keyboard focus, and the serial of the latest wl_keyboard.enter (kept after a leave).
+    pub keyboard_focus: Option<usize>,
+    pub enter_serial: Option<u32>,
     outputs: Vec<wl_output::WlOutput>,
     pub globals: Vec<String>,
     pub windows: Vec<Win>,
@@ -102,6 +109,9 @@ impl Client {
         // Bind events (wl_output's) arrive on the second trip.
         queue.roundtrip(&mut state).expect("bind roundtrip");
         assert!(state.compositor.is_some() && state.shm.is_some() && state.wm_base.is_some());
+        // A keyboard, so the client learns its focus and the enter serials activation tokens can carry.
+        state.keyboard = state.seat.as_ref().map(|seat| seat.get_keyboard(&queue.handle(), ()));
+        queue.roundtrip(&mut state).expect("keyboard roundtrip");
         Self {
             _conn: conn,
             queue,
@@ -258,12 +268,24 @@ impl Client {
         self.roundtrip();
     }
 
-    /// A token of this client's own, from xdg_activation_v1.get_activation_token (no serial, no surface).
-    pub fn activation_token(&mut self) -> String {
+    /// xdg_activation_v1.activate for popup `i`'s surface with `token`.
+    pub fn activate_popup(&mut self, i: usize, token: &str) {
+        let surface = self.state.popups[i].surface.as_ref().expect("live popup");
+        let activation = self.state.activation.as_ref().expect("xdg_activation_v1");
+        activation.activate(token.to_owned(), surface);
+        self.roundtrip();
+    }
+
+    /// A token of this client's own, from xdg_activation_v1.get_activation_token, with `serial` (an input event's,
+    /// on this client's seat) if given; no surface.
+    pub fn activation_token(&mut self, serial: Option<u32>) -> String {
         let qh = self.queue.handle();
         self.state.token = None;
         let activation = self.state.activation.as_ref().expect("xdg_activation_v1");
         let token = activation.get_activation_token(&qh, ());
+        if let Some(serial) = serial {
+            token.set_serial(serial, self.state.seat.as_ref().expect("wl_seat"));
+        }
         token.commit();
         assert!(self.wait_for(|s| s.token.is_some()), "no token came");
         token.destroy();
@@ -364,6 +386,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(6), qh, ())),
             "zxdg_decoration_manager_v1" => state.decorations = Some(registry.bind(name, 1, qh, ())),
             "xdg_activation_v1" => state.activation = Some(registry.bind(name, 1, qh, ())),
+            "wl_seat" => state.seat = Some(registry.bind(name, version.min(5), qh, ())),
             // Without a bound wl_output, wl_surface.enter cannot be sent, and mapping could not be observed.
             "wl_output" => state.outputs.push(registry.bind(name, version.min(4), qh, ())),
             _ => {}
@@ -558,6 +581,26 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
     }
 }
 
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Enter { serial, surface, .. } => {
+                state.enter_serial = Some(serial);
+                state.keyboard_focus = surface.data::<usize>().copied();
+            }
+            wl_keyboard::Event::Leave { .. } => state.keyboard_focus = None,
+            _ => {}
+        }
+    }
+}
+
 /// Objects whose events the tests do not need.
 macro_rules! ignore_events {
     ($($t:ty),*) => {$(
@@ -575,5 +618,6 @@ ignore_events!(
     wl_output::WlOutput,
     xdg_positioner::XdgPositioner,
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
-    xdg_activation_v1::XdgActivationV1
+    xdg_activation_v1::XdgActivationV1,
+    wl_seat::WlSeat
 );

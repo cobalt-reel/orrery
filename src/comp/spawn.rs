@@ -60,8 +60,8 @@ impl Orrery {
     /// Starts `argv` (see `command`) with a fresh xdg-activation token and records it as a launch aimed at the
     /// focused slot; the error says why it could not be started (a key logs it, `msg` answers it).
     pub fn spawn(&mut self, argv: &[String]) -> Result<(), String> {
-        // Smithay mints it; the launch keeps it. Activations never look in Smithay's pool (see `handlers`), so it
-        // is not left there to pile up.
+        // Smithay mints it; the launch keeps it. Smithay's pool holds only the client tokens orrery keeps (see
+        // `token_created`), whose rules are not a launch's, so it is taken out again.
         let token = self.xdg_activation_state.create_external_token(None).0.clone();
         self.xdg_activation_state.remove_token(&token);
         let token = String::from(token);
@@ -89,7 +89,7 @@ impl Orrery {
         };
         self.launches.push(Launch {
             pid,
-            token: Some(token),
+            token,
             monitor: mon.name().to_owned(),
             slot: mon.focus(),
             at: now,
