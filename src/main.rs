@@ -75,6 +75,9 @@ fn msg_usage() -> String {
     format!("{NAME} msg {socket} <REQUEST>...\n       {NAME} msg {socket} spawn <PROGRAM> [ARGS]...")
 }
 
+/// How long a `run` refused by a starting orrery waits for it to answer, to join it.
+const JOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn config_default() -> String {
     format!("$XDG_CONFIG_HOME/{NAME}/config.kdl")
 }
@@ -88,8 +91,9 @@ fn main() -> ExitCode {
     match command {
         Command::Run(args) => {
             // An orrery already answering on the control socket opens one more screen instead.
-            if let Some(path) = args.socket.clone().or_else(ipc_server::default_socket_path)
-                && let Some(answer) = ipc_server::join(&path)
+            let control = args.socket.clone().or_else(ipc_server::default_socket_path);
+            if let Some(path) = &control
+                && let Some(answer) = ipc_server::join(path)
             {
                 return print_answer("run", answer);
             }
@@ -104,6 +108,14 @@ fn main() -> ExitCode {
             match comp::run(opts) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
+                    // Another orrery took the socket between the probe and here (most likely one still starting,
+                    // holding the lock): joined once it answers, if it does soon.
+                    if e.is::<ipc_server::Taken>()
+                        && let Some(path) = &control
+                        && let Some(answer) = ipc_server::join_within(path, JOIN_WAIT)
+                    {
+                        return print_answer("run", answer);
+                    }
                     eprintln!("{NAME}: {e:#}");
                     ExitCode::FAILURE
                 }

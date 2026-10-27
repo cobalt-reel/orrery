@@ -12,7 +12,7 @@ use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use smithay::reexports::calloop::generic::Generic;
@@ -93,6 +93,12 @@ fn check_dir(mode: u32, owner: u32, me: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// `bind`'s refusal when another orrery has the path: it holds the lock (perhaps still starting) or answers there.
+/// A `run` refused so may join it instead.
+#[derive(Debug, thiserror::Error)]
+#[error("{NAME} already running ({0})")]
+pub struct Taken(String);
+
 /// Binds `path` mode 0600, after checking its directory and taking `<path>.lock`. A held lock or a live orrery
 /// answering at the path is a refusal; a stale socket (nobody listening) is replaced; anything that is not a
 /// socket is left alone and refused.
@@ -119,12 +125,12 @@ pub fn bind(path: &Path) -> anyhow::Result<ControlSocket> {
         .with_context(|| format!("cannot open {}", Path::new(&lock_path).display()))?;
     // Safety: a valid fd for the life of `lock`.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("{NAME} already running (it holds {})", Path::new(&lock_path).display());
+        return Err(Taken(format!("it holds {}", Path::new(&lock_path).display())).into());
     }
 
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if UnixStream::connect(path).is_ok() {
-            bail!("{NAME} already running (its control socket {} answers)", path.display());
+            return Err(Taken(format!("its control socket {} answers", path.display())).into());
         }
         if !meta.file_type().is_socket() {
             bail!("{} exists and is not a socket; not touching it", path.display());
@@ -463,6 +469,21 @@ pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
 pub fn join(path: &Path) -> Option<anyhow::Result<Response>> {
     let stream = UnixStream::connect(path).ok()?;
     Some(exchange(stream, &Request::OpenScreen))
+}
+
+/// `join`, tried again until `wait` has passed while nothing answers: for a `run` refused because another orrery
+/// holds the lock but is still starting.
+pub fn join_within(path: &Path, wait: Duration) -> Option<anyhow::Result<Response>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(answer) = join(path) {
+            return Some(answer);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// One request on a connected stream, its answer back.

@@ -233,7 +233,12 @@ fn ten_screens_at_most() {
     }
     let err = orrery.msg_err(&["open-screen"]);
     assert!(err["error"].as_str().is_some_and(|e| e.contains("1 to 10")), "{err}");
+    // A further `run` joins, is refused the same way, and says so.
+    let (status, stdout, stderr, _runtime) = orrery.run_again();
+    assert!(!status.success(), "{stdout}{stderr}");
+    assert!(stderr.contains("1 to 10"), "{stdout}{stderr}");
     let state = orrery.state();
+    assert_eq!(state["monitors"].as_array().map(Vec::len), Some(10));
     assert_eq!(state["monitors"][9]["name"], "headless-10");
     assert_eq!(state["monitors"][9]["slots"][0]["rect"]["x"], 9 * SIZE.0);
     drop(client);

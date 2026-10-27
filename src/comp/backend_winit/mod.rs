@@ -19,11 +19,14 @@
 //! **One host connection, one GL context.** A single winit event loop serves every window, pumped from calloop
 //! (as Smithay's own winit backend does). winit creates windows only inside its event handler, so `open-screen`
 //! adds the output at once (its number taken, so a second request cannot get the same one) and queues the window,
-//! which the next pump creates; a window that cannot be created takes its output away again. One EGL display (made
-//! from the event loop's connection, not a window: the display keeps what it was made from alive, and closing that
-//! window would then leave it on the host) and one context and `GlesRenderer` serve every window, so client
-//! textures are shared; each window has its own EGL surface, made current before its frame (EGL reports the buffer
-//! age only for the current surface), with swap interval 0, and its own damage tracker.
+//! which the next pump creates; a window that cannot be created takes its output away again. Creating one blocks
+//! the loop until the host's first configure (milliseconds). A closed screen leaves no gap: the others are laid
+//! side by side again in opening order, as on a resize.
+//!
+//! One EGL display (made from the event loop's connection, not a window: the display keeps what it was made from
+//! alive, and closing that window would then leave it on the host) and one context and `GlesRenderer` serve every
+//! window, so client textures are shared; each window has its own EGL surface, made current before its frame (EGL
+//! reports the buffer age only for the current surface), with swap interval 0, and its own damage tracker.
 //!
 //! None of this is reachable from the headless tests.
 
@@ -47,7 +50,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{self, EventLoop, EventSource, Interest, PostAction, Readiness, Token};
 use smithay::reexports::winit::application::ApplicationHandler;
 use smithay::reexports::winit::dpi::LogicalSize;
-use smithay::reexports::winit::event::{StartCause, WindowEvent};
+use smithay::reexports::winit::event::{ElementState, StartCause, WindowEvent};
 use smithay::reexports::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop as HostLoop, OwnedDisplayHandle};
 use smithay::reexports::winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
 use smithay::reexports::winit::platform::scancode::PhysicalKeyExtScancode as _;
@@ -65,6 +68,9 @@ use crate::layout::Rect;
 
 /// How often housekeeping runs, clients get frame callbacks and redraws are requested: about 60 Hz.
 const FRAME: Duration = Duration::from_millis(16);
+
+/// A window's failed frames are logged at most this often: one that keeps failing would fill the log at 60 Hz.
+const WARN_EVERY: Duration = Duration::from_secs(10);
 
 /// Every screen's output is called this, numbered from the second on (`screen_name`).
 const BASE: &str = "winit";
@@ -230,6 +236,8 @@ struct Screen {
     decorations: render::Decorations,
     /// A frame was rendered but not submitted since the last submit (see `frame_age`).
     skipped_since_submit: bool,
+    /// When a failed frame was last logged (see `warn_due`).
+    warned: Option<Instant>,
 }
 
 /// Opening and closing nested screens: windows.
@@ -279,8 +287,8 @@ fn open_screen(host: &RefCell<Host>, state: &mut Orrery, number: u8) {
     host.borrow_mut().opening.push(output);
 }
 
-/// Closes the window of output `name` and takes the screen away; the last one closed quits. False when there is
-/// no such window.
+/// Closes the window of output `name` (or drops it from the queue, not yet created) and takes the screen away; the
+/// others close the gap. The last one closed quits. False when there is no such window.
 fn close_screen(host: &RefCell<Host>, state: &mut Orrery, name: &str) -> bool {
     let (closed, last) = {
         let mut host = host.borrow_mut();
@@ -291,18 +299,31 @@ fn close_screen(host: &RefCell<Host>, state: &mut Orrery, name: &str) -> bool {
         {
             tracing::warn!("cannot release the closed window's EGL surface: {e}");
         }
-        let closed = screen.is_some();
+        let closed = screen.is_some() || unqueue(&mut host.opening, name);
         drop(screen);
         (closed, host.windows.is_empty() && host.opening.is_empty())
     };
     if closed {
-        state.remove_output(name);
+        remove_screen(state, name);
         if last {
             tracing::info!("the last nested window closed");
             state.loop_signal.stop();
         }
     }
     closed
+}
+
+/// Takes output `name` out of the queue of windows to create; false when it is not there.
+fn unqueue(opening: &mut Vec<Output>, name: &str) -> bool {
+    let before = opening.len();
+    opening.retain(|o| o.name() != name);
+    opening.len() != before
+}
+
+/// Takes output `name` away and lays the others side by side again.
+fn remove_screen(state: &mut Orrery, name: &str) {
+    state.remove_output(name);
+    lay_side_by_side(state, None);
 }
 
 /// What the pump saw, kept until the event source can hand it to `handle` with the state.
@@ -360,7 +381,7 @@ fn handle(host: &RefCell<Host>, state: &mut Orrery, event: HostEvent) {
                 let host = host.borrow();
                 host.windows.is_empty() && host.opening.is_empty()
             };
-            state.remove_output(&output);
+            remove_screen(state, &output);
             if last {
                 state.loop_signal.stop();
             }
@@ -368,12 +389,18 @@ fn handle(host: &RefCell<Host>, state: &mut Orrery, event: HostEvent) {
     }
 }
 
-/// Output `name` follows its window's new size; every screen is laid side by side again in opening order, so a
-/// wider window never overlaps the next one in global space (where pointer positions are hit-tested).
+/// Output `name` follows its window's new size; every screen is laid side by side again (`lay_side_by_side`).
 fn resize_screen(state: &mut Orrery, name: &str, size: Size<i32, Physical>) {
     if let Some(output) = state.outputs.iter().find(|o| o.name() == name) {
         output.change_current_state(Some(Mode { size, refresh: 60_000 }), None, None, None);
     }
+    lay_side_by_side(state, Some(name));
+}
+
+/// Every screen side by side again in opening order, so a wider window never overlaps the next one in global space
+/// (where pointer positions are hit-tested) and a closed one leaves no gap. The monitors of the screens that moved
+/// follow, and that of `resized` (its size changed) even where it stayed.
+fn lay_side_by_side(state: &mut Orrery, resized: Option<&str>) {
     let sizes: Vec<_> = (state.outputs.iter())
         .map(|o| o.current_mode().map_or((0, 0), |m| (m.size.w, m.size.h)))
         .collect();
@@ -384,7 +411,7 @@ fn resize_screen(state: &mut Orrery, name: &str, size: Size<i32, Physical>) {
             output.change_current_state(None, None, None, Some((x, 0).into()));
             state.space.map_output(&output, (x, 0));
         }
-        if moved || output.name() == name {
+        if moved || resized == Some(output.name().as_str()) {
             state.resize_output(&output.name(), Rect { x, y: 0, w, h });
         }
     }
@@ -431,24 +458,31 @@ fn draw(host: &mut Host, id: WindowId, state: &mut Orrery) {
         Err(e) => Err(anyhow::anyhow!("cannot bind the window: {e}")),
     };
     let took = started.elapsed();
-    let presented = damage.and_then(|damage| match damage {
-        Some(damage) if !damage.is_empty() => {
-            let r = submit(screen, *swaps_damage, &damage).context("presenting the frame");
-            if r.is_ok() {
+    match damage {
+        Ok(Some(damage)) if !damage.is_empty() => match submit(screen, *swaps_damage, &damage) {
+            Ok(()) => {
                 screen.skipped_since_submit = false;
                 // Only frames that went to the screen count: idle damage checks would make the times look tiny.
                 state.frame_drawn(took);
             }
-            r
+            // The frame callback `pre_present_notify` asked for went out with no commit, so winit holds this
+            // window's redraws back for good.
+            Err(e) => tracing::error!("{name}: presenting the frame: {e}; this window will stop drawing"),
+        },
+        Ok(_) => screen.skipped_since_submit = true,
+        Err(e) => {
+            let now = Instant::now();
+            if warn_due(screen.warned, now) {
+                screen.warned = Some(now);
+                tracing::warn!("{name}: {e:#} (logged at most every {} s)", WARN_EVERY.as_secs());
+            }
         }
-        _ => {
-            screen.skipped_since_submit = true;
-            Ok(())
-        }
-    });
-    if let Err(e) = presented {
-        tracing::warn!("{name}: {e:#}");
     }
+}
+
+/// Whether a failed frame is logged, the last one having been logged at `last`.
+fn warn_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= WARN_EVERY)
 }
 
 /// Swaps the window's surface (current since `draw`), with `pre_present_notify` first: it asks the host for the
@@ -468,7 +502,8 @@ fn window_size(window: &WinitWindow) -> Size<i32, Physical> {
 /// Calloop's view of the host connection: pumps winit (creating queued windows, collecting events) before calloop
 /// sleeps and when the connection is readable, and hands what it collected to the callback.
 struct HostEvents {
-    // Declaration order is drop order: windows and EGL go before the host connection.
+    // Shared with the timer and `Screens`, so this field's order does not decide when windows and EGL go; any order
+    // is safe: the EGL display owns a display handle and every window holds the connection, which outlives them.
     host: Rc<RefCell<Host>>,
     host_loop: Generic<HostLoop<()>>,
     pending: Vec<HostEvent>,
@@ -607,8 +642,8 @@ impl ApplicationHandler for Pump<'_> {
                 event, is_synthetic, ..
             } if !is_synthetic && !event.repeat => {
                 *self.keys_down = match event.state {
-                    smithay::reexports::winit::event::ElementState::Pressed => self.keys_down.saturating_add(1),
-                    smithay::reexports::winit::event::ElementState::Released => self.keys_down.saturating_sub(1),
+                    ElementState::Pressed => self.keys_down.saturating_add(1),
+                    ElementState::Released => self.keys_down.saturating_sub(1),
                 };
                 HostEvent::Input(
                     id,
@@ -706,6 +741,7 @@ fn open_window(active: &ActiveEventLoop, host: &Host, output: &Output) -> anyhow
         damage_tracker: OutputDamageTracker::from_output(output),
         decorations: render::Decorations::default(),
         skipped_since_submit: false,
+        warned: None,
     })
 }
 
@@ -836,6 +872,34 @@ mod tests {
         assert_eq!(t.values().collect::<Vec<_>>(), vec![&'b']);
         t.remove_named("winit-2");
         assert!(t.is_empty(), "the last one closed");
+    }
+
+    #[test]
+    fn a_queued_window_can_be_unqueued() {
+        let output = |name: &str| {
+            Output::new(
+                name.into(),
+                PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: Subpixel::Unknown,
+                    make: NAME.into(),
+                    model: BASE.into(),
+                },
+            )
+        };
+        let mut opening = vec![output("winit-2"), output("winit-3")];
+        assert!(unqueue(&mut opening, "winit-2"));
+        assert!(!unqueue(&mut opening, "winit-2"), "once");
+        assert!(!unqueue(&mut opening, "winit"), "not queued");
+        assert_eq!(opening.iter().map(Output::name).collect::<Vec<_>>(), ["winit-3"]);
+    }
+
+    #[test]
+    fn a_failing_window_is_logged_once_per_ten_seconds() {
+        let t = Instant::now();
+        assert!(warn_due(None, t), "the first failure");
+        assert!(!warn_due(Some(t), t + Duration::from_secs(9)));
+        assert!(warn_due(Some(t), t + Duration::from_secs(10)));
     }
 
     #[test]

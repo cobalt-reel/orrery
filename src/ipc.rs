@@ -76,9 +76,10 @@ enum Wire {
     Split {},
     ToggleStacking {},
     Spawn { argv: Vec<String> },
-    // Wide, so every number out of range gets the range in its error, not serde's "expected u8".
-    Workspace { number: i64 },
-    MoveToWorkspace { number: i64 },
+    // Any JSON number, so every one out of range (or not an integer) gets the range in its error, not serde's
+    // "expected u8".
+    Workspace { number: serde_json::Number },
+    MoveToWorkspace { number: serde_json::Number },
     OpenScreen {},
     CloseScreen { name: String },
 }
@@ -114,9 +115,10 @@ impl TryFrom<Wire> for Request {
     }
 }
 
-/// A workspace number as a request carries it: 1..=WORKSPACES.
-fn workspace(number: i64, verb: &str) -> Result<u8, String> {
-    workspace_number(number.into()).ok_or_else(|| numbers(verb))
+/// A workspace number as a request carries it: an integer, 1..=WORKSPACES.
+fn workspace(number: serde_json::Number, verb: &str) -> Result<u8, String> {
+    let n = (number.as_i64().map(i128::from)).or_else(|| number.as_u64().map(i128::from));
+    n.and_then(workspace_number).ok_or_else(|| numbers(verb))
 }
 
 /// What a bad workspace number is told.
@@ -634,7 +636,19 @@ mod tests {
 
     #[test]
     fn every_out_of_range_workspace_number_gets_the_range() {
-        for n in ["0", "11", "256", "-1", "70000", "-9999999999"] {
+        for n in [
+            "0",
+            "11",
+            "256",
+            "-1",
+            "70000",
+            "-9999999999",
+            "9223372036854775808",
+            "99999999999999999999999",
+            "1e20",
+            "1.5",
+            "1.0",
+        ] {
             for verb in ["workspace", "move-to-workspace"] {
                 let json = format!(r#"{{"cmd":"{verb}","number":{n}}}"#);
                 let err = serde_json::from_str::<Request>(&json).expect_err(&json).to_string();

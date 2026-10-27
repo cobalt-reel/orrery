@@ -64,8 +64,10 @@ A second `orrery run` on the same control socket does not start another orrery: 
 more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used).
 Nested, that is one more window (same title and app id, so host window rules match it too), screen k's output
 named `winit-k` (screen 1 is `winit`); put it on another host monitor and orrery has two screens. Closing a window
-takes its screen away (its workspaces move, hidden, to the focused remaining screen); closing the last one quits. A
-stale socket left by a killed orrery (nothing listening) is replaced as usual.
+takes its screen away (its workspaces move, hidden, to the focused remaining screen, and the screens right of it
+move left, so orrery's global space has no gap); closing the last one quits. A `run` that finds an orrery still
+starting (it holds the lock but does not answer yet) waits up to a second for it to answer. A stale socket left by
+a killed orrery (nothing listening) is replaced as usual.
 
 orrery presents a window's frame only when the host asks for one, and everything else runs on its own timer, so a
 hidden orrery window (on another workspace, say) neither stalls the others nor stops orrery answering `orrery msg`
@@ -332,7 +334,8 @@ binds {
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
-- Nested, one output per window, scale 1; no layer-shell, no Xwayland.
+- Nested, one output per window, scale 1; no layer-shell, no Xwayland, no touch input.
+- Nested, `open-screen` holds orrery until the host has configured the new window (milliseconds).
 
 ## First nested session: checklist
 

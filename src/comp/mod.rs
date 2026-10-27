@@ -407,7 +407,8 @@ impl Orrery {
     /// screen numbered `Stacks::next_screen_number`).
     pub fn add_output(&mut self, output: Output, area: Rect) {
         let global = output.create_global::<Orrery>(&self.display_handle);
-        self.output_globals.insert(output.name(), global);
+        let replaced = self.output_globals.insert(output.name(), global);
+        debug_assert!(replaced.is_none(), "two outputs named {}", output.name());
         self.space.map_output(&output, (area.x, area.y));
         if let Some(layout) = layout_for_output(&self.config, &output.name()) {
             self.stacks.add_monitor(&output.name(), area, layout);

@@ -547,7 +547,7 @@ fn msg_refuses_bad_words_locally_and_reports_a_missing_orrery() {
 
 #[test]
 fn a_second_orrery_refuses_while_the_lock_is_held() {
-    // A orrery still starting holds the lock but does not answer yet: refused, not joined.
+    // A orrery still starting holds the lock but never answers (within a second): refused, not joined.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = socket_path_in(dir.path());
     let lock = std::fs::File::create(dir.path().join(format!("{NAME}.sock.lock"))).expect("lock file");
@@ -559,6 +559,74 @@ fn a_second_orrery_refuses_while_the_lock_is_held() {
     let stderr = refused_with(&path);
     assert!(stderr.contains("already running"), "{stderr}");
     assert!(!path.exists());
+}
+
+#[test]
+fn a_second_orrery_joins_one_that_answers_soon_after_holding_the_lock() {
+    // The lock is held and nothing answers yet: the one that has it is still starting. It answers 300 ms later.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = socket_path_in(dir.path());
+    let lock = std::fs::File::create(dir.path().join(format!("{NAME}.sock.lock"))).expect("lock file");
+    // Safety: a valid fd for the life of `lock`.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) },
+        0
+    );
+    let runtime = tempfile::tempdir().expect("temp runtime dir");
+    let child = Command::new(support::BIN)
+        .args(["run", "--backend", "headless", "--socket"])
+        .arg(&path)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_CONFIG_HOME", runtime.path())
+        .env_remove("WAYLAND_DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orrery");
+    let mut child = Killed(child);
+    std::thread::sleep(Duration::from_millis(300));
+    let listener = UnixListener::bind(&path).expect("bind");
+    listener.set_nonblocking(true).expect("non-blocking");
+    let deadline = Instant::now() + TIMEOUT;
+    let mut conn = loop {
+        match listener.accept() {
+            Ok((conn, _)) => break conn,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    child.0.try_wait().expect("wait").is_none(),
+                    "it gave up before the answer"
+                );
+                assert!(Instant::now() < deadline, "it never came back to join");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    conn.set_nonblocking(false).expect("blocking");
+    conn.set_read_timeout(Some(TIMEOUT)).expect("timeout");
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut conn), &mut line).expect("read the request");
+    assert_eq!(line.trim(), r#"{"cmd":"open-screen"}"#);
+    std::io::Write::write_all(&mut conn, b"{\"ok\":true}\n").expect("answer");
+    drop(conn);
+    let status = wait_or_kill(&mut child.0, "the second orrery kept running");
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.0.stdout.take().expect("stdout"), &mut out).expect("stdout");
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().expect("stderr"), &mut err).expect("stderr");
+    assert!(status.success(), "{out}{err}");
+    assert!(out.contains(r#""ok":true"#), "{out}{err}");
+}
+
+/// Kills the child if the test fails before it exits.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
