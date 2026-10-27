@@ -17,7 +17,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::Rect;
-use crate::link::Message;
+use crate::link::{Message, ScrollSource};
 
 /// A key by its raw keycode (xkb's: evdev's plus 8). Debug never shows which: keystrokes are never logged.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -369,7 +369,9 @@ fn unit(f: f64) -> f64 {
 }
 
 /// Input on its way to one machine, in order. Motion merges into motion queued last, so a link that stalls sends one
-/// step when it moves again, never a late replay; anything else (keys, buttons, scroll, handoffs) waits as it is.
+/// step when it moves again, never a late replay; finger scroll merges the same way, except its stop (nothing on
+/// either axis, as the receiver reads it) and a sum that would read as one. Anything else (keys, buttons, wheel
+/// scroll, handoffs) waits as it is.
 #[derive(Debug, Default)]
 pub struct Outbox {
     queue: VecDeque<Message>,
@@ -385,6 +387,29 @@ impl Outbox {
                 Some(Message::Motion { dx: x, dy: y }) if (*x + dx).is_finite() && (*y + dy).is_finite() => {
                     *x += dx;
                     *y += dy;
+                }
+                _ => self.queue.push_back(msg),
+            },
+            Message::Axis {
+                source: ScrollSource::Finger,
+                h,
+                v,
+                v120_h: 0,
+                v120_v: 0,
+            } if (h, v) != (0.0, 0.0) => match self.queue.back_mut() {
+                Some(Message::Axis {
+                    source: ScrollSource::Finger,
+                    h: x,
+                    v: y,
+                    v120_h: 0,
+                    v120_v: 0,
+                }) if (*x, *y) != (0.0, 0.0)
+                    && (*x + h).is_finite()
+                    && (*y + v).is_finite()
+                    && (*x + h, *y + v) != (0.0, 0.0) =>
+                {
+                    *x += h;
+                    *y += v;
                 }
                 _ => self.queue.push_back(msg),
             },
@@ -412,7 +437,6 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::ScrollSource;
 
     const SUPER: RawKey = RawKey(133);
     const SHIFT: RawKey = RawKey(50);
@@ -877,6 +901,46 @@ mod tests {
         assert_eq!(
             std::iter::from_fn(|| o.pop()).collect::<Vec<_>>(),
             [motion(f64::MAX, 1.0), motion(f64::MAX - 1.0, 2.0)]
+        );
+    }
+
+    #[test]
+    fn finger_scroll_merges_while_it_waits_and_its_stop_never_does() {
+        let axis = |source, h, v| Message::Axis {
+            source,
+            h,
+            v,
+            v120_h: 0,
+            v120_v: 0,
+        };
+        let finger = |h, v| axis(ScrollSource::Finger, h, v);
+        let mut o = Outbox::default();
+        o.push(finger(1.0, 2.0));
+        o.push(finger(0.5, -1.0));
+        o.push(finger(0.0, 3.0));
+        assert_eq!(o.len(), 1, "one step of scroll");
+        // A stop (nothing on either axis) waits as it is, and nothing merges into it.
+        o.push(finger(0.0, 0.0));
+        o.push(finger(2.0, 0.0));
+        // Scroll that would sum to nothing would read as a stop: kept apart.
+        o.push(finger(-2.0, 0.0));
+        // Another source, or motion between, keeps them apart.
+        o.push(axis(ScrollSource::Continuous, 0.0, 1.0));
+        o.push(finger(0.0, 1.0));
+        o.push(motion(1.0, 0.0));
+        o.push(finger(0.0, 1.0));
+        assert_eq!(
+            std::iter::from_fn(|| o.pop()).collect::<Vec<_>>(),
+            [
+                finger(1.5, 4.0),
+                finger(0.0, 0.0),
+                finger(2.0, 0.0),
+                finger(-2.0, 0.0),
+                axis(ScrollSource::Continuous, 0.0, 1.0),
+                finger(0.0, 1.0),
+                motion(1.0, 0.0),
+                finger(0.0, 1.0),
+            ]
         );
     }
 

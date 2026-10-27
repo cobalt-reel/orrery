@@ -442,8 +442,9 @@ as if typed on it. The satellite's own keyboard and pointer keep working on it a
   host's relative-pointer protocol (most Wayland compositors have it; X11 reports raw motion): pushing past orrery's
   outer edge counts. Headless there is nothing to hold. The machine input went to draws the pointer itself while it
   has it: the client's cursor, or a plain square where a client names one (orrery has no cursor theme).
-- **Motion merges, nothing else does:** when a link stalls, pointer movement waiting for it merges into one step and
-  is never replayed late; keys, buttons and scroll all arrive, in order. The satellite acknowledges the input it ran,
+- **Motion merges, keys never do:** when a link stalls, pointer movement waiting for it merges into one step and is
+  never replayed late, and so does touchpad scroll (its stop kept apart); keys, buttons and wheel steps all arrive,
+  in order. The satellite acknowledges the input it ran,
   and the primary keeps at most 32 input messages unacknowledged: the rest wait on the primary, where they merge
   (`queued` in `state` shows them).
 - Plain typing never shows in `last_key` on the primary while it is forwarded, and keystrokes are never logged.
