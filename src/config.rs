@@ -2,10 +2,14 @@
 //!
 //! Parsing is pure (a string in, a model out); reading the file is the caller's job.
 
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use smithay::input::keyboard::{Keysym, xkb};
 
 use crate::layout::{Dir, Layout, LayoutError, MAX_WEIGHT, SlotSpec};
+use crate::session::Role;
 use crate::stacks::WORKSPACES;
 
 /// The built-in config, used when no file exists. Kept as a file so it can be copied to start a config; the
@@ -85,6 +89,42 @@ pub struct Config {
     pub stacking: bool,
     pub colors: Colors,
     pub binds: Vec<Bind>,
+    /// This machine's place in a session of linked orrerys (`listen` or `primary`); None: alone.
+    pub link: Option<LinkConfig>,
+    /// `name`: this machine's name in a session; None: its hostname.
+    pub name: Option<String>,
+}
+
+/// A machine name (`name`, a satellite's Hello) is at most this many bytes.
+pub const MAX_NAME: usize = 64;
+
+/// `listen "ADDR:PORT" secret-file="PATH"` (the primary, `Role::Primary`) or `primary "HOST:PORT"
+/// secret-file="PATH"` (a satellite, `Role::Satellite`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkConfig {
+    pub role: Role,
+    /// The primary: the address it listens on (an IP address and a port; port 0 picks one). A satellite: where the
+    /// primary is (a host name or IP address, and a port).
+    pub addr: String,
+    /// As written: absolute, or `~/` for the home directory (see `secret_path`).
+    pub secret_file: String,
+}
+
+impl LinkConfig {
+    /// The secret file's path, `~/` taken as `home` (left as written without one).
+    #[must_use]
+    pub fn secret_path(&self, home: Option<&Path>) -> PathBuf {
+        match (self.secret_file.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(&self.secret_file),
+        }
+    }
+}
+
+/// Whether `name` can name a machine: 1 to `MAX_NAME` bytes, no control characters.
+#[must_use]
+pub fn valid_machine_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_NAME && !name.chars().any(char::is_control)
 }
 
 /// The layout an output starts with (outputs without a rule get the first layout).
@@ -294,6 +334,10 @@ impl<'a> Parser<'a> {
         let mut colors: Option<Colors> = None;
         let mut raw_binds: Vec<RawBind> = Vec::new();
         let mut seen_binds = false;
+        let mut link: Option<LinkConfig> = None;
+        let mut seen_link: Option<&str> = None;
+        let mut name: Option<String> = None;
+        let mut seen_name = false;
 
         for node in doc.nodes() {
             match node.name().value() {
@@ -345,6 +389,35 @@ impl<'a> Parser<'a> {
                     }
                     colors = Some(self.colors(node));
                 }
+                which @ ("listen" | "primary") => {
+                    match seen_link {
+                        Some(w) if w == which => self.err(node, format!("`{which}` is set twice")),
+                        Some(_) => self.err(
+                            node,
+                            "`listen` and `primary` are both set: a machine is the primary or a satellite",
+                        ),
+                        None => {}
+                    }
+                    seen_link = Some(which);
+                    if let Some(l) = self.link(node) {
+                        link = Some(l);
+                    }
+                }
+                "name" => {
+                    if seen_name {
+                        self.err(node, "`name` is set twice");
+                    }
+                    seen_name = true;
+                    self.no_children(node);
+                    let msg = format!("`name` takes one machine name, 1 to {MAX_NAME} bytes, no control characters");
+                    if let Some((text, at)) = self.only_string(node, &msg) {
+                        if valid_machine_name(&text) {
+                            name = Some(text);
+                        } else {
+                            self.err_at(at, msg);
+                        }
+                    }
+                }
                 "binds" => {
                     if seen_binds {
                         self.err(node, "`binds` is set twice");
@@ -389,6 +462,54 @@ impl<'a> Parser<'a> {
             stacking: stacking.unwrap_or(true),
             colors: colors.unwrap_or_default(),
             binds,
+            link,
+            name,
+        })
+    }
+
+    /// A `listen` or `primary` node.
+    fn link(&mut self, node: &KdlNode) -> Option<LinkConfig> {
+        self.no_children(node);
+        let which = node.name().value();
+        let (role, msg) = match which {
+            "listen" => (
+                Role::Primary,
+                "`listen` takes the address and port to listen on, like \"0.0.0.0:7340\"",
+            ),
+            _ => (
+                Role::Satellite,
+                "`primary` takes the primary's HOST:PORT, like \"desk.lan:7340\"",
+            ),
+        };
+        let file = self.props(node, &["secret-file"])[0];
+        let addr = self.one_string(node, msg).and_then(|(addr, at)| {
+            let ok = match role {
+                Role::Primary => addr.parse::<SocketAddr>().is_ok(),
+                Role::Satellite => host_port(&addr),
+            };
+            if !ok {
+                self.err_at(at, msg);
+            }
+            ok.then_some(addr)
+        });
+        let secret_file = match file {
+            Some(e) => self.string_value(e, "secret-file").and_then(|f| {
+                let ok = f.starts_with('/') || f.starts_with("~/");
+                if !ok {
+                    let msg = "`secret-file` must be an absolute path, or start with ~/ for the home directory";
+                    self.err_at(e.span().offset(), msg);
+                }
+                ok.then_some(f)
+            }),
+            None => {
+                self.err(node, format!("`{which}` needs secret-file=\"PATH\""));
+                None
+            }
+        };
+        Some(LinkConfig {
+            role,
+            addr: addr?,
+            secret_file: secret_file?,
         })
     }
 
@@ -891,6 +1012,18 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// `HOST:PORT`: a host (a name, an IPv4 address, or an IPv6 one in brackets) and a port, 1 to 65535.
+fn host_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => !host.is_empty() && !host.contains([':', '[', ']']) && !host.chars().any(char::is_whitespace),
+    };
+    host_ok && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 fn children(node: &KdlNode) -> &[KdlNode] {
     node.children().map_or(&[], |d| d.nodes())
 }
@@ -1058,6 +1191,8 @@ mod tests {
                 bind(MOD_SHIFT, "E", k::KEY_e, Action::Quit),
             ])
             .collect(),
+            link: None,
+            name: None,
         }
     }
 
@@ -1621,6 +1756,93 @@ mod tests {
             5,
             "slot 0 is only 0x2160 at 3840x2160 (at least 64 px each way)",
         );
+    }
+
+    #[test]
+    fn a_machine_listens_or_follows_a_primary_and_has_a_name() {
+        assert_eq!(
+            (default_config().link, default_config().name),
+            (None, None),
+            "alone by default"
+        );
+        let c = parse(&format!(
+            "{DEFAULT}\nlisten \"0.0.0.0:7340\" secret-file=\"~/.config/orrery/secret\"\nname \"desk\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            c.link,
+            Some(LinkConfig {
+                role: Role::Primary,
+                addr: "0.0.0.0:7340".into(),
+                secret_file: "~/.config/orrery/secret".into(),
+            })
+        );
+        assert_eq!(c.name.as_deref(), Some("desk"));
+        let c = parse(&format!(
+            "{DEFAULT}\nprimary \"desk.lan:7340\" secret-file=\"/etc/orrery-secret\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            c.link,
+            Some(LinkConfig {
+                role: Role::Satellite,
+                addr: "desk.lan:7340".into(),
+                secret_file: "/etc/orrery-secret".into(),
+            })
+        );
+        // A bracketed IPv6 address works for both.
+        parse(&format!("{DEFAULT}\nprimary \"[::1]:7340\" secret-file=\"/s\"\n")).expect("parses");
+        parse(&format!("{DEFAULT}\nlisten \"[::]:7340\" secret-file=\"/s\"\n")).expect("parses");
+        // `~/` is the home directory; any other path is taken as written.
+        let link = c.link.expect("a link");
+        assert_eq!(
+            link.secret_path(Some(Path::new("/home/me"))),
+            PathBuf::from("/etc/orrery-secret")
+        );
+        let home = LinkConfig {
+            secret_file: "~/s".into(),
+            ..link
+        };
+        assert_eq!(
+            home.secret_path(Some(Path::new("/home/me"))),
+            PathBuf::from("/home/me/s")
+        );
+    }
+
+    #[test]
+    fn link_lines_are_strict() {
+        let at_end = |extra: &str| format!("{DEFAULT}\n{extra}");
+        let last = DEFAULT.lines().count() + 2;
+        for (bad, word) in [
+            ("listen \"0.0.0.0:7340\"", "secret-file"),
+            ("listen secret-file=\"/s\"", "address"),
+            ("listen \"desk:7340\" secret-file=\"/s\"", "address"),
+            ("listen \"0.0.0.0\" secret-file=\"/s\"", "address"),
+            ("listen \"0.0.0.0:70000\" secret-file=\"/s\"", "address"),
+            ("primary \"desk\" secret-file=\"/s\"", "HOST:PORT"),
+            ("primary \":7340\" secret-file=\"/s\"", "HOST:PORT"),
+            ("primary \"desk:port\" secret-file=\"/s\"", "HOST:PORT"),
+            ("primary \"desk:7340\" secret-file=\"s\"", "absolute"),
+            ("primary \"desk:7340\" secret-file=1", "string"),
+            ("primary \"desk:7340\" secret-file=\"/s\" key=\"x\"", "unknown property"),
+            ("primary \"desk:7340\" secret-file=\"/s\" {\n}", "block"),
+            ("name", "name"),
+            ("name \"\"", "name"),
+            ("name \"a\\tb\"", "name"),
+            ("name \"x\" \"y\"", "name"),
+        ] {
+            assert_problem(&at_end(bad), last, word);
+        }
+        assert_problem(&at_end(&"name \"x\"\n".repeat(2)), last + 1, "twice");
+        let long = format!("name \"{}\"", "n".repeat(MAX_NAME + 1));
+        assert_problem(&at_end(&long), last, "name");
+        assert_problem(
+            &at_end("listen \"0.0.0.0:1\" secret-file=\"/s\"\nlisten \"0.0.0.0:2\" secret-file=\"/s\""),
+            last + 1,
+            "twice",
+        );
+        let both = at_end("listen \"0.0.0.0:1\" secret-file=\"/s\"\nprimary \"desk:1\" secret-file=\"/s\"");
+        assert_problem(&both, last + 1, "both");
     }
 
     #[test]

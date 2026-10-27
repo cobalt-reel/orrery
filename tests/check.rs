@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Output};
 
 use orrery_wm::comp::config_path_in;
@@ -57,4 +58,38 @@ fn without_config_it_checks_the_default_path() {
     std::fs::write(config_path_in(home.path()), config::DEFAULT).unwrap();
     let out = check(&[], home.path());
     assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn the_link_is_reported_and_its_secret_file_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    let contents = "never-shown-0b5e and enough more to be 32 bytes";
+    std::fs::write(&secret, contents).unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let path = dir.path().join("config.kdl");
+    let link = format!("listen \"127.0.0.1:7340\" secret-file=\"{}\"", secret.display());
+    std::fs::write(&path, format!("{}\nname \"desk\"\n{link}\n", config::DEFAULT)).unwrap();
+    let out = check(&["--config".as_ref(), path.as_os_str()], dir.path());
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(
+        said.starts_with("ok\nlink: \"desk\", the primary, listening on 127.0.0.1:7340"),
+        "{said}"
+    );
+    assert!(
+        said.contains(&secret.display().to_string()) && !said.contains("never-shown"),
+        "{said}"
+    );
+
+    // Open to others: refused, with the path and never the contents.
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = check(&["--config".as_ref(), path.as_os_str()], dir.path());
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&secret.display().to_string()) && err.contains("chmod 600"),
+        "{err}"
+    );
+    assert!(!err.contains("never-shown") && out.stdout.is_empty(), "{err}");
 }

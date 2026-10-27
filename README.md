@@ -155,6 +155,7 @@ orrery msg reload                     # re-read the config now (it is also watch
 orrery msg quit
 orrery msg '{"cmd":"layout","name":"wall"}'   # a single argument is taken as a JSON request
 orrery msg --socket /path/to/orrery.sock state
+orrery msg --to side state            # any request, run on that machine of the session (see Linking machines)
 ```
 
 Errors come back as `{"ok":false,"error":"..."}` (also printed on stderr), e.g. an unknown layout or monitor.
@@ -172,7 +173,8 @@ activation), `frames` (how long drawing a frame takes on the compositor thread: 
 `p95_us`, `max_us` over about the last minute; absent before the first frame and headless, which draws nothing) and
 `last_key`: the last key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a
 bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
-Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was.
+Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. In a session, `state` also carries
+`session` (see [Linking machines](#linking-machines)); alone it has none.
 
 ## The config, its reload and `orrery check`
 
@@ -191,7 +193,9 @@ orrery check                          # the default path; or: orrery check --con
 ```
 
 prints `ok` (exit 0), or every problem as `FILE:LINE:COL: message` on stderr (exit 1). A missing file is exit 1
-too (orrery would use the built-in config).
+too (orrery would use the built-in config). With `listen` or `primary` it also reads the secret file as `run` would
+(what is wrong with it is an error, exit 1) and prints a `link:` line: the machine's name, its role and address,
+and the secret file's path.
 
 ### Reference
 
@@ -219,6 +223,12 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   focused slot's current stack (`#true`, the default) or as a new tab there; `toggle-stacking` flips it while
   running. Dialogs go on their parent's stack and launched programs' windows open as new tabs where the launch was
   made, whatever `stacking` says.
+- `listen "ADDR:PORT" secret-file="PATH"`: this machine is a session's primary, listening for satellites on that
+  IP address and port (`0.0.0.0:7340` for every interface; port 0 picks one, shown in `state`).
+- `primary "HOST:PORT" secret-file="PATH"`: this machine is a satellite of the primary there (a host name or an IP
+  address, IPv6 in brackets). A machine has `listen` or `primary`, never both. `PATH` is absolute, or starts with
+  `~/` for the home directory.
+- `name "NAME"`: this machine's name in a session, 1 to 64 bytes, unique in it; default: the hostname.
 - `colors { focus "#rrggbb"; badge "#rrggbb"; attention "#rrggbb"; background "#rrggbb" }`: each also
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
   one window and the tab strips, `attention` the badge of a slot holding a window that asked for attention,
@@ -324,6 +334,65 @@ binds {
     "Mod+Shift+E" quit
 }
 ```
+
+## Linking machines
+
+orrerys on several machines make one **session**: one **primary** and any number of **satellites**. Workspace
+numbers are one space across the session: the primary's screens come first, then each satellite's in the order they
+join, and workspace k is locked to screen k wherever that screen is. Each machine keeps its own windows; for now the
+keyboard and pointer stay on the machine they are plugged into.
+
+```kdl
+// the primary
+name "desk"
+listen "0.0.0.0:7340" secret-file="~/.config/orrery/secret"
+
+// each satellite
+name "side"
+primary "desk.lan:7340" secret-file="~/.config/orrery/secret"
+```
+
+The **secret file** holds the same 32 or more random bytes on every machine and is readable by its owner only
+(orrery refuses it otherwise, naming the file, and never logs or shows its contents):
+
+```sh
+(umask 077; head -c 32 /dev/urandom | base64 > ~/.config/orrery/secret)   # then copy it to each machine, 0600
+```
+
+Holding it is a shell on every machine in the session (`--to` can spawn programs), so guard it like a private key.
+The link is TCP, encrypted and authenticated with Noise on that secret: a machine with another secret never joins
+(the primary logs the failed handshake) and nothing crosses in clear. The satellite connects; the primary only
+listens. To cross a firewall or NAT one way is an ssh reverse tunnel from the primary, so the satellite reaches it at
+its own loopback:
+
+```sh
+ssh -R 7340:127.0.0.1:7340 side       # on the primary; the satellite's config says primary "127.0.0.1:7340"
+```
+
+- **Joining:** a satellite keeps its workspace numbers where they are free in the session; a number already taken
+  moves, windows and screen with it, to the lowest free one (two machines that both start with screen 1: the
+  satellite's becomes 2). A name already in the session, or another link protocol version, is refused with a reason
+  shown on both ends (the satellite's in `state`).
+- **`workspace N`** (keys or `orrery msg`) on the primary goes to the machine that has N: that machine shows it, and
+  the session's focus marker moves there. A number nobody has is made on the machine holding the marker. On a
+  satellite, a number another machine has is refused (switch to it from the primary).
+- **`move-to-workspace N`** to a number on another machine is refused: windows never cross machines.
+- **`orrery msg --to MACHINE <request>`** runs any request on that machine and prints its answer (`--to side
+  spawn foot`, `--to side state`); on the primary, through the link (an error after 5 s without an answer); naming
+  the machine itself runs it there; a satellite sends nothing on.
+- **Dropping:** a satellite that loses the primary keeps working alone with every workspace number it has, and
+  tries again every 1 s, backing off to every 5 s; the primary frees its numbers meanwhile. On the rejoin it keeps
+  them where still free. A link silent for 10 s counts as lost.
+- `listen`, `primary` and `name` take effect when orrery starts; a reload reads the secret file again (a secret
+  that cannot be read is the `config_error`, and the one read before stays in use).
+
+`state.session` shows this machine's place: `machine` (its name), `role` (`primary` or `satellite`), `listen` (the
+primary's address, with the port it picked for 0), `primary` (a satellite's primary, as configured), `foreign` (the
+workspace numbers other machines own), `error` (why a link last failed, until one opens), and `machines`: on the
+primary every machine in the session (itself first, then the satellites in join order), on a satellite itself, each
+as `{ name, role, monitors, workspaces, latency_ms, connected, focused }` (`monitors` as `{ name, number }`;
+`latency_ms` the link's round trip, pinged every 2 s, null for the primary itself; `focused`: the session's focus
+marker is there).
 
 ## Limits
 

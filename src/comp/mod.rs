@@ -8,6 +8,7 @@ mod frames;
 mod handlers;
 mod input;
 pub mod ipc_server;
+pub mod net;
 mod render;
 mod spawn;
 
@@ -309,6 +310,8 @@ pub struct Orrery {
     pub screens: Option<Box<dyn Screens>>,
     /// How long frames take to draw (backends with a renderer record them).
     frames: frames::FrameStats,
+    /// This machine in a session of linked orrerys; None alone.
+    net: Option<net::Net>,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -391,6 +394,7 @@ impl Orrery {
             output_globals: HashMap::new(),
             screens: None,
             frames: frames::FrameStats::new(Instant::now()),
+            net: None,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -770,9 +774,23 @@ impl Orrery {
         }
     }
 
-    /// One request, from the socket or a key. Pure requests go through the stacks and are arranged.
+    /// One request, from the socket, a key or the primary. Pure requests go through the stacks and are arranged;
+    /// in a session `workspace` and `move-to-workspace` go through it first. A `to` for another machine is sent
+    /// there and answered ok at once (its answer, an error, is logged): the control socket uses `link_forward`.
     pub fn handle_request(&mut self, request: Request) -> Response {
         match request {
+            Request::Workspace { number } if self.net.is_some() => self.session_workspace(number),
+            Request::MoveToWorkspace { number } if self.net.is_some() => self.session_move(number),
+            Request::To { machine, request } => {
+                let to = machine.clone();
+                let logged = Box::new(move |r: Response| {
+                    if let Some(e) = r.error {
+                        tracing::info!("{to}: {e}");
+                    }
+                });
+                self.link_forward(&machine, *request, logged)
+                    .unwrap_or_else(Response::ok)
+            }
             Request::State => Response::with_state(self.state_view()),
             Request::Close => {
                 // A request to the client; the window leaves the stacks when it is destroyed or unmapped.
@@ -811,13 +829,18 @@ impl Orrery {
                 screens.open(state, number)
             }),
             Request::CloseScreen { name } => self.with_screens("close", |screens, state| screens.close(state, &name)),
-            pure => match pure.apply(&mut self.stacks, &self.config) {
-                Ok(()) => {
-                    self.arrange();
-                    Response::ok()
-                }
-                Err(e) => Response::error(e),
-            },
+            pure => self.apply(pure),
+        }
+    }
+
+    /// A pure request applied to the stacks, then arranged.
+    fn apply(&mut self, pure: Request) -> Response {
+        match pure.apply(&mut self.stacks, &self.config) {
+            Ok(()) => {
+                self.arrange();
+                Response::ok()
+            }
+            Err(e) => Response::error(e),
         }
     }
 
@@ -826,7 +849,8 @@ impl Orrery {
     /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets
     /// `config_error`, which shows as the red bar until a good config loads. A file gone while running (an editor
     /// between delete and write, say) keeps the running config: the built-in one stands in only at startup. That
-    /// is an error answer for `reload` but not a `config_error`.
+    /// is an error answer for `reload` but not a `config_error`. In a session the secret file is read again too (a
+    /// failure is the `config_error`); `listen`, `primary` and `name` take effect on the next start.
     pub fn reload(&mut self) -> Result<(), String> {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());
@@ -846,11 +870,17 @@ impl Orrery {
                     }
                 }
                 self.stacking = stacking_after_reload(self.stacking, &self.config, &config);
+                if (&self.config.link, &self.config.name) != (&config.link, &config.name) {
+                    tracing::warn!("`listen`, `primary` and `name` changed: they take effect when {NAME} starts again");
+                }
                 self.config = config;
-                self.config_error = None;
+                self.config_error = self.link_reload();
                 self.arrange();
                 tracing::info!("config reloaded");
-                Ok(())
+                match &self.config_error {
+                    Some(e) => Err(e.clone()),
+                    None => Ok(()),
+                }
             }
             Err(e) => {
                 tracing::error!("{e}; keeping the old config");
@@ -890,6 +920,7 @@ impl Orrery {
                 .unwrap_or_default()
         });
         view.frames = self.frames.view();
+        view.session = self.session_view().map(Box::new);
         view.last_key = self.last_key.clone();
         let now = Instant::now();
         view.launches = (self.launches.all().iter())
@@ -1023,6 +1054,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
         Backend::Winit => backend_winit::init(&mut event_loop, &mut state)?,
         Backend::Headless => backend_headless::init(&mut event_loop, &mut state, opts.size)?,
     }
+    state.start_link();
 
     let Some(name) = state.socket_name.to_str().map(str::to_owned) else {
         bail!("the Wayland socket name is not UTF-8");
@@ -1035,6 +1067,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
 
     event_loop
         .run(None, &mut state, |state| {
+            state.link_tick();
             // Everything queued for clients during this iteration goes out now.
             if let Err(e) = state.display_handle.flush_clients() {
                 tracing::warn!("flushing clients: {e}");

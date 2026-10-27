@@ -16,7 +16,8 @@ use crate::stacks::WORKSPACES;
 /// Workspace numbers to change, (from, to): what a join or a report hands a machine for `Stacks::apply_session`.
 pub type Renames = Vec<(u8, u8)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Role {
     Primary,
     Satellite,

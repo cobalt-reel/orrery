@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Cycle, parse_dir, workspace_number};
 use crate::layout::{Dir, Rect};
+use crate::session::{Role, Screen};
 use crate::stacks::{Stacks, WORKSPACES, WinId, Workspace};
 
 /// Read through `Wire`: every variant needs a twin there (a test fails to compile until it has one).
@@ -56,6 +57,12 @@ pub enum Request {
     CloseScreen {
         name: String,
     },
+    /// `request` run on machine `machine` of the session (`orrery msg --to`), through the primary; never another
+    /// `to`.
+    To {
+        machine: String,
+        request: Box<Request>,
+    },
 }
 
 /// How a `Request` is read: serde ignores unknown fields on internally tagged unit variants, so here they are
@@ -82,6 +89,7 @@ enum Wire {
     MoveToWorkspace { number: serde_json::Number },
     OpenScreen {},
     CloseScreen { name: String },
+    To { machine: String, request: Box<Request> },
 }
 
 impl TryFrom<Wire> for Request {
@@ -111,6 +119,15 @@ impl TryFrom<Wire> for Request {
             },
             Wire::OpenScreen {} => Request::OpenScreen,
             Wire::CloseScreen { name } => Request::CloseScreen { name },
+            Wire::To { machine, request } => {
+                if machine.is_empty() {
+                    return Err("`to` takes a machine name".into());
+                }
+                if matches!(*request, Request::To { .. }) {
+                    return Err("`to` takes one machine: its request cannot be another `to`".into());
+                }
+                Request::To { machine, request }
+            }
         })
     }
 }
@@ -162,6 +179,47 @@ pub struct StateView {
     /// Recent spawns and whether a window has taken each (see `placement`), oldest first: a debug aid.
     #[serde(default)]
     pub launches: Vec<LaunchView>,
+    /// This machine's place in a session of linked orrerys; absent alone (no `listen` or `primary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Box<SessionView>>,
+}
+
+/// A machine in a session: who it is, where it links, and the machines it knows. The primary knows every machine
+/// in the session; a satellite only itself (and which numbers the others own).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionView {
+    /// This machine's name.
+    pub machine: String,
+    pub role: Role,
+    /// The primary: the address it listens on, the port picked when it was given 0; absent while not listening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// A satellite: the primary's address, as configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    /// The primary: itself, then the satellites in join order. A satellite: itself.
+    pub machines: Vec<MachineView>,
+    /// The workspace numbers other machines own here: switching or moving to them is not done on this machine.
+    pub foreign: Vec<u8>,
+    /// Why a link last failed (a handshake, a refusal, a connection lost), until the next one opens.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineView {
+    pub name: String,
+    pub role: Role,
+    /// Its screens, in number order.
+    pub monitors: Vec<Screen>,
+    /// The workspace numbers it owns, its screens' among them.
+    pub workspaces: Vec<u8>,
+    /// The round trip of its link to the primary (to this machine, for a satellite's own view); null for the
+    /// primary itself and before the first answer to a ping.
+    pub latency_ms: Option<u64>,
+    /// Its link is up (on the primary every machine in the session is).
+    pub connected: bool,
+    /// It holds the session's focus marker: `workspace N` last went to it (the primary's view only).
+    pub focused: bool,
 }
 
 /// One recent spawn: the program's pid, the xdg-activation token it was handed, its age, and whether a window has
@@ -345,6 +403,7 @@ impl StateView {
             frames: None,
             last_key: None,
             launches: Vec::new(),
+            session: None,
         }
     }
 }
@@ -395,7 +454,8 @@ impl Request {
             | Request::ToggleStacking
             | Request::Spawn { .. }
             | Request::OpenScreen
-            | Request::CloseScreen { .. } => {
+            | Request::CloseScreen { .. }
+            | Request::To { .. } => {
                 return Err(format!("{} is answered by the compositor", self.verb()));
             }
         }
@@ -420,6 +480,7 @@ impl Request {
             Request::MoveToWorkspace { .. } => "move-to-workspace",
             Request::OpenScreen => "open-screen",
             Request::CloseScreen { .. } => "close-screen",
+            Request::To { .. } => "to",
         }
     }
 }
@@ -528,10 +589,11 @@ mod tests {
             Request::MoveToWorkspace { number } => (13, Wire::MoveToWorkspace { number: number.into() }),
             Request::OpenScreen => (14, Wire::OpenScreen {}),
             Request::CloseScreen { name } => (15, Wire::CloseScreen { name }),
+            Request::To { machine, request } => (16, Wire::To { machine, request }),
         }
     }
 
-    const VARIANTS: usize = 16;
+    const VARIANTS: usize = 17;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -576,6 +638,10 @@ mod tests {
             Request::OpenScreen,
             Request::CloseScreen {
                 name: "headless-2".into(),
+            },
+            Request::To {
+                machine: "desk".into(),
+                request: Box::new(Request::Workspace { number: 2 }),
             },
         ]
     }
@@ -628,6 +694,13 @@ mod tests {
             r#"{"cmd":"move-to-workspace","number":10}"#
         );
         assert_eq!(json(&Request::OpenScreen), r#"{"cmd":"open-screen"}"#);
+        assert_eq!(
+            json(&Request::To {
+                machine: "desk".into(),
+                request: Box::new(Request::State)
+            }),
+            r#"{"cmd":"to","machine":"desk","request":{"cmd":"state"}}"#
+        );
         assert_eq!(
             json(&Request::CloseScreen {
                 name: "headless-2".into()
@@ -684,6 +757,11 @@ mod tests {
             r#"{"cmd":"open-screen","name":"x"}"#,
             r#"{"cmd":"close-screen"}"#,
             r#"{"cmd":"close-screen","name":2}"#,
+            r#"{"cmd":"to","machine":"desk"}"#,
+            r#"{"cmd":"to","request":{"cmd":"state"}}"#,
+            r#"{"cmd":"to","machine":"","request":{"cmd":"state"}}"#,
+            r#"{"cmd":"to","machine":"desk","request":{"cmd":"bogus"}}"#,
+            r#"{"cmd":"to","machine":"a","request":{"cmd":"to","machine":"b","request":{"cmd":"state"}}}"#,
             r#"{"dir":"left"}"#,
             r#"[]"#,
         ] {
@@ -748,6 +826,26 @@ mod tests {
                 age_ms: 120,
                 claimed: false,
             }],
+            session: Some(Box::new(SessionView {
+                machine: "desk".into(),
+                role: Role::Primary,
+                listen: Some("127.0.0.1:7340".into()),
+                primary: None,
+                machines: vec![MachineView {
+                    name: "desk".into(),
+                    role: Role::Primary,
+                    monitors: vec![Screen {
+                        name: "winit".into(),
+                        number: 1,
+                    }],
+                    workspaces: vec![1, 4],
+                    latency_ms: None,
+                    connected: true,
+                    focused: true,
+                }],
+                foreign: vec![2],
+                error: None,
+            })),
         }
     }
 
@@ -765,6 +863,17 @@ mod tests {
             "{}",
             json(&r)
         );
+        let session = concat!(
+            r#""session":{"machine":"desk","role":"primary","listen":"127.0.0.1:7340","machines":[{"name":"desk","#,
+            r#""role":"primary","monitors":[{"name":"winit","number":1}],"workspaces":[1,4],"latency_ms":null,"#,
+            r#""connected":true,"focused":true}],"foreign":[2],"error":null}"#
+        );
+        assert!(json(&r).contains(session), "{}", json(&r));
+        let alone = Response::with_state(StateView {
+            session: None,
+            ..state_view()
+        });
+        assert!(!json(&alone).contains("session"), "absent alone");
         let workspaces = concat!(
             r#""workspaces":[{"number":4,"monitor":"winit","shown":false,"layout":"halves","#,
             r#""focused_slot":1,"slots":[]}]"#
@@ -997,6 +1106,10 @@ mod tests {
             },
             Request::OpenScreen,
             Request::CloseScreen { name: "other".into() },
+            Request::To {
+                machine: "desk".into(),
+                request: Box::new(Request::Split),
+            },
         ] {
             let (mut s, config) = setup();
             let err = req.apply(&mut s, &config).expect_err("not pure");

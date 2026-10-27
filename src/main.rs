@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use orrery_wm::comp::{self, Backend, RunOptions, ipc_server};
-use orrery_wm::ipc::Response;
+use orrery_wm::comp::{self, Backend, RunOptions, ipc_server, net};
+use orrery_wm::ipc::{Request, Response};
+use orrery_wm::link::Secret;
+use orrery_wm::session::Role;
 use orrery_wm::{NAME, config, ipc};
 
 #[derive(Parser)]
@@ -26,13 +28,17 @@ enum Command {
     Msg {
         #[arg(long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Run the request on that machine of the session (through the primary).
+        #[arg(long, value_name = "MACHINE")]
+        to: Option<String>,
         /// Words (`focus-slot left`) or a single JSON request.
         #[arg(required = true)]
         request: Vec<String>,
         #[command(subcommand)]
         spawn: Option<MsgSpawn>,
     },
-    /// Validate a config file: `ok`, or every problem as `FILE:LINE:COL: message`; exit 0 or 1.
+    /// Validate a config file: `ok` (and the link, if any), or every problem as `FILE:LINE:COL: message`; exit 0
+    /// or 1.
     Check {
         #[arg(long, help = format!("Default: `{}`", config_default()))]
         config: Option<PathBuf>,
@@ -40,7 +46,7 @@ enum Command {
 }
 
 /// `msg spawn` is a subcommand only so that its argv is taken verbatim, flags included; every other request is
-/// words, with `--socket` before or after them.
+/// words, with `--socket` and `--to` before or after them.
 #[derive(Subcommand)]
 enum MsgSpawn {
     /// Launch a program as a `spawn` bind does: every word after `spawn` is its argv (no shell).
@@ -71,7 +77,7 @@ fn socket_help() -> String {
 
 /// `spawn` is the only subcommand; clap's own second form (`msg <COMMAND>`) would hide `--socket`.
 fn msg_usage() -> String {
-    let socket = "[--socket <SOCKET>]";
+    let socket = "[--socket <SOCKET>] [--to <MACHINE>]";
     format!("{NAME} msg {socket} <REQUEST>...\n       {NAME} msg {socket} spawn <PROGRAM> [ARGS]...")
 }
 
@@ -121,12 +127,17 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Msg { socket, request, spawn } => {
+        Command::Msg {
+            socket,
+            to,
+            request,
+            spawn,
+        } => {
             let words = match spawn {
                 Some(MsgSpawn::Spawn { argv }) => std::iter::once("spawn".to_owned()).chain(argv).collect(),
                 None => request,
             };
-            msg(socket, &words)
+            msg(socket, to, &words)
         }
         Command::Check { config } => check(config),
     }
@@ -153,8 +164,24 @@ fn check(path: Option<PathBuf>) -> ExitCode {
         }
     };
     match config::parse(&src) {
-        Ok(_) => {
+        Ok(config) => {
+            let Some(link) = &config.link else {
+                println!("ok");
+                return ExitCode::SUCCESS;
+            };
+            // The secret file is read as `run` reads it: what is wrong with it is said here, its contents never.
+            let secret = net::secret_path(link);
+            if let Err(e) = Secret::load(&secret) {
+                eprintln!("{}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            let name = net::machine_name(&config);
+            let place = match link.role {
+                Role::Primary => format!("the primary, listening on {}", link.addr),
+                Role::Satellite => format!("a satellite of the primary at {}", link.addr),
+            };
             println!("ok");
+            println!("link: {name:?}, {place}, secret file {}", secret.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -167,10 +194,16 @@ fn check(path: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// `orrery msg`: one request, its answer as `print_answer` shows it.
-fn msg(socket: Option<PathBuf>, words: &[String]) -> ExitCode {
+/// `orrery msg`: one request (to `to`, when given), its answer as `print_answer` shows it.
+fn msg(socket: Option<PathBuf>, to: Option<String>, words: &[String]) -> ExitCode {
     let request = match ipc::parse_words(words) {
-        Ok(r) => r,
+        Ok(r) => match to {
+            Some(machine) => Request::To {
+                machine,
+                request: Box::new(r),
+            },
+            None => r,
+        },
         Err(e) => {
             eprintln!("{NAME} msg: {e}");
             return ExitCode::FAILURE;
@@ -242,6 +275,28 @@ mod tests {
         };
         assert_eq!(request, ["focus-slot", "left"]);
         assert_eq!(socket, Some(PathBuf::from("/t")));
+        // `--to` too, before or after; spawn's argv stays verbatim after it.
+        let Some(Command::Msg { request, to, .. }) =
+            Cli::parse_from([NAME, "msg", "workspace", "2", "--to", "desk"]).command
+        else {
+            panic!("msg parses");
+        };
+        assert_eq!(
+            (request, to),
+            (vec!["workspace".to_owned(), "2".into()], Some("desk".into()))
+        );
+        let Some(Command::Msg {
+            to,
+            spawn: Some(MsgSpawn::Spawn { argv }),
+            ..
+        }) = Cli::parse_from([NAME, "msg", "--to", "desk", "spawn", "foot", "--to", "x"]).command
+        else {
+            panic!("msg spawn parses");
+        };
+        assert_eq!(
+            (to, argv),
+            (Some("desk".into()), vec!["foot".into(), "--to".into(), "x".into()])
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The control socket: `orrery msg` connects, sends one JSON `Request` line, gets one `Response` line back, and
 //! the connection closes. Everything runs on calloop, with no threads and nothing blocking: a connection is a
 //! source that reads until its line is complete, then (if the answer does not fit the socket at once) a source
-//! that writes the rest. Every connection has a total deadline, and only a few may be open at once.
+//! that writes the rest. Every connection has a total deadline, and only a few may be open at once. A `to` request
+//! for another machine is answered when that machine answers (`net::Reply`), within a longer deadline.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 
 use super::Orrery;
+use super::net::{FORWARD_TIMEOUT, Reply};
 use crate::NAME;
 use crate::ipc::{Request, Response};
 
@@ -29,11 +31,13 @@ pub const MAX_REQUEST: usize = 64 * 1024;
 /// cuts off a reader too slow to take a huge answer (a `state` with very many long titles) within it; `orrery
 /// msg` then reports a parse error for the truncated line. Accepted: a real client reads it at once.
 pub const DEADLINE: Duration = Duration::from_secs(2);
+/// The deadline of a connection whose request went to another machine: its answer may take `FORWARD_TIMEOUT`.
+pub const FORWARDED_DEADLINE: Duration = FORWARD_TIMEOUT.saturating_add(DEADLINE);
 /// Connections open at once; one more is answered "busy" and closed.
 pub const MAX_CONNECTIONS: usize = 16;
 /// Out of file descriptors: stop accepting for this long instead of spinning on a ready listener.
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
-/// How long `orrery msg` waits for orrery.
+/// How long `orrery msg` waits for orrery (and for a `to`, `FORWARD_TIMEOUT` more).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The control socket in `dir`: `<dir>/<NAME>.sock`.
@@ -182,7 +186,7 @@ fn finish(handle: &LoopHandle<'static, Orrery>, conns: &Registry, id: u64) {
 
 /// What to do when accept fails: back off on fd exhaustion (the listener stays ready, so retrying at once
 /// would spin), carry on otherwise.
-fn accept_backoff(e: &std::io::Error) -> Option<Duration> {
+pub(super) fn accept_backoff(e: &std::io::Error) -> Option<Duration> {
     matches!(
         e.raw_os_error(),
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
@@ -361,6 +365,20 @@ fn accept(handle: &LoopHandle<'static, Orrery>, conns: &Registry, stream: UnixSt
             }
             let response = match reader.take(eof) {
                 Line::Partial => return Ok(PostAction::Continue),
+                Line::Done(Ok(Request::To { machine, request })) => {
+                    let Ok(writer) = stream.try_clone() else {
+                        finish(&h, &registry, id);
+                        return Ok(PostAction::Remove);
+                    };
+                    match state.link_forward(&machine, *request, answer_later(&h, &registry, id, writer)) {
+                        Some(response) => response,
+                        None => {
+                            // Another machine answers: the connection waits for it, nothing more to read.
+                            wait_longer(&h, &registry, id);
+                            return Ok(PostAction::Remove);
+                        }
+                    }
+                }
                 Line::Done(Ok(request)) => state.handle_request(request),
                 Line::Done(Err(_)) if eof && reader.buf.is_empty() => {
                     // Connected and left without a word: nobody to answer.
@@ -404,31 +422,92 @@ fn accept(handle: &LoopHandle<'static, Orrery>, conns: &Registry, stream: UnixSt
         return;
     };
 
-    let (h, registry) = (handle.clone(), conns.clone());
-    let deadline = handle.insert_source(Timer::from_duration(DEADLINE), move |_, _, _| {
-        // Still live: whatever serves it now goes, with the connection.
-        if let Some(live) = registry.borrow_mut().live.remove(&id)
-            && let Some(io) = live.io
-        {
-            tracing::debug!("control connection {id} timed out");
-            h.remove(io);
-        }
-        TimeoutAction::Drop
-    });
+    let deadline = deadline(handle, conns, id, DEADLINE);
     let mut c = conns.borrow_mut();
     match (deadline, c.live.get_mut(&id)) {
-        (Ok(timer), Some(live)) => {
+        (Some(timer), Some(live)) => {
             live.io = Some(io);
             live.deadline = Some(timer);
         }
-        (Ok(timer), None) => handle.remove(timer),
-        (Err(_), _) => {
+        (Some(timer), None) => handle.remove(timer),
+        (None, _) => {
             // No deadline, no connection.
             tracing::warn!("cannot time a control connection");
             c.live.remove(&id);
             handle.remove(io);
         }
     }
+}
+
+/// Connection `id`'s deadline, `after` from now.
+fn deadline(
+    handle: &LoopHandle<'static, Orrery>,
+    conns: &Registry,
+    id: u64,
+    after: Duration,
+) -> Option<RegistrationToken> {
+    let (h, registry) = (handle.clone(), conns.clone());
+    handle
+        .insert_source(Timer::from_duration(after), move |_, _, _| {
+            // Still live: whatever serves it now goes, with the connection.
+            if let Some(live) = registry.borrow_mut().live.remove(&id)
+                && let Some(io) = live.io
+            {
+                tracing::debug!("control connection {id} timed out");
+                h.remove(io);
+            }
+            TimeoutAction::Drop
+        })
+        .ok()
+}
+
+/// Connection `id`'s request went to another machine: its reader is done, and its deadline is now
+/// `FORWARDED_DEADLINE` (without one, the forward's own timeout still answers it).
+fn wait_longer(handle: &LoopHandle<'static, Orrery>, conns: &Registry, id: u64) {
+    let old = match conns.borrow_mut().live.get_mut(&id) {
+        Some(live) => {
+            live.io = None;
+            live.deadline.take()
+        }
+        None => return,
+    };
+    if let Some(t) = old {
+        handle.remove(t);
+    }
+    let later = deadline(handle, conns, id, FORWARDED_DEADLINE);
+    match conns.borrow_mut().live.get_mut(&id) {
+        Some(live) => live.deadline = later,
+        None => later.into_iter().for_each(|t| handle.remove(t)),
+    }
+}
+
+/// Where the answer to connection `id`'s forwarded request goes: written as any answer, unless the connection
+/// timed out meanwhile.
+fn answer_later(handle: &LoopHandle<'static, Orrery>, conns: &Registry, id: u64, stream: UnixStream) -> Reply {
+    let (h, registry) = (handle.clone(), conns.clone());
+    Box::new(move |response| {
+        if !registry.borrow().live.contains_key(&id) {
+            return;
+        }
+        let out = encode(&response);
+        let mut done = 0;
+        match write_some(&stream, &out, &mut done) {
+            Ok(false) => {
+                if let Some(token) = write_later(&h, &registry, id, stream, out, done)
+                    && let Some(live) = registry.borrow_mut().live.get_mut(&id)
+                {
+                    live.io = Some(token);
+                    return;
+                }
+                finish(&h, &registry, id);
+            }
+            Ok(true) => finish(&h, &registry, id),
+            Err(e) => {
+                tracing::debug!("control connection write: {e}");
+                finish(&h, &registry, id);
+            }
+        }
+    })
 }
 
 /// A source writing the rest of an answer as the socket drains; removed when done, on error, or by the deadline.
@@ -488,9 +567,11 @@ pub fn join_within(path: &Path, wait: Duration) -> Option<anyhow::Result<Respons
 
 /// One request on a connected stream, its answer back.
 fn exchange(mut stream: UnixStream, request: &Request) -> anyhow::Result<Response> {
-    stream
-        .set_read_timeout(Some(CLIENT_TIMEOUT))
-        .context("socket timeout")?;
+    let wait = match request {
+        Request::To { .. } => CLIENT_TIMEOUT + FORWARD_TIMEOUT,
+        _ => CLIENT_TIMEOUT,
+    };
+    stream.set_read_timeout(Some(wait)).context("socket timeout")?;
     stream
         .set_write_timeout(Some(CLIENT_TIMEOUT))
         .context("socket timeout")?;
