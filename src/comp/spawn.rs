@@ -13,18 +13,28 @@ use std::time::Instant;
 use super::Orrery;
 use crate::placement::Launch;
 
+/// Where a launched program finds its xdg-activation token: the protocol's name, and the older startup-notification
+/// one that some toolkits still read.
+const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
+
 /// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
 /// toolkit falls back to the host's Xwayland) for the child only (orrery's
-/// own environment keeps the host's, which winit needs), no stdio, its own process group (a Ctrl+C in orrery's
-/// terminal does not reach it), and an empty signal mask. None for an empty argv.
+/// own environment keeps the host's, which winit needs), `token` as its xdg-activation token under both names
+/// toolkits read (removed without one: a token orrery was started with is not orrery's to hand on), no stdio, its
+/// own process group (a Ctrl+C in orrery's terminal does not reach it), and an empty signal mask. None for an
+/// empty argv.
 #[must_use]
-pub fn command(argv: &[String], display: &OsStr) -> Option<Command> {
+pub fn command(argv: &[String], display: &OsStr, token: Option<&str>) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
-    cmd.args(args)
-        .env("WAYLAND_DISPLAY", display)
-        .env_remove("DISPLAY")
-        .stdin(Stdio::null())
+    cmd.args(args).env("WAYLAND_DISPLAY", display).env_remove("DISPLAY");
+    for name in TOKEN_VARS {
+        match token {
+            Some(t) => cmd.env(name, t),
+            None => cmd.env_remove(name),
+        };
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
@@ -47,16 +57,21 @@ pub fn command(argv: &[String], display: &OsStr) -> Option<Command> {
 }
 
 impl Orrery {
-    /// Starts `argv` (see `command`) and records it as a launch aimed at the focused slot; the error says why it
-    /// could not be started (a key logs it, `msg` answers it).
+    /// Starts `argv` (see `command`) with a fresh xdg-activation token and records it as a launch aimed at the
+    /// focused slot; the error says why it could not be started (a key logs it, `msg` answers it).
     pub fn spawn(&mut self, argv: &[String]) -> Result<(), String> {
-        let Some(mut cmd) = command(argv, &self.socket_name) else {
+        // Smithay mints it; the launch keeps it. Activations never look in Smithay's pool (see `handlers`), so it
+        // is not left there to pile up.
+        let token = self.xdg_activation_state.create_external_token(None).0.clone();
+        self.xdg_activation_state.remove_token(&token);
+        let token = String::from(token);
+        let Some(mut cmd) = command(argv, &self.socket_name, Some(&token)) else {
             return Err("nothing to spawn: the argv is empty".into());
         };
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!("spawned {argv:?} (pid {})", child.id());
-                self.record_launch(child.id());
+                self.record_launch(child.id(), token);
                 self.children.push(child);
                 Ok(())
             }
@@ -66,7 +81,7 @@ impl Orrery {
 
     /// A launch of `pid` aimed at the focused monitor's focused slot as it is now. Without a monitor there is no
     /// target, and nothing is recorded: the window goes to `pending` either way.
-    fn record_launch(&mut self, pid: u32) {
+    fn record_launch(&mut self, pid: u32, token: String) {
         let now = Instant::now();
         self.launches.expire(now);
         let Some(mon) = self.stacks.monitors().get(self.stacks.focused_monitor()) else {
@@ -74,7 +89,7 @@ impl Orrery {
         };
         self.launches.push(Launch {
             pid,
-            token: None,
+            token: Some(token),
             monitor: mon.name().to_owned(),
             slot: mon.focus(),
             at: now,
@@ -120,15 +135,33 @@ mod tests {
     #[test]
     fn the_child_does_not_see_the_host_x_display() {
         // With DISPLAY set (Xwayland in the host), toolkits may pick X and open outside orrery.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9")).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&(OsStr::new("DISPLAY"), None)), "{envs:?}");
         assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wayland-9")))));
     }
 
     #[test]
+    fn the_child_gets_its_activation_token_under_both_names() {
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), Some("tok123")).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+            assert!(
+                envs.contains(&(OsStr::new(name), Some(OsStr::new("tok123")))),
+                "{name}: {envs:?}"
+            );
+        }
+        // Without one, a token orrery itself was started with is not handed on: it is not orrery's to give.
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+            assert!(envs.contains(&(OsStr::new(name), None)), "{name}: {envs:?}");
+        }
+    }
+
+    #[test]
     fn empty_argv_is_nothing() {
-        assert!(command(&[], OsStr::new("wayland-9")).is_none());
+        assert!(command(&[], OsStr::new("wayland-9"), None).is_none());
     }
 
     #[test]
@@ -143,7 +176,7 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            let mut cmd = command(&argv, OsStr::new("wayland-test-7")).unwrap();
+            let mut cmd = command(&argv, OsStr::new("wayland-test-7"), None).unwrap();
             cmd.stdout(Stdio::piped());
             cmd.output().unwrap()
         })

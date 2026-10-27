@@ -116,6 +116,19 @@ pub struct StateView {
     /// at when a bind does nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_key: Option<KeyView>,
+    /// Recent spawns and whether a window has taken each (see `placement`), oldest first: a debug aid.
+    #[serde(default)]
+    pub launches: Vec<LaunchView>,
+}
+
+/// One recent spawn: the program's pid, the xdg-activation token it was handed, its age, and whether a window has
+/// taken it (opened for it, or moved to it by an activation with its token). Forgotten lazily, after 5 s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchView {
+    pub pid: u32,
+    pub token: Option<String>,
+    pub age_ms: u64,
+    pub claimed: bool,
 }
 
 /// A key press as the bind lookup read it: the key (its keysym's name; `(plain key)` for typing, which is never
@@ -258,6 +271,7 @@ impl StateView {
             config_error,
             frames: None,
             last_key: None,
+            launches: Vec::new(),
         }
     }
 }
@@ -553,6 +567,12 @@ mod tests {
                 mods: "Super".into(),
                 bind: Some("focus-slot left".into()),
             }),
+            launches: vec![LaunchView {
+                pid: 4242,
+                token: Some("tok".into()),
+                age_ms: 120,
+                claimed: false,
+            }],
         }
     }
 
@@ -565,6 +585,11 @@ mod tests {
         assert!(r.ok);
         let back: Response = serde_json::from_str(&json(&r)).expect("deserializes");
         assert_eq!(back, r);
+        assert!(
+            json(&r).contains(r#""launches":[{"pid":4242,"token":"tok","age_ms":120,"claimed":false}]"#),
+            "{}",
+            json(&r)
+        );
     }
 
     fn words(s: &str) -> Vec<String> {

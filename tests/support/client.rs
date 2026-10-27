@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -62,6 +63,9 @@ pub struct State {
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     decorations: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    activation: Option<xdg_activation_v1::XdgActivationV1>,
+    /// The token the compositor gave for the last `activation_token` request.
+    token: Option<String>,
     outputs: Vec<wl_output::WlOutput>,
     pub globals: Vec<String>,
     pub windows: Vec<Win>,
@@ -246,6 +250,26 @@ impl Client {
         i
     }
 
+    /// xdg_activation_v1.activate for window `i` with `token`, whoever made it.
+    pub fn activate(&mut self, i: usize, token: &str) {
+        let surface = self.state.windows[i].surface.as_ref().expect("live window");
+        let activation = self.state.activation.as_ref().expect("xdg_activation_v1");
+        activation.activate(token.to_owned(), surface);
+        self.roundtrip();
+    }
+
+    /// A token of this client's own, from xdg_activation_v1.get_activation_token (no serial, no surface).
+    pub fn activation_token(&mut self) -> String {
+        let qh = self.queue.handle();
+        self.state.token = None;
+        let activation = self.state.activation.as_ref().expect("xdg_activation_v1");
+        let token = activation.get_activation_token(&qh, ());
+        token.commit();
+        assert!(self.wait_for(|s| s.token.is_some()), "no token came");
+        token.destroy();
+        self.state.token.take().expect("the token")
+    }
+
     pub fn popup(&self, i: usize) -> &Popup {
         &self.state.popups[i]
     }
@@ -339,6 +363,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(6), qh, ())),
             "zxdg_decoration_manager_v1" => state.decorations = Some(registry.bind(name, 1, qh, ())),
+            "xdg_activation_v1" => state.activation = Some(registry.bind(name, 1, qh, ())),
             // Without a bound wl_output, wl_surface.enter cannot be sent, and mapping could not be observed.
             "wl_output" => state.outputs.push(registry.bind(name, version.min(4), qh, ())),
             _ => {}
@@ -518,6 +543,21 @@ impl Dispatch<wl_surface::WlSurface, PopupId> for State {
     }
 }
 
+impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &xdg_activation_token_v1::XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            state.token = Some(token);
+        }
+    }
+}
+
 /// Objects whose events the tests do not need.
 macro_rules! ignore_events {
     ($($t:ty),*) => {$(
@@ -534,5 +574,6 @@ ignore_events!(
     wl_buffer::WlBuffer,
     wl_output::WlOutput,
     xdg_positioner::XdgPositioner,
-    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    xdg_activation_v1::XdgActivationV1
 );

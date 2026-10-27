@@ -27,7 +27,7 @@ libc = "0.2.191"
 [dev-dependencies]
 tempfile = "3.27.0"
 wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
 
 # Dependencies (kdl, smithay, ...) optimised in dev builds: the parser-heavy tests run several times faster, and
 # orrery's own code stays at opt-level 0 for debugging.

@@ -1,12 +1,15 @@
-//! Protocol handlers: compositor, shm, xdg-shell, xdg-decoration, seat, data device, output. They translate
-//! events into `Orrery` calls; placement is `Orrery::arrange`'s alone.
+//! Protocol handlers: compositor, shm, xdg-shell, xdg-decoration, xdg-activation, seat, data device, output. They
+//! translate events into `Orrery` calls; placement is `Orrery::arrange`'s alone.
 
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
 use smithay::desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords};
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::wayland_protocols::xdg::activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::reexports::wayland_server::{Client, Resource};
+use smithay::reexports::wayland_server::{
+    Client, DataInit, Dispatch, DisplayHandle, Resource, delegate_dispatch, delegate_global_dispatch,
+};
 use smithay::utils::{Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -20,6 +23,9 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::xdg_activation::{
+    ActivationTokenData, XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration,
     delegate_xdg_shell,
@@ -220,6 +226,45 @@ impl ServerDndGrabHandler for Orrery {}
 
 impl OutputHandler for Orrery {}
 
+impl XdgActivationHandler for Orrery {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    // A client's own token (xdg_activation_v1.get_activation_token, to pass focus to another of its windows or to
+    // a program it starts) is never a launch's: an activation with it is a plain request, like one with any token
+    // orrery did not hand out. Nothing looks it up again, so it is not kept.
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        false
+    }
+
+    // Unreached: orrery dispatches xdg_activation_v1 itself (below). Routed the same way should that change.
+    fn request_activation(&mut self, token: XdgActivationToken, _data: XdgActivationTokenData, surface: WlSurface) {
+        self.activation_requested(&token, &surface);
+    }
+}
+
+/// Smithay's dispatch, except `activate`: Smithay passes on only tokens in its pool and drops the rest silently,
+/// but to orrery every request counts (`Orrery::activation_requested` decides what a token is worth).
+impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for Orrery {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &xdg_activation_v1::XdgActivationV1,
+        request: xdg_activation_v1::Request,
+        data: &(),
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_activation_v1::Request::Activate { token, surface } => state.activation_requested(&token, &surface),
+            other => <XdgActivationState as Dispatch<xdg_activation_v1::XdgActivationV1, (), Self>>::request(
+                state, client, resource, other, data, dh, data_init,
+            ),
+        }
+    }
+}
+
 delegate_compositor!(Orrery);
 delegate_shm!(Orrery);
 delegate_xdg_shell!(Orrery);
@@ -227,3 +272,6 @@ delegate_xdg_decoration!(Orrery);
 delegate_seat!(Orrery);
 delegate_data_device!(Orrery);
 delegate_output!(Orrery);
+// delegate_xdg_activation! less the xdg_activation_v1 requests (see its Dispatch above).
+delegate_global_dispatch!(Orrery: [xdg_activation_v1::XdgActivationV1: ()] => XdgActivationState);
+delegate_dispatch!(Orrery: [xdg_activation_token_v1::XdgActivationTokenV1: ActivationTokenData] => XdgActivationState);

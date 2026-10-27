@@ -305,19 +305,7 @@ impl Stacks {
         if self.has(w) {
             return;
         }
-        let m = match monitor {
-            Some(name) => self.index_of(name),
-            None => Some(self.focused_monitor),
-        };
-        let target = m.and_then(|m| {
-            let mon = self.monitors.get(m)?;
-            let s = slot.unwrap_or(mon.focus);
-            (s < mon.slots.len()).then_some((m, s))
-        });
-        let Some((m, s)) = target.or_else(|| {
-            let mon = self.monitors.get(self.focused_monitor)?;
-            Some((self.focused_monitor, mon.focus))
-        }) else {
+        let Some((m, s)) = self.target(monitor, slot) else {
             self.pending.push(w);
             return;
         };
@@ -451,6 +439,30 @@ impl Stacks {
         true
     }
 
+    /// `w` leaves wherever it is (a tab it leaves empty goes, as on a close) for a new tab right after the current
+    /// one in `slot` of `monitor` (the focused slot if that is not there), shown, and that slot focused: where an
+    /// activation with a launch's token sends a window. Already a tab of its own there: that tab is shown, nothing
+    /// moves. An unknown or pending `w` does nothing.
+    pub fn move_window_to_tab(&mut self, w: WinId, monitor: &str, slot: usize) {
+        let Some((m, s, t, p)) = self.where_is(w) else {
+            return;
+        };
+        // w is placed, so there is a monitor and a target.
+        let Some((tm, ts)) = self.target(Some(monitor), Some(slot)) else {
+            return;
+        };
+        let from = &mut self.monitors[m].slots[s];
+        if (m, s) == (tm, ts) && from.tabs[t].len() == 1 {
+            from.current = t;
+        } else {
+            from.remove(t, p);
+            self.monitors[tm].slots[ts].insert_tab(vec![w]);
+        }
+        self.focused_monitor = tm;
+        self.monitors[tm].focus = ts;
+        self.settle();
+    }
+
     /// Marks `w` as asking for attention. Only a waiting window can be: one on top is already seen, and one not
     /// placed has no slot to show it.
     pub fn mark(&mut self, w: WinId) {
@@ -532,6 +544,24 @@ impl Stacks {
     /// Placed or pending: every open refuses such an id, so a window can never be in two places.
     fn has(&self, w: WinId) -> bool {
         self.where_is(w).is_some() || self.pending.contains(&w)
+    }
+
+    /// (monitor, slot) for `slot` of `monitor`, each defaulting to the focused one; the focused slot when that is
+    /// not there; None with no monitor.
+    fn target(&self, monitor: Option<&str>, slot: Option<usize>) -> Option<(usize, usize)> {
+        let m = match monitor {
+            Some(name) => self.index_of(name),
+            None => Some(self.focused_monitor),
+        };
+        let target = m.and_then(|m| {
+            let mon = self.monitors.get(m)?;
+            let s = slot.unwrap_or(mon.focus);
+            (s < mon.slots.len()).then_some((m, s))
+        });
+        target.or_else(|| {
+            let mon = self.monitors.get(self.focused_monitor)?;
+            Some((self.focused_monitor, mon.focus))
+        })
     }
 
     fn index_of(&self, monitor: &str) -> Option<usize> {
@@ -1253,6 +1283,79 @@ mod tests {
     }
 
     #[test]
+    fn move_window_to_tab_takes_it_out_and_shows_it_as_a_new_tab_there() {
+        // Tabs [1], [2, 3], [4] in slot 0 (the middle one current); slot 3 holds [5], [6] (6 current).
+        let mut s = three_tabs();
+        s.focus_slot(Dir::Right);
+        s.open_stacked(5);
+        s.open_tab(6, None, None);
+        s.focus_at("winit", 1);
+        // Beneath the top of a stack: it leaves the stack.
+        s.mark(2);
+        s.move_window_to_tab(2, "winit", 3);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![3], vec![4]]);
+        assert_eq!(tabs(&s, 0, 3), [vec![5], vec![6], vec![2]]);
+        assert_eq!(current(&s, 0, 3), 2);
+        assert_eq!((s.focused_monitor, s.monitors[0].focus), (0, 3));
+        assert_eq!(s.focused_window(), Some(2));
+        assert!(!s.is_marked(2), "shown");
+        // The last window of its tab: the tab goes, as on a close.
+        s.move_window_to_tab(4, "winit", 5);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![3]]);
+        assert_eq!(current(&s, 0, 0), 1);
+        assert_eq!(tabs(&s, 0, 5), [vec![4]]);
+        assert_eq!((s.monitors[0].focus, s.focused_window()), (5, Some(4)));
+    }
+
+    #[test]
+    fn move_window_to_tab_shows_a_window_already_alone_in_a_tab_there_where_it_is() {
+        // Tabs [1], [2, 3], [4], the middle one current.
+        let mut s = three_tabs();
+        s.focus_at("winit", 2);
+        s.move_window_to_tab(4, "winit", 0);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3], vec![4]], "nothing moves");
+        assert_eq!(current(&s, 0, 0), 2);
+        assert_eq!((s.monitors[0].focus, s.focused_window()), (0, Some(4)));
+        // Already shown: only focus changes.
+        s.focus_at("winit", 2);
+        s.move_window_to_tab(4, "winit", 0);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3], vec![4]]);
+        assert_eq!((s.monitors[0].focus, s.focused_window()), (0, Some(4)));
+        // In a stack of the target slot, not alone: it leaves the stack for a tab of its own after the current.
+        s.cycle_tab(Cycle::Prev);
+        s.move_window_to_tab(2, "winit", 0);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![3], vec![2], vec![4]]);
+        assert_eq!(current(&s, 0, 0), 2);
+    }
+
+    #[test]
+    fn move_window_to_tab_with_the_target_gone_uses_the_focused_slot() {
+        let mut s = three_tabs();
+        s.add_monitor("second", UHD, layout("halves"));
+        s.focus_at("second", 1);
+        s.move_window_to_tab(1, "gone", 0);
+        s.move_window_to_tab(4, "winit", 9);
+        assert_invariants(&s);
+        assert_eq!(tabs(&s, 1, 1), [vec![1], vec![4]]);
+        assert_eq!(current(&s, 1, 1), 1);
+        assert_eq!(tabs(&s, 0, 0), [vec![2, 3]]);
+        assert_eq!(s.focused_window(), Some(4));
+        // Unknown or pending windows: nothing.
+        let before = s.clone();
+        s.move_window_to_tab(99, "winit", 0);
+        assert_eq!(s, before);
+        let mut none = Stacks::new();
+        none.open_stacked(1);
+        let before = none.clone();
+        none.move_window_to_tab(1, "winit", 0);
+        assert_eq!(none, before);
+    }
+
+    #[test]
     fn remove_the_focused_monitor_sends_its_tabs_to_the_first() {
         let mut s = wall_monitor();
         s.open_stacked(1);
@@ -1527,7 +1630,7 @@ mod tests {
             let op = if live.len() > 12 && rng.below(2) == 0 {
                 3
             } else {
-                rng.below(20)
+                rng.below(21)
             };
             match op {
                 0 | 1 => {
@@ -1591,6 +1694,10 @@ mod tests {
                     }
                 }
                 16 => s.split(),
+                19 => {
+                    let m = name(&mut rng, &s);
+                    s.move_window_to_tab(pick(&mut rng, &live), &m, rng.below(7) as usize);
+                }
                 17 | 18 => {
                     let w = pick(&mut rng, &live);
                     s.mark(w);

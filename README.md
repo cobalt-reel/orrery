@@ -94,6 +94,13 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 A slot holding more than one window (in any tab, at any depth) shows a small badge in its top-right corner. A
 click focuses the slot under the pointer.
 
+A window asking to be seen (xdg-activation) is never raised. When it is what its slot shows, that slot is focused;
+otherwise it is marked for attention: its slot's badge and its tab's strip segment take the `attention` colour
+until the window comes on top (a `cycle-tab`, a close above it), and the mark does not come back. One exception:
+each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), and a window asking with the
+token of a spawn under 5 s old that no window has taken yet moves to where the spawn was made, as a new tab there
+(a single-instance program opening its existing window from a new launch, say).
+
 ## `orrery msg`
 
 One request to the running orrery; the answer is JSON on stdout (pretty for `state`), exit 0 only when it says
@@ -119,8 +126,11 @@ orrery msg --socket /path/to/orrery.sock state
 Errors come back as `{"ok":false,"error":"..."}` (also printed on stderr), e.g. an unknown layout or monitor.
 
 Each slot's `tabs` lists its tabs left to right, each as `{ current, attention, windows }` with `windows` (`id`,
-`app_id`, `title`) bottom to top. Besides the monitors, `state` carries `stacking` (the running value),
-`config_error` (why the config file was not loaded, or null), `frames`
+`app_id`, `title`) bottom to top; `attention` is true when a window of that tab asked to be seen. Besides the
+monitors, `state` carries `stacking` (the running value), `config_error` (why the config file was not loaded, or
+null), `launches` (recent spawns, oldest first, as `{ pid, token, age_ms, claimed }`: the activation token each was
+handed and whether a window has taken it; a debug aid; one over 5 s old no longer counts and goes on the next spawn,
+new window or activation), `frames`
 (how long drawing a frame takes on the compositor thread: `count`, `min_us`, `mean_us`, `p95_us`, `max_us` over
 about the last minute; absent before the first frame and headless, which draws nothing) and `last_key`: the last
 key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a bind does

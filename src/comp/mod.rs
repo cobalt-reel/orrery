@@ -39,10 +39,11 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState, XdgToplevelSurfaceData};
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::xdg_activation::XdgActivationState;
 
 use crate::NAME;
 use crate::config::{self, Config};
-use crate::ipc::{Request, Response, StateView};
+use crate::ipc::{LaunchView, Request, Response, StateView};
 use crate::layout::{Layout, Rect};
 use crate::placement::{self, Landing, Launches};
 use crate::stacks::{Stacks, WinId};
@@ -267,6 +268,7 @@ pub struct Orrery {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
+    pub xdg_activation_state: XdgActivationState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Orrery>,
@@ -302,6 +304,7 @@ impl Orrery {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
@@ -343,6 +346,7 @@ impl Orrery {
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
+            xdg_activation_state,
             shm_state,
             output_manager_state,
             seat_state,
@@ -435,6 +439,33 @@ impl Orrery {
             Landing::Stacked => self.stacks.open_stacked(id),
             Landing::Tab => self.stacks.open_tab(id, None, None),
         }
+    }
+
+    /// An xdg-activation request for `surface` with `token`. A placed window bringing the token of a launch still
+    /// waiting (`Launches::claim_token`) moves to that launch's target as a new tab, shown and focused, and the
+    /// launch is claimed. Any other request (another token, an old or unknown one, a client's own) focuses the
+    /// window's slot when the window is what it shows, else marks the window for attention: nothing beneath is ever
+    /// raised.
+    pub fn activation_requested(&mut self, token: &str, surface: &WlSurface) {
+        let Some(id) = self.id_of_surface(surface) else {
+            return;
+        };
+        let now = Instant::now();
+        self.launches.expire(now);
+        let placed = self.stacks.where_is(id).is_some();
+        let target = placed
+            .then(|| self.launches.claim_token(token, now))
+            .flatten()
+            .map(|l| (l.monitor.clone(), l.slot));
+        match target {
+            Some((monitor, slot)) => self.stacks.move_window_to_tab(id, &monitor, slot),
+            None => {
+                if !self.stacks.focus_window(id) {
+                    self.stacks.mark(id);
+                }
+            }
+        }
+        self.arrange();
     }
 
     /// The pid of the client owning `surface`, from its socket's credentials.
@@ -699,6 +730,15 @@ impl Orrery {
         });
         view.frames = self.frames.view();
         view.last_key = self.last_key.clone();
+        let now = Instant::now();
+        view.launches = (self.launches.all().iter())
+            .map(|l| LaunchView {
+                pid: l.pid,
+                token: l.token.clone(),
+                age_ms: u64::try_from(now.saturating_duration_since(l.at).as_millis()).unwrap_or(u64::MAX),
+                claimed: l.claimed,
+            })
+            .collect();
         view
     }
 

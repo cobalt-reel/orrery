@@ -289,6 +289,20 @@ pub fn current_tabs(state: &Value) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// Each slot's tabs' `attention`, left to right, on the first monitor.
+pub fn attention(state: &Value) -> Vec<Vec<bool>> {
+    state["monitors"][0]["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .map(|slot| {
+            (slot["tabs"].as_array().expect("tabs").iter())
+                .map(|t| t["attention"].as_bool().expect("attention"))
+                .collect()
+        })
+        .collect()
+}
+
 pub fn focused_slot(state: &Value) -> Option<u64> {
     state["monitors"][0]["slots"]
         .as_array()?

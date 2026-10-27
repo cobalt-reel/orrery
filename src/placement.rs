@@ -70,6 +70,16 @@ impl Launches {
         Some(self.claim(i))
     }
 
+    /// Claims the unclaimed launch handed `token`, if it is younger than `LAUNCH_WAIT` at `now`: an activation
+    /// with it moves its window to the launch's target.
+    pub fn claim_token(&mut self, token: &str, now: Instant) -> Option<&Launch> {
+        let i = self
+            .launches
+            .iter()
+            .position(|l| !l.claimed && young(l, now) && l.token.as_deref() == Some(token))?;
+        Some(self.claim(i))
+    }
+
     fn claim(&mut self, i: usize) -> &Launch {
         let l = &mut self.launches[i];
         l.claimed = true;
@@ -286,6 +296,43 @@ mod tests {
         assert_eq!(l.claim_oldest(now).map(|x| x.pid), Some(20));
         assert_eq!(l.claim_oldest(now), None);
         assert_eq!(l.claim_by_pids(&[20]), None, "claimed once");
+    }
+
+    fn with_token(pid: u32, slot: usize, at: Instant, token: &str) -> Launch {
+        Launch {
+            token: Some(token.into()),
+            ..launch(pid, slot, at)
+        }
+    }
+
+    #[test]
+    fn claim_token_finds_its_launch_once() {
+        let t0 = Instant::now();
+        let mut l = launches(&[
+            with_token(10, 1, t0, "aa"),
+            with_token(20, 2, t0, "bb"),
+            launch(30, 3, t0),
+        ]);
+        assert_eq!(l.claim_token("bb", t0 + MS).map(|x| x.slot), Some(2));
+        assert!(l.all()[1].claimed && !l.all()[0].claimed);
+        assert_eq!(l.claim_token("bb", t0 + MS), None, "claimed once");
+        // Unknown tokens, and the empty one a launch without a token cannot match.
+        assert_eq!(l.claim_token("cc", t0 + MS), None);
+        assert_eq!(l.claim_token("", t0 + MS), None);
+        assert_eq!(l.claim_token("aa", t0 + MS).map(|x| x.pid), Some(10));
+    }
+
+    #[test]
+    fn claim_token_honours_the_wait_and_earlier_claims() {
+        let t0 = Instant::now();
+        let mut l = launches(&[with_token(10, 1, t0, "aa"), with_token(20, 2, t0, "bb")]);
+        // Not expired yet (expire was not called), but too old to claim.
+        assert_eq!(l.claim_token("aa", t0 + LAUNCH_WAIT), None);
+        assert!(!l.all()[0].claimed);
+        assert_eq!(l.claim_token("aa", t0 + LAUNCH_WAIT - MS).map(|x| x.pid), Some(10));
+        // A launch its window already claimed (by pid here) is not claimed again by its token.
+        assert_eq!(l.claim_by_pids(&[20]).map(|x| x.pid), Some(20));
+        assert_eq!(l.claim_token("bb", t0 + MS), None);
     }
 
     #[test]

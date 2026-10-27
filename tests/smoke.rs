@@ -40,6 +40,7 @@ fn headless_offers_shell_and_decorations_and_stops_cleanly() {
         "wl_shm",
         "xdg_wm_base",
         "zxdg_decoration_manager_v1",
+        "xdg_activation_v1",
         "wl_output",
         "wl_seat",
     ] {
