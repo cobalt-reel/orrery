@@ -152,6 +152,12 @@ pub fn action_request(action: &Action) -> Option<Request> {
     })
 }
 
+/// A window-local pointer position in global space: on the output whose window it came from, at `origin`.
+#[must_use]
+pub fn on_output(local: Point<f64, Logical>, origin: Point<i32, Logical>) -> Point<f64, Logical> {
+    local + origin.to_f64()
+}
+
 /// The monitor and slot (of its shown workspace) whose rectangle holds the point, empty slots included.
 #[must_use]
 pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
@@ -243,7 +249,8 @@ impl Orrery {
         self.held.clear();
     }
 
-    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+    /// One input event from the window showing `output`; pointer positions are local to that window.
+    pub fn process_input_event<I: InputBackend>(&mut self, output: &str, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event } => {
                 let Some(keyboard) = self.seat.get_keyboard() else {
@@ -263,13 +270,14 @@ impl Orrery {
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let Some(output_geo) = self.outputs.first().and_then(|o| self.space.output_geometry(o)) else {
+                let output = self.outputs.iter().find(|o| o.name() == output);
+                let Some(output_geo) = output.and_then(|o| self.space.output_geometry(o)) else {
                     return;
                 };
                 let Some(pointer) = self.seat.get_pointer() else {
                     return;
                 };
-                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                let pos = on_output(event.position_transformed(output_geo.size), output_geo.loc);
                 let under = self.surface_under(pos);
                 self.pointer_seen = true;
                 self.pointer_target = under.clone();
@@ -610,5 +618,20 @@ mod tests {
         s.workspace(2);
         assert_eq!(top_at(&s, r.x, r.y), None, "1 is hidden");
         assert_eq!(slot_at(&s, r.x, r.y), Some(("m".into(), 0)), "the slot is still there");
+    }
+
+    #[test]
+    fn pointer_positions_are_offset_by_their_outputs_place() {
+        let local = Point::<f64, Logical>::from((10.5, 20.0));
+        assert_eq!(
+            on_output(local, (0, 0).into()),
+            local,
+            "the first screen sits at the origin"
+        );
+        assert_eq!(
+            on_output(local, (1280, 0).into()),
+            (1290.5, 20.0).into(),
+            "the second right of it"
+        );
     }
 }

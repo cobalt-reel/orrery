@@ -18,8 +18,9 @@ workspace has its own layout, slots, tabs and focused slot, starting from its sc
 else the first layout); a layout switch changes only the workspace shown. A workspace neither locked, shown nor
 holding a window goes away. Windows of a hidden workspace are unmapped but keep their slot's size, so showing them
 again is instant. When a screen goes, its workspaces move intact to the focused remaining screen, hidden there.
-Headless (tests) orrery opens and closes screens on request (`open-screen`, `close-screen`); nested it has one screen,
-its window, for now: one window per screen is planned.
+Nested, each screen is one orrery window: `open-screen` (or a second `orrery run`) opens another, which the host
+places and sizes like any window, and closing one takes its screen away. Headless (tests) orrery opens and closes
+screens on request too (`open-screen`, `close-screen`).
 
 For now orrery runs **nested**, as a window inside another Wayland compositor, or **headless** (no screen) for
 tests. The design and the build order ahead are in `docs/plans/2026-10-26-orrery-design.md`.
@@ -60,13 +61,15 @@ file means the built-in config, which is `examples/config.kdl`), `--socket PATH`
 `$XDG_RUNTIME_DIR/orrery.sock`), and `--backend headless --size WxH` (no screen, for tests).
 
 A second `orrery run` on the same control socket does not start another orrery: it asks the running one for one
-more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used). For
-now only headless orrery can open one, so nested this answers an error. A stale socket left by a killed orrery
-(nothing listening) is replaced as usual.
+more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used).
+Nested, that is one more window (same title and app id, so host window rules match it too), screen k's output
+named `winit-k` (screen 1 is `winit`); put it on another host monitor and orrery has two screens. Closing a window
+takes its screen away (its workspaces move, hidden, to the focused remaining screen); closing the last one quits. A
+stale socket left by a killed orrery (nothing listening) is replaced as usual.
 
-orrery presents a frame only when the host asks for one, and everything else runs on its own timer, so a hidden
-orrery (on another workspace, say) keeps answering `orrery msg` and serving its clients; it just stops drawing
-until shown again.
+orrery presents a window's frame only when the host asks for one, and everything else runs on its own timer, so a
+hidden orrery window (on another workspace, say) neither stalls the others nor stops orrery answering `orrery msg`
+and serving its clients; it just stops drawing until shown again.
 
 ### A Hyprland window rule (suggestion)
 
@@ -78,6 +81,9 @@ windowrule = workspace 3, match:class ^(orrery)$
 windowrule = fullscreen on, match:class ^(orrery)$
 windowrule = render_unfocused on, match:class ^(orrery)$
 ```
+
+These match every orrery window: with several screens, leave out the `workspace` rule (or move the windows by hand
+afterwards), or every screen lands on the same host workspace.
 
 ## Default keys
 
@@ -140,8 +146,8 @@ orrery msg spawn kitty --single-instance   # every word after spawn is the argv 
 orrery msg layout halves              # optionally a monitor: orrery msg layout halves winit
 orrery msg workspace 3                # 1 to 10: show it on its screen (made on the focused screen if new)
 orrery msg move-to-workspace 3        # the current tab, its whole stack, to workspace 3; focus stays
-orrery msg open-screen                # one more screen, numbered the lowest free (headless only for now)
-orrery msg close-screen headless-2    # take a screen away by output name (headless only, for tests)
+orrery msg open-screen                # one more screen, numbered the lowest free (nested: one more window)
+orrery msg close-screen headless-2    # take a screen away by output name (for tests; nested, close the window)
 orrery msg close
 orrery msg reload                     # re-read the config now (it is also watched)
 orrery msg quit
@@ -204,9 +210,9 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
 
   Columns split the width with integer math, so slots tile the output exactly; focus moves and other neighbour
   questions are answered in grid cells, whatever the weights.
-- `monitor "OUTPUT" layout="NAME"`: the layout an output's workspaces start with. The nested output is `winit`,
-  the headless ones `headless`, `headless-2`, ... (screen k is `headless-k`); an output without a rule gets the
-  first layout.
+- `monitor "OUTPUT" layout="NAME"`: the layout an output's workspaces start with. The nested outputs are `winit`,
+  `winit-2`, ... (one per window, screen k is `winit-k`), the headless ones `headless`, `headless-2`, ...; an output
+  without a rule gets the first layout.
 - `stacking #true|#false`: where a window that orrery did not launch and that has no parent opens: on top of the
   focused slot's current stack (`#true`, the default) or as a new tab there; `toggle-stacking` flips it while
   running. Dialogs go on their parent's stack and launched programs' windows open as new tabs where the launch was
@@ -326,7 +332,7 @@ binds {
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
-- One output (the window), scale 1; no layer-shell, no Xwayland.
+- Nested, one output per window, scale 1; no layer-shell, no Xwayland.
 
 ## First nested session: checklist
 
@@ -376,6 +382,28 @@ cp examples/config.kdl /tmp/orrery-try.kdl
       top; `orrery msg state` shows `config_error` with the line; keys still work as before;
       `orrery check --config /tmp/orrery-try.kdl` names the problem.
 - [ ] Fix it (delete the line): the red bar goes, `config_error` is null.
-- [ ] `Super+Shift+Q` closes the focused kitty; `Super+Shift+E` (or closing the window) quits orrery and removes
+- [ ] `Super+Shift+Q` closes the focused kitty; `Super+Shift+E` (or closing its window) quits orrery and removes
       `$XDG_RUNTIME_DIR/orrery.sock`.
 - [ ] Idle, `top` shows orrery near 0 % CPU.
+
+## Several nested screens: checklist
+
+Start as above (`./target/release/orrery run --config /tmp/orrery-try.kdl`, keys handed over), with a kitty on
+workspace 1.
+
+- [ ] From a terminal outside orrery, `./target/release/orrery run` again: it prints `ok` and exits 0; a second
+      `orrery` window opens. `orrery msg state` lists monitors `winit` (workspace 1) and `winit-2` (workspace 2).
+- [ ] Move the second window to another host monitor (or beside the first): both draw; idle CPU stays near 0 %.
+- [ ] Click into the second window: `orrery msg state` shows `winit-2` focused; `Super+Return` opens a kitty
+      there. The pointer works in both windows (hover and click a kitty in each: the right one takes focus).
+- [ ] In the first window, `Super+2`: screen 2 gets the focus (`orrery msg state`), typing goes to its kitty.
+      `Super+1` brings it back.
+- [ ] From workspace 1, `Super+Shift+2`: the focused kitty moves to the second window, as a new tab there.
+- [ ] Resize either window (or tile it on the host): its slots follow its size, the other window's do not change,
+      and clicks still land on the window under the pointer.
+- [ ] Hide one window (another host workspace): the other keeps drawing and `orrery msg state` answers at once.
+- [ ] Close the second window: `orrery msg state` shows `winit` only, and workspace 2 listed on it, hidden, its
+      kitty intact; `Super+2` shows it in the first window.
+- [ ] `orrery run` again: the new window is `winit-2` again and takes workspace 2 back.
+- [ ] Close the first window: `winit-2` remains, with workspace 1 hidden on it. Close that one too: orrery quits
+      and `$XDG_RUNTIME_DIR/orrery.sock` is gone.
