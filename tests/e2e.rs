@@ -324,7 +324,7 @@ fn a_monitor_whose_layout_vanished_keeps_it() {
     let end = start + config::DEFAULT[start..].find("}\n").expect("wall ends") + 2;
     let src = format!("{}{}", &config::DEFAULT[..start], &config::DEFAULT[end..])
         .replace("monitor \"winit\" layout=\"wall\"", "")
-        .replace("\"Mod+1\" layout \"wall\"", "");
+        .replace("\"Mod+Ctrl+1\" layout \"wall\"", "");
     config::parse(&src).expect("the edited config is good");
     orrery.write_config(&src);
     let reload = orrery.msg_ok(&["reload"]);

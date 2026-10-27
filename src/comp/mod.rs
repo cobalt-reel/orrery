@@ -714,6 +714,8 @@ impl Orrery {
                 Ok(()) => Response::ok(),
                 Err(e) => Response::error(e),
             },
+            // Each backend opens its own kind of screen; none does yet.
+            Request::OpenScreen => Response::error("this backend cannot open screens"),
             pure => match pure.apply(&mut self.stacks, &self.config) {
                 Ok(()) => {
                     self.arrange();

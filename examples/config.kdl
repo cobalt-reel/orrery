@@ -44,8 +44,28 @@ binds {
     "Mod+Shift+Tab" cycle-tab "prev"
     "Mod+S" split
     "Mod+Shift+S" toggle-stacking
-    "Mod+1" layout "wall"
-    "Mod+2" layout "halves"
+    "Mod+Ctrl+1" layout "wall"
+    "Mod+Ctrl+2" layout "halves"
+    "Mod+1" workspace 1
+    "Mod+2" workspace 2
+    "Mod+3" workspace 3
+    "Mod+4" workspace 4
+    "Mod+5" workspace 5
+    "Mod+6" workspace 6
+    "Mod+7" workspace 7
+    "Mod+8" workspace 8
+    "Mod+9" workspace 9
+    "Mod+0" workspace 10
+    "Mod+Shift+1" move-to-workspace 1
+    "Mod+Shift+2" move-to-workspace 2
+    "Mod+Shift+3" move-to-workspace 3
+    "Mod+Shift+4" move-to-workspace 4
+    "Mod+Shift+5" move-to-workspace 5
+    "Mod+Shift+6" move-to-workspace 6
+    "Mod+Shift+7" move-to-workspace 7
+    "Mod+Shift+8" move-to-workspace 8
+    "Mod+Shift+9" move-to-workspace 9
+    "Mod+Shift+0" move-to-workspace 10
     "Mod+Return" spawn "kitty"
     "Mod+Shift+Q" close           // as Hyprland's killactive
     "Mod+Space" show-tabs        // held: tab strips visible while down

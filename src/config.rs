@@ -6,6 +6,7 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 use smithay::input::keyboard::{Keysym, xkb};
 
 use crate::layout::{Dir, Layout, LayoutError, MAX_WEIGHT, SlotSpec};
+use crate::stacks::WORKSPACES;
 
 /// The built-in config, used when no file exists. Kept as a file so it can be copied to start a config; the
 /// README shows it verbatim (tested).
@@ -52,6 +53,10 @@ pub enum Action {
     Split,
     ToggleStacking,
     Layout(String),
+    /// 1..=WORKSPACES.
+    Workspace(u8),
+    /// 1..=WORKSPACES.
+    MoveToWorkspace(u8),
     Spawn(Vec<String>),
     Close,
     ShowTabs,
@@ -712,6 +717,25 @@ impl<'a> Parser<'a> {
         };
         // The first argument's position, for errors about its value.
         let arg_at = rest.first().map_or(verb_at, |e| e.span().offset());
+        if let "workspace" | "move-to-workspace" = verb {
+            // A number, not a string: the one action that takes one.
+            let n = match rest {
+                [e] => e.value().as_integer().and_then(workspace_number),
+                _ => None,
+            };
+            let Some(n) = n else {
+                self.err_at(
+                    arg_at,
+                    format!("`{verb}` takes a workspace number from 1 to {WORKSPACES}"),
+                );
+                return None;
+            };
+            return Some(if verb == "workspace" {
+                Action::Workspace(n)
+            } else {
+                Action::MoveToWorkspace(n)
+            });
+        }
         let strings: Option<Vec<&str>> = rest.iter().map(|e| e.value().as_string()).collect();
         let action = match (verb, strings.as_deref()) {
             ("focus-slot" | "move" | "swap-slot", Some([dir])) => {
@@ -899,6 +923,11 @@ fn resolve_key(name: &str) -> Option<Keysym> {
     (sym.raw() != xkb::keysyms::KEY_NoSymbol).then_some(sym)
 }
 
+/// A workspace number as written: 1..=WORKSPACES, else None.
+pub(crate) fn workspace_number(n: i128) -> Option<u8> {
+    u8::try_from(n).ok().filter(|n| (1..=WORKSPACES).contains(n))
+}
+
 pub(crate) fn parse_dir(s: &str) -> Option<Dir> {
     match s {
         "left" => Some(Dir::Left),
@@ -1016,14 +1045,30 @@ mod tests {
                 bind(MOD_SHIFT, "Tab", k::KEY_Tab, Action::CycleTab(Cycle::Prev)),
                 bind(MOD, "S", k::KEY_s, Action::Split),
                 bind(MOD_SHIFT, "S", k::KEY_s, Action::ToggleStacking),
-                bind(MOD, "1", k::KEY_1, Action::Layout("wall".into())),
-                bind(MOD, "2", k::KEY_2, Action::Layout("halves".into())),
+                bind(MOD_CTRL, "1", k::KEY_1, Action::Layout("wall".into())),
+                bind(MOD_CTRL, "2", k::KEY_2, Action::Layout("halves".into())),
+            ]
+            .into_iter()
+            .chain(digit_binds(MOD, Action::Workspace))
+            .chain(digit_binds(MOD_SHIFT, Action::MoveToWorkspace))
+            .chain([
                 bind(MOD, "Return", k::KEY_Return, Action::Spawn(vec!["kitty".into()])),
                 bind(MOD_SHIFT, "Q", k::KEY_q, Action::Close),
                 bind(MOD, "Space", k::KEY_space, Action::ShowTabs),
                 bind(MOD_SHIFT, "E", k::KEY_e, Action::Quit),
-            ],
+            ])
+            .collect(),
         }
+    }
+
+    /// `mods` with keys 1..9 then 0, for workspaces 1..10.
+    fn digit_binds(mods: Mods, action: fn(u8) -> Action) -> Vec<Bind> {
+        (1..=10u8)
+            .map(|n| {
+                let digit = n % 10;
+                bind(mods, &digit.to_string(), k::KEY_0 + u32::from(digit), action(n))
+            })
+            .collect()
     }
 
     /// The source with one line replaced, so a broken line keeps a known number.
@@ -1192,8 +1237,26 @@ mod tests {
 
     #[test]
     fn bind_layout_must_exist() {
-        let n = line_of("\"Mod+2\"");
-        assert_problem(&with_line(n, "    \"Mod+2\" layout \"nope\""), n, "nope");
+        let n = line_of("\"Mod+Ctrl+2\"");
+        assert_problem(&with_line(n, "    \"Mod+Ctrl+2\" layout \"nope\""), n, "nope");
+    }
+
+    #[test]
+    fn workspace_binds_take_a_number_from_1_to_10() {
+        let n = line_of("\"Mod+3\"");
+        for action in ["workspace", "move-to-workspace"] {
+            for bad in ["0", "11", "-1", "300", "\"3\"", "1.5", "", "1 2"] {
+                let line = format!("    \"Mod+3\" {action} {bad}");
+                assert_problem(&with_line(n, &line), n, "1 to 10");
+            }
+        }
+        let c = parse(&with_line(n, "    \"Mod+3\" move-to-workspace 10")).expect("in range");
+        let b = c
+            .binds
+            .iter()
+            .find(|b| b.key == "3" && b.mods == MOD)
+            .expect("the bind");
+        assert_eq!(b.action, Action::MoveToWorkspace(10));
     }
 
     #[test]
@@ -1371,8 +1434,8 @@ mod tests {
         problem_at(&with_line(n, "    slot col=2 row=2 cols=\"x\""), n, 22, "cols");
         let n = line_of("monitor \"winit\"");
         problem_at(&with_line(n, "monitor \"winit\" layout=\"nope\""), n, 17, "nope");
-        let n = line_of("\"Mod+2\"");
-        problem_at(&with_line(n, "    \"Mod+2\" layout \"nope\""), n, 20, "nope");
+        let n = line_of("\"Mod+Ctrl+2\"");
+        problem_at(&with_line(n, "    \"Mod+Ctrl+2\" layout \"nope\""), n, 25, "nope");
         let n = line_of("\"Mod+H\"");
         problem_at(&with_line(n, "    \"Mod+H\" focus-slot \"west\""), n, 24, "west");
     }

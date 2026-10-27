@@ -113,6 +113,123 @@ fn move_takes_the_whole_stack_to_the_neighbour() {
     assert!(orrery.stop().success());
 }
 
+/// Every existing workspace in `state` as (number, shown, its windows' app ids slot by slot, tab by tab).
+fn workspaces(state: &Value) -> Vec<(u64, bool, Vec<String>)> {
+    (state["workspaces"].as_array().expect("workspaces").iter())
+        .map(|w| {
+            let apps = (w["slots"].as_array().expect("slots").iter())
+                .flat_map(|s| s["tabs"].as_array().expect("tabs"))
+                .flat_map(|t| t["windows"].as_array().expect("windows"))
+                .map(|w| w["app_id"].as_str().unwrap_or("?").to_owned())
+                .collect();
+            (w["number"].as_u64().expect("number"), w["shown"] == true, apps)
+        })
+        .collect()
+}
+
+#[test]
+fn workspaces_hide_their_windows_until_shown_again() {
+    let (orrery, mut client) = start();
+    let a = client.create_window("a", "A");
+    assert!(client.wait_for(|s| s.windows[a].mapped() && s.windows[a].activated()));
+    let state = orrery.state();
+    assert_eq!(
+        (&state["monitors"][0]["number"], &state["monitors"][0]["workspace"]),
+        (&1.into(), &1.into())
+    );
+    assert_eq!(workspaces(&state), [(1, true, strs(&["a"]))]);
+    assert_eq!(state["workspaces"][0]["monitor"], "headless");
+    assert_eq!(state["workspaces"][0]["layout"], "wall");
+
+    // Switching to 3 makes it, empty, and hides 1: a is unmapped but keeps its slot's size.
+    assert_eq!(orrery.msg_ok(&["workspace", "3"]), serde_json::json!({"ok": true}));
+    assert!(client.wait_for(|s| !s.windows[a].mapped() && !s.windows[a].activated()));
+    assert_eq!(client.window(a).size, size(rects("wall")[0]));
+    let b = client.create_window("b", "B");
+    assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated()));
+    assert!(!client.window(a).mapped());
+    let state = orrery.state();
+    assert_eq!(state["monitors"][0]["workspace"], 3);
+    assert_eq!(windows(&state)[0], strs(&["b"]), "the monitor lists what it shows");
+    assert_eq!(workspaces(&state), [(1, false, strs(&["a"])), (3, true, strs(&["b"]))]);
+
+    // Back to 1: b hides in 3, a is shown and focused again.
+    orrery.msg_ok(&["workspace", "1"]);
+    assert!(client.wait_for(|s| !s.windows[b].mapped() && s.windows[a].mapped() && s.windows[a].activated()));
+    assert_eq!(
+        workspaces(&orrery.state()),
+        [(1, true, strs(&["a"])), (3, false, strs(&["b"]))]
+    );
+    // And to 3 again: b is back.
+    orrery.msg_ok(&["workspace", "3"]);
+    assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated() && !s.windows[a].mapped()));
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn move_to_workspace_carries_the_stack_and_an_empty_workspace_goes_when_left() {
+    let (orrery, mut client) = start();
+    let a = client.create_window("a", "A");
+    let b = client.create_window("b", "B");
+    assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated()));
+    // The whole stack goes to 3, made hidden; 1 stays shown and focused, now empty.
+    orrery.msg_ok(&["move-to-workspace", "3"]);
+    assert!(client.wait_for(|s| !s.windows[a].mapped() && !s.windows[b].mapped() && !s.windows[b].activated()));
+    let state = orrery.state();
+    assert_eq!(state["monitors"][0]["workspace"], 1);
+    assert_eq!(focused_slot(&state), Some(0));
+    assert_eq!(workspaces(&state), [(1, true, vec![]), (3, false, strs(&["a", "b"]))]);
+    assert_eq!(state["workspaces"][1]["focused_slot"], 0);
+    // A new window opens where the focus stayed.
+    let c = client.create_window("c", "C");
+    assert!(client.wait_for(|s| s.windows[c].mapped() && s.windows[c].activated()));
+    // Shown, 3 has the stack on top; moved on to 2 it leaves 3 empty, which goes once 3 is left.
+    orrery.msg_ok(&["workspace", "3"]);
+    assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated() && !s.windows[c].mapped()));
+    orrery.msg_ok(&["move-to-workspace", "2"]);
+    orrery.msg_ok(&["workspace", "1"]);
+    assert!(client.wait_for(|s| s.windows[c].mapped() && !s.windows[b].mapped()));
+    assert_eq!(
+        workspaces(&orrery.state()),
+        [(1, true, strs(&["c"])), (2, false, strs(&["a", "b"]))],
+        "3 went, left empty"
+    );
+    // An empty workspace switched away from goes too; the screen's own (1) never does.
+    orrery.msg_ok(&["workspace", "5"]);
+    orrery.msg_ok(&["workspace", "1"]);
+    assert_eq!(workspaces(&orrery.state()).len(), 2);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn workspace_numbers_are_checked_and_open_screen_is_refused_for_now() {
+    let (orrery, client) = start();
+    for words in [
+        &["workspace", "0"][..],
+        &["workspace", "11"],
+        &["workspace"],
+        &["move-to-workspace", "eleven"],
+    ] {
+        let out = orrery.msg(words);
+        assert!(!out.status.success(), "{words:?}");
+        assert!(out.stdout.is_empty(), "{words:?}: nothing was sent");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("1 to 10"), "{words:?}");
+    }
+    let answer = orrery.raw(b"{\"cmd\":\"workspace\",\"number\":11}\n");
+    assert!(answer.contains("bad request") && answer.contains("1 to 10"), "{answer}");
+    let err = orrery.msg_err(&["open-screen"]);
+    assert!(
+        err["error"].as_str().is_some_and(|e| e.contains("cannot open screens")),
+        "{err}"
+    );
+    assert_eq!(workspaces(&orrery.state()), [(1, true, vec![])]);
+    assert_eq!(orrery.state()["monitors"].as_array().map(Vec::len), Some(1));
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
 #[test]
 fn move_tab_is_gone() {
     let (orrery, client) = start();
@@ -325,7 +442,7 @@ fn reload_reports_a_broken_config_and_keeps_the_old_one() {
     orrery.write_config(
         &config::DEFAULT
             .replace("layout \"halves\"", "layout \"pair\"")
-            .replace("\"Mod+2\" layout \"halves\"", "\"Mod+2\" layout \"pair\""),
+            .replace("\"Mod+Ctrl+2\" layout \"halves\"", "\"Mod+Ctrl+2\" layout \"pair\""),
     );
     assert_eq!(orrery.msg_ok(&["reload"]), serde_json::json!({"ok": true}));
     orrery.msg_ok(&["layout", "pair"]);

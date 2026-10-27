@@ -144,6 +144,8 @@ pub fn action_request(action: &Action) -> Option<Request> {
             name: name.clone(),
             monitor: None,
         },
+        Action::Workspace(number) => Request::Workspace { number: *number },
+        Action::MoveToWorkspace(number) => Request::MoveToWorkspace { number: *number },
         Action::Close => Request::Close,
         Action::Quit => Request::Quit,
         Action::ShowTabs => return None,
@@ -393,6 +395,14 @@ mod tests {
         assert_eq!(action_for(MOD, k::KEY_Tab), Some(Action::CycleTab(Cycle::Next)));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_e), Some(Action::Quit));
         assert_eq!(action_for(MOD, k::KEY_e), None, "Mod+E is not Mod+Shift+E");
+        // Shift+1's raw sym is 1, not exclam; 0 is workspace 10; Ctrl+digits are the layouts.
+        assert_eq!(action_for(MOD, k::KEY_1), Some(Action::Workspace(1)));
+        assert_eq!(action_for(MOD, k::KEY_0), Some(Action::Workspace(10)));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_1), Some(Action::MoveToWorkspace(1)));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_0), Some(Action::MoveToWorkspace(10)));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_exclam), None);
+        assert_eq!(action_for(MOD_CTRL, k::KEY_1), Some(Action::Layout("wall".into())));
+        assert_eq!(action_for(MOD_CTRL, k::KEY_2), Some(Action::Layout("halves".into())));
     }
 
     #[test]
@@ -547,6 +557,14 @@ mod tests {
         assert_eq!(action_request(&Action::Split), Some(Request::Split));
         assert_eq!(action_request(&Action::ToggleStacking), Some(Request::ToggleStacking));
         assert_eq!(action_request(&Action::ShowTabs), None);
+        assert_eq!(
+            action_request(&Action::Workspace(10)),
+            Some(Request::Workspace { number: 10 })
+        );
+        assert_eq!(
+            action_request(&Action::MoveToWorkspace(3)),
+            Some(Request::MoveToWorkspace { number: 3 })
+        );
     }
 
     #[test]

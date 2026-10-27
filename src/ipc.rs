@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Cycle, parse_dir};
+use crate::config::{Config, Cycle, parse_dir, workspace_number};
 use crate::layout::{Dir, Rect};
-use crate::stacks::{Stacks, WinId};
+use crate::stacks::{Stacks, WORKSPACES, WinId, Workspace};
 
 /// Read through `Wire`: every variant needs a twin there (a test fails to compile until it has one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +40,17 @@ pub enum Request {
     Spawn {
         argv: Vec<String>,
     },
+    /// Shows workspace `number` (1..=10) on its monitor and focuses that monitor; a missing one is made on the
+    /// focused monitor.
+    Workspace {
+        number: u8,
+    },
+    /// The focused slot's current tab, its whole stack, to workspace `number` (1..=10) as a new tab; focus stays.
+    MoveToWorkspace {
+        number: u8,
+    },
+    /// One more screen, where the backend can open one.
+    OpenScreen,
 }
 
 /// How a `Request` is read: serde ignores unknown fields on internally tagged unit variants, so here they are
@@ -60,6 +71,9 @@ enum Wire {
     Split {},
     ToggleStacking {},
     Spawn { argv: Vec<String> },
+    Workspace { number: u8 },
+    MoveToWorkspace { number: u8 },
+    OpenScreen {},
 }
 
 impl TryFrom<Wire> for Request {
@@ -81,8 +95,20 @@ impl TryFrom<Wire> for Request {
             Wire::Spawn { argv } => Request::Spawn {
                 argv: spawn_argv(argv)?,
             },
+            Wire::Workspace { number } => Request::Workspace {
+                number: workspace(number, "workspace")?,
+            },
+            Wire::MoveToWorkspace { number } => Request::MoveToWorkspace {
+                number: workspace(number, "move-to-workspace")?,
+            },
+            Wire::OpenScreen {} => Request::OpenScreen,
         })
     }
+}
+
+/// A workspace number as a request carries it: 1..=WORKSPACES.
+fn workspace(number: impl Into<i128>, verb: &str) -> Result<u8, String> {
+    workspace_number(number.into()).ok_or_else(|| format!("`{verb}` takes a workspace number from 1 to {WORKSPACES}"))
 }
 
 /// A spawn's argv as a request carries it: a program, which is not empty, then its arguments.
@@ -105,6 +131,8 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateView {
     pub monitors: Vec<MonitorView>,
+    /// Every existing workspace, shown or not, by number.
+    pub workspaces: Vec<WorkspaceView>,
     /// Where a window with nowhere else to go opens: on top of the focused slot's current stack (true), or as a
     /// new tab there (false). `toggle-stacking` flips it.
     pub stacking: bool,
@@ -154,8 +182,24 @@ pub struct FramesView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorView {
     pub name: String,
+    /// Its screen number, which locks the workspace of that number to it.
+    pub number: u8,
+    /// The workspace it shows; `layout` and `slots` are that workspace's.
+    pub workspace: u8,
     pub layout: String,
     pub focused: bool,
+    pub slots: Vec<SlotView>,
+}
+
+/// One workspace, wherever it is: the monitor it lives on (by name), whether that monitor shows it, and its slots
+/// as a monitor lists them (a hidden workspace's never focused).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub number: u8,
+    pub monitor: String,
+    pub shown: bool,
+    pub layout: String,
+    pub focused_slot: usize,
     pub slots: Vec<SlotView>,
 }
 
@@ -214,60 +258,73 @@ impl Response {
 
 impl StateView {
     /// The state as `orrery msg state` shows it; `info` gives a window's (app_id, title). A monitor lists the
-    /// slots of the workspace it shows. Pending windows have no slot and are not listed.
+    /// slots of the workspace it shows, and `workspaces` every workspace's. Pending windows have no slot and are
+    /// not listed.
     pub fn new(
         stacks: &Stacks,
         stacking: bool,
         config_error: Option<String>,
         info: impl Fn(WinId) -> (Option<String>, Option<String>),
     ) -> Self {
-        let monitors = stacks
-            .monitors()
-            .iter()
-            .enumerate()
+        // A workspace's slots on its monitor's area; `focused` when it is the focused monitor's shown one.
+        let slots = |ws: &Workspace, focused: bool| -> Vec<SlotView> {
+            let area = stacks.monitors()[ws.monitor()].area();
+            (ws.layout().slots.iter())
+                .zip(ws.layout().rects(area))
+                .zip(ws.slots())
+                .enumerate()
+                .map(|(index, ((spec, rect), slot))| SlotView {
+                    index,
+                    name: spec.name.clone(),
+                    rect,
+                    focused: focused && index == ws.focus(),
+                    tabs: (slot.tabs().iter().enumerate())
+                        .map(|(t, stack)| TabView {
+                            current: t == slot.current(),
+                            attention: stack.iter().any(|&w| stacks.is_marked(w)),
+                            windows: stack
+                                .iter()
+                                .map(|&id| {
+                                    let (app_id, title) = info(id);
+                                    WindowView { id, app_id, title }
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        let monitors = (stacks.monitors().iter().enumerate())
             .filter_map(|(mi, mon)| Some((mi, mon, stacks.shown(mi)?)))
             .map(|(mi, mon, ws)| {
                 let focused = mi == stacks.focused_monitor();
-                let slots = ws
-                    .layout()
-                    .slots
-                    .iter()
-                    .zip(ws.layout().rects(mon.area()))
-                    .zip(ws.slots())
-                    .enumerate()
-                    .map(|(index, ((spec, rect), slot))| SlotView {
-                        index,
-                        name: spec.name.clone(),
-                        rect,
-                        focused: focused && index == ws.focus(),
-                        tabs: slot
-                            .tabs()
-                            .iter()
-                            .enumerate()
-                            .map(|(t, stack)| TabView {
-                                current: t == slot.current(),
-                                attention: stack.iter().any(|&w| stacks.is_marked(w)),
-                                windows: stack
-                                    .iter()
-                                    .map(|&id| {
-                                        let (app_id, title) = info(id);
-                                        WindowView { id, app_id, title }
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                    })
-                    .collect();
                 MonitorView {
                     name: mon.name().to_owned(),
+                    number: mon.number(),
+                    workspace: ws.number(),
                     layout: ws.layout().name.clone(),
                     focused,
-                    slots,
+                    slots: slots(ws, focused),
+                }
+            })
+            .collect();
+        let workspaces = (stacks.workspaces().iter())
+            .map(|ws| {
+                let mon = &stacks.monitors()[ws.monitor()];
+                let shown = mon.shown() == ws.number();
+                WorkspaceView {
+                    number: ws.number(),
+                    monitor: mon.name().to_owned(),
+                    shown,
+                    layout: ws.layout().name.clone(),
+                    focused_slot: ws.focus(),
+                    slots: slots(ws, shown && ws.monitor() == stacks.focused_monitor()),
                 }
             })
             .collect();
         StateView {
             monitors,
+            workspaces,
             stacking,
             config_error,
             frames: None,
@@ -305,12 +362,20 @@ impl Request {
                 };
                 stacks.set_layout(&target, layout.clone());
             }
+            Request::Workspace { number } => {
+                if stacks.monitors().is_empty() {
+                    return Err(format!("no monitor to show workspace {number} on"));
+                }
+                stacks.workspace(*number);
+            }
+            Request::MoveToWorkspace { number } => stacks.move_to_workspace(*number),
             Request::State
             | Request::Close
             | Request::Reload
             | Request::Quit
             | Request::ToggleStacking
-            | Request::Spawn { .. } => {
+            | Request::Spawn { .. }
+            | Request::OpenScreen => {
                 return Err(format!("{} is answered by the compositor", self.verb()));
             }
         }
@@ -331,12 +396,15 @@ impl Request {
             Request::Split => "split",
             Request::ToggleStacking => "toggle-stacking",
             Request::Spawn { .. } => "spawn",
+            Request::Workspace { .. } => "workspace",
+            Request::MoveToWorkspace { .. } => "move-to-workspace",
+            Request::OpenScreen => "open-screen",
         }
     }
 }
 
-/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `spawn PROGRAM [ARGS...]`) or a
-/// single JSON request.
+/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `workspace 3`, `spawn PROGRAM
+/// [ARGS...]`) or a single JSON request.
 pub fn parse_words(words: &[String]) -> Result<Request, String> {
     if let [one] = words
         && one.trim_start().starts_with('{')
@@ -350,6 +418,10 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
     let dir = |args: &[&str]| match args {
         [d] => parse_dir(d).ok_or_else(|| format!("`{verb}` takes a direction (left, right, up, down), not {d:?}")),
         _ => Err(format!("`{verb}` takes one direction (left, right, up, down)")),
+    };
+    let number = |args: &[&str]| match args {
+        [n] => workspace(n.parse::<i128>().unwrap_or(0), verb),
+        _ => workspace(0, verb),
     };
     let none = |r: Request| {
         if args.is_empty() {
@@ -365,6 +437,9 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
         "quit" => none(Request::Quit),
         "split" => none(Request::Split),
         "toggle-stacking" => none(Request::ToggleStacking),
+        "open-screen" => none(Request::OpenScreen),
+        "workspace" => Ok(Request::Workspace { number: number(&args)? }),
+        "move-to-workspace" => Ok(Request::MoveToWorkspace { number: number(&args)? }),
         "spawn" => Ok(Request::Spawn {
             argv: spawn_argv(args.iter().map(|a| (*a).to_owned()).collect())?,
         }),
@@ -420,10 +495,13 @@ mod tests {
             Request::Split => (9, Wire::Split {}),
             Request::ToggleStacking => (10, Wire::ToggleStacking {}),
             Request::Spawn { argv } => (11, Wire::Spawn { argv }),
+            Request::Workspace { number } => (12, Wire::Workspace { number }),
+            Request::MoveToWorkspace { number } => (13, Wire::MoveToWorkspace { number }),
+            Request::OpenScreen => (14, Wire::OpenScreen {}),
         }
     }
 
-    const VARIANTS: usize = 12;
+    const VARIANTS: usize = 15;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -462,6 +540,10 @@ mod tests {
             Request::Spawn {
                 argv: vec!["kitty".into(), "--single-instance".into()],
             },
+            Request::Workspace { number: 1 },
+            Request::Workspace { number: 10 },
+            Request::MoveToWorkspace { number: 3 },
+            Request::OpenScreen,
         ]
     }
 
@@ -504,6 +586,15 @@ mod tests {
             }),
             r#"{"cmd":"spawn","argv":["foot","-e"]}"#
         );
+        assert_eq!(
+            json(&Request::Workspace { number: 3 }),
+            r#"{"cmd":"workspace","number":3}"#
+        );
+        assert_eq!(
+            json(&Request::MoveToWorkspace { number: 10 }),
+            r#"{"cmd":"move-to-workspace","number":10}"#
+        );
+        assert_eq!(json(&Request::OpenScreen), r#"{"cmd":"open-screen"}"#);
     }
 
     #[test]
@@ -520,6 +611,15 @@ mod tests {
             r#"{"cmd":"spawn"}"#,
             r#"{"cmd":"spawn","argv":[]}"#,
             r#"{"cmd":"spawn","argv":[""]}"#,
+            r#"{"cmd":"workspace"}"#,
+            r#"{"cmd":"workspace","number":0}"#,
+            r#"{"cmd":"workspace","number":11}"#,
+            r#"{"cmd":"workspace","number":256}"#,
+            r#"{"cmd":"workspace","number":-1}"#,
+            r#"{"cmd":"workspace","number":"3"}"#,
+            r#"{"cmd":"move-to-workspace","number":0}"#,
+            r#"{"cmd":"move-to-workspace","number":11}"#,
+            r#"{"cmd":"open-screen","name":"x"}"#,
             r#"{"dir":"left"}"#,
             r#"[]"#,
         ] {
@@ -531,6 +631,8 @@ mod tests {
         StateView {
             monitors: vec![MonitorView {
                 name: "winit".into(),
+                number: 1,
+                workspace: 1,
                 layout: "wall".into(),
                 focused: true,
                 slots: vec![SlotView {
@@ -553,6 +655,14 @@ mod tests {
                         }],
                     }],
                 }],
+            }],
+            workspaces: vec![WorkspaceView {
+                number: 4,
+                monitor: "winit".into(),
+                shown: false,
+                layout: "halves".into(),
+                focused_slot: 1,
+                slots: Vec::new(),
             }],
             stacking: true,
             config_error: None,
@@ -588,6 +698,13 @@ mod tests {
         assert_eq!(back, r);
         assert!(
             json(&r).contains(r#""launches":[{"pid":4242,"token":"tok","age_ms":120,"claimed":false}]"#),
+            "{}",
+            json(&r)
+        );
+        assert!(
+            json(&r).contains(
+                r#""workspaces":[{"number":4,"monitor":"winit","shown":false,"layout":"halves","focused_slot":1,"slots":[]}]"#
+            ),
             "{}",
             json(&r)
         );
@@ -632,6 +749,10 @@ mod tests {
             ("close", Request::Close),
             ("reload", Request::Reload),
             ("quit", Request::Quit),
+            ("workspace 1", Request::Workspace { number: 1 }),
+            ("workspace 10", Request::Workspace { number: 10 }),
+            ("move-to-workspace 4", Request::MoveToWorkspace { number: 4 }),
+            ("open-screen", Request::OpenScreen),
         ];
         for (text, want) in cases {
             assert_eq!(parse_words(&words(text)), Ok(want), "{text}");
@@ -665,6 +786,15 @@ mod tests {
             ("layout a b c", "layout"),
             ("close now", "no arguments"),
             ("state please", "no arguments"),
+            ("workspace", "1 to 10"),
+            ("workspace 0", "1 to 10"),
+            ("workspace 11", "1 to 10"),
+            ("workspace -3", "1 to 10"),
+            ("workspace three", "1 to 10"),
+            ("workspace 1 2", "1 to 10"),
+            ("move-to-workspace", "1 to 10"),
+            ("move-to-workspace 300", "1 to 10"),
+            ("open-screen now", "no arguments"),
         ];
         for (text, word) in cases {
             let err = parse_words(&words(text)).expect_err(text);
@@ -694,7 +824,7 @@ mod tests {
     #[test]
     fn apply_mirrors_the_stacks_methods() {
         type Op = fn(&mut Stacks);
-        let cases: [(Request, Op); 7] = [
+        let cases: [(Request, Op); 9] = [
             (Request::FocusSlot { dir: Dir::Right }, |s| s.focus_slot(Dir::Right)),
             (Request::Move { dir: Dir::Right }, |s| s.move_stack(Dir::Right)),
             (Request::SwapSlot { dir: Dir::Down }, |s| s.swap_slot(Dir::Down)),
@@ -708,6 +838,8 @@ mod tests {
                 },
                 |s| s.set_layout("winit", layout("halves")),
             ),
+            (Request::Workspace { number: 4 }, |s| s.workspace(4)),
+            (Request::MoveToWorkspace { number: 2 }, |s| s.move_to_workspace(2)),
         ];
         for (req, op) in cases {
             let (mut via_ipc, config) = setup();
@@ -754,6 +886,18 @@ mod tests {
     }
 
     #[test]
+    fn workspace_without_a_monitor_is_an_error() {
+        let config = default_config();
+        let mut s = Stacks::new();
+        let err = Request::Workspace { number: 2 }
+            .apply(&mut s, &config)
+            .expect_err("no monitor");
+        assert!(err.contains("monitor"), "{err}");
+        assert_eq!(Request::MoveToWorkspace { number: 2 }.apply(&mut s, &config), Ok(()));
+        assert_eq!(s, Stacks::new());
+    }
+
+    #[test]
     fn layout_without_a_monitor_is_an_error() {
         let config = default_config();
         let mut s = Stacks::new();
@@ -776,6 +920,7 @@ mod tests {
             Request::Spawn {
                 argv: vec!["true".into()],
             },
+            Request::OpenScreen,
         ] {
             let (mut s, config) = setup();
             let err = req.apply(&mut s, &config).expect_err("not pure");
@@ -855,5 +1000,58 @@ mod tests {
         assert!(!v.monitors[1].focused);
         assert_eq!(v.monitors[1].slots.len(), 2);
         assert!(v.monitors[1].slots.iter().all(|sl| !sl.focused));
+    }
+
+    #[test]
+    fn state_view_lists_every_workspace_and_what_each_monitor_shows() {
+        let mut s = Stacks::new();
+        let uhd = Rect {
+            x: 0,
+            y: 0,
+            w: 3840,
+            h: 2160,
+        };
+        let side = Rect { x: 3840, ..uhd };
+        s.add_monitor("winit", uhd, layout("wall"));
+        s.add_monitor("second", side, layout("halves"));
+        // winit shows 3 (one window, its slot 0 focused) and hides 1 (two tabs in slot 0); second shows 2.
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        s.focus_slot(Dir::Right);
+        s.workspace(3);
+        s.open_stacked(3);
+        let v = StateView::new(&s, true, None, |_| (None, None));
+        let shows: Vec<(&str, u8, u8, bool)> = (v.monitors.iter())
+            .map(|m| (m.name.as_str(), m.number, m.workspace, m.focused))
+            .collect();
+        assert_eq!(shows, [("winit", 1, 3, true), ("second", 2, 2, false)]);
+        let all: Vec<(u8, &str, bool, &str, usize, usize)> = (v.workspaces.iter())
+            .map(|w| {
+                (
+                    w.number,
+                    w.monitor.as_str(),
+                    w.shown,
+                    w.layout.as_str(),
+                    w.focused_slot,
+                    w.slots.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            all,
+            [
+                (1, "winit", false, "wall", 3, 6),
+                (2, "second", true, "halves", 0, 2),
+                (3, "winit", true, "wall", 0, 6),
+            ]
+        );
+        // Slots as the monitors list them: the shown ones the same, a hidden one's never focused.
+        assert_eq!(v.workspaces[2].slots, v.monitors[0].slots);
+        assert_eq!(v.workspaces[1].slots, v.monitors[1].slots);
+        let hidden = &v.workspaces[0].slots;
+        assert!(hidden.iter().all(|sl| !sl.focused));
+        assert_eq!(hidden[0].tabs.len(), 2);
+        assert_eq!(hidden[0].tabs[1].windows[0].id, 2);
+        assert_eq!(hidden[3].rect, v.monitors[0].slots[3].rect, "on its monitor's area");
     }
 }

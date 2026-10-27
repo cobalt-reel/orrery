@@ -1,14 +1,24 @@
 # orrery
 
 orrery is a Wayland compositor and static tiling window manager written in Rust on
-[Smithay](https://github.com/Smithay/smithay). Each monitor shows a fixed **layout** of **slots** (rectangles of a
-weighted grid); every slot holds **tabs**, and each tab is a **stack** of windows. A slot shows its current tab, and
-of that tab only the top window is drawn. A new window opens by three rules: a dialog on top of its parent's stack; a
-window of a program orrery launched (a `spawn` bind or `orrery msg spawn`) as a new tab in the slot focused at the
-launch (matched by process, else the first window within 5 s); anything else by `stacking`, on top of the focused
-slot's current stack (on, the default) or as a new tab there (off). Windows never move by themselves: you move stacks
-between slots, split a window off into a tab of its own, cycle tabs and switch layouts, with keys from a KDL config
-or with `orrery msg` over a control socket.
+[Smithay](https://github.com/Smithay/smithay). Each screen shows one **workspace**, and each workspace a fixed
+**layout** of **slots** (rectangles of a weighted grid); every slot holds **tabs**, and each tab is a **stack** of
+windows. A slot shows its current tab, and of that tab only the top window is drawn. A new window opens by three
+rules: a dialog on top of its parent's stack; a window of a program orrery launched (a `spawn` bind or
+`orrery msg spawn`) as a new tab in the slot focused at the launch (matched by process, else the first window within
+5 s); anything else by `stacking`, on top of the focused slot's current stack (on, the default) or as a new tab
+there (off). Windows never move by themselves: you move stacks between slots and workspaces, split a window off into
+a tab of its own, cycle tabs and switch layouts and workspaces, with keys from a KDL config or with `orrery msg`
+over a control socket.
+
+There are 10 workspaces, numbered 1 to 10. Each screen has a number, kept while it lives (a new screen takes the
+lowest free one), and workspace k is locked to screen k while that screen exists. Switching to a workspace shows it
+on its screen and focuses that screen; one that does not exist is made on the focused screen and stays there. Each
+workspace has its own layout, slots, tabs and focused slot, starting from its screen's layout (the `monitor` rule,
+else the first layout); a layout switch changes only the workspace shown. A workspace neither locked, shown nor
+holding a window goes away. Windows of a hidden workspace are unmapped but keep their slot's size, so showing them
+again is instant. When a screen goes, its workspaces move intact to the focused remaining screen, hidden there. For
+now orrery has one screen (its window, or headless one output); several are planned.
 
 For now orrery runs **nested**, as a window inside another Wayland compositor, or **headless** (no screen) for
 tests. The design and the build order ahead are in `docs/plans/2026-10-26-orrery-design.md`.
@@ -87,7 +97,9 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Tab` / `Super+Shift+Tab` | show the focused slot's next / previous tab (wrapping; tabs never move) |
 | `Super+S` | split: the top window leaves its stack for a new tab of its own, right after |
 | `Super+Shift+S` | toggle stacking: a window orrery did not launch and with no parent goes on top of the focused stack (on) or opens as a new tab (off) |
-| `Super+1` / `Super+2` | layout `wall` / `halves` |
+| `Super+1` ... `Super+9`, `Super+0` | show workspace 1 ... 9, 10 (made on the focused screen if it does not exist) |
+| `Super+Shift+1` ... `Super+Shift+0` | move the current tab (its whole stack) to workspace 1 ... 10, as a new tab in its focused slot (focus stays) |
+| `Super+Ctrl+1` / `Super+Ctrl+2` | layout `wall` / `halves` (of the workspace shown) |
 | `Super+Return` | spawn `kitty` |
 | `Super+Shift+Q` | close the focused window (asks it to close) |
 | `Super+Space` (held) | show tab strips along the top of each slot holding more than one window: one segment per tab, the current tab bright, pips for its depth |
@@ -112,7 +124,7 @@ One request to the running orrery; the answer is JSON on stdout (pretty for `sta
 ok.
 
 ```sh
-orrery msg state                      # monitors, layouts, slots (rects, focus), their tabs and each tab's windows
+orrery msg state                      # monitors, workspaces, layouts, slots (rects, focus), tabs and their windows
 orrery msg focus-slot right           # left | right | up | down
 orrery msg move right                 # the current tab, its whole stack, to the neighbour
 orrery msg swap-slot down
@@ -121,6 +133,9 @@ orrery msg split                      # the top window becomes a tab of its own
 orrery msg toggle-stacking
 orrery msg spawn kitty --single-instance   # every word after spawn is the argv (so --socket goes before spawn)
 orrery msg layout halves              # optionally a monitor: orrery msg layout halves winit
+orrery msg workspace 3                # 1 to 10: show it on its screen (made on the focused screen if new)
+orrery msg move-to-workspace 3        # the current tab, its whole stack, to workspace 3; focus stays
+orrery msg open-screen                # one more screen (refused for now: no backend opens a second one yet)
 orrery msg close
 orrery msg reload                     # re-read the config now (it is also watched)
 orrery msg quit
@@ -130,29 +145,32 @@ orrery msg --socket /path/to/orrery.sock state
 
 Errors come back as `{"ok":false,"error":"..."}` (also printed on stderr), e.g. an unknown layout or monitor.
 
-Each slot's `tabs` lists its tabs left to right, each as `{ current, attention, windows }` with `windows` (`id`,
-`app_id`, `title`) bottom to top; `attention` is true when a window of that tab asked to be seen. Besides the
-monitors, `state` carries `stacking` (the running value), `config_error` (why the config file was not loaded, or
-null), `launches` (recent spawns, oldest first, as `{ pid, token, age_ms, claimed }`: the activation token each was
-handed and whether a window has taken it; a debug aid; one over 5 s old no longer counts and goes on the next spawn,
-new window or activation), `frames`
-(how long drawing a frame takes on the compositor thread: `count`, `min_us`, `mean_us`, `p95_us`, `max_us` over
-about the last minute; absent before the first frame and headless, which draws nothing) and `last_key`: the last
-key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a bind does
-nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no Ctrl,
-Alt or Super) is kept only as `(plain key)`, never which key it was.
+`state` lists `monitors`, each as `{ name, number, workspace, layout, focused, slots }`: its screen number, the
+workspace it shows, and that workspace's layout and slots; and `workspaces`, every existing one by number, as
+`{ number, monitor, shown, layout, focused_slot, slots }` (`monitor` by name; `slots` as a monitor lists them, a
+hidden workspace's never focused). Each slot is `{ index, name, rect, focused, tabs }`. Each slot's `tabs` lists its
+tabs left to right, each as `{ current, attention, windows }` with `windows` (`id`, `app_id`, `title`) bottom to
+top; `attention` is true when a window of that tab asked to be seen. Besides the monitors, `state` carries
+`stacking` (the running value), `config_error` (why the config file was not loaded, or null), `launches` (recent
+spawns, oldest first, as `{ pid, token, age_ms, claimed }`: the activation token each was handed and whether a
+window has taken it; a debug aid; one over 5 s old no longer counts and goes on the next spawn, new window or
+activation), `frames` (how long drawing a frame takes on the compositor thread: `count`, `min_us`, `mean_us`,
+`p95_us`, `max_us` over about the last minute; absent before the first frame and headless, which draws nothing) and
+`last_key`: the last key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a
+bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
+Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was.
 
 ## The config, its reload and `orrery check`
 
-orrery looks at its config file once a second (modification time and size) and reloads it when it changes, or
-at once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at runtime is
-kept, unless the file's own `stacking` value changed): each monitor takes the new definition of its current
-layout by name (a monitor whose layout is gone keeps showing it; that is logged, not
-an error). Monitor rules apply to new outputs only, except after a start on the built-in config (the file was
-missing or broken): the first good file then also applies its monitor rules, as a start with it would have. A
-broken file changes nothing: the old config stays, the error is in `orrery msg state` as `config_error`, and a
-**4 px red bar** runs along the top of every output until a good config loads. At startup a broken file means
-the built-in config, with the bar. A file deleted while running keeps the running config.
+orrery looks at its config file once a second (modification time and size) and reloads it when it changes, or at
+once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at runtime is kept,
+unless the file's own `stacking` value changed): every workspace, hidden ones too, takes the new definition of its
+layout by name (a workspace whose layout is gone keeps it; that is logged, not an error). Monitor rules apply to new
+outputs only, except after a start on the built-in config (the file was missing or broken): the first good file then
+also applies its monitor rules, as a start with it would have. A broken file changes nothing: the old config stays,
+the error is in `orrery msg state` as `config_error`, and a **4 px red bar** runs along the top of every output
+until a good config loads. At startup a broken file means the built-in config, with the bar. A file deleted while
+running keeps the running config.
 
 ```sh
 orrery check                          # the default path; or: orrery check --config PATH
@@ -180,8 +198,8 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
 
   Columns split the width with integer math, so slots tile the output exactly; focus moves and other neighbour
   questions are answered in grid cells, whatever the weights.
-- `monitor "OUTPUT" layout="NAME"`: the layout an output starts with. The nested output is `winit`, the headless
-  one `headless`; an output without a rule gets the first layout.
+- `monitor "OUTPUT" layout="NAME"`: the layout an output's workspaces start with. The nested output is `winit`,
+  the headless one `headless`; an output without a rule gets the first layout.
 - `stacking #true|#false`: where a window that orrery did not launch and that has no parent opens: on top of the
   focused slot's current stack (`#true`, the default) or as a new tab there; `toggle-stacking` flips it while
   running. Dialogs go on their parent's stack and launched programs' windows open as new tabs where the launch was
@@ -203,7 +221,9 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   | `cycle-tab` | `"next"`/`"prev"` | show the focused slot's next / previous tab |
   | `split` | | the top window leaves its stack for a new tab right after it |
   | `toggle-stacking` | | flip `stacking` (windows orrery did not launch, with no parent) |
-  | `layout` | a layout name | switch the focused monitor's layout (fewer slots: the extra slots' tabs join the last) |
+  | `layout` | a layout name | switch the layout of the focused screen's workspace (fewer slots: the extra slots' tabs join the last) |
+  | `workspace` | a number, 1 to 10 (`workspace 3`, not `"3"`) | show that workspace on its screen and focus it (made on the focused screen if new) |
+  | `move-to-workspace` | a number, 1 to 10 | move the focused slot's current tab, its whole stack, to that workspace as a new tab (focus stays) |
   | `spawn` | program, then its arguments | run it (no shell) with `WAYLAND_DISPLAY` set to orrery and no `DISPLAY` |
   | `close` | | ask the focused window to close |
   | `show-tabs` | | while held: the tab strips |
@@ -259,8 +279,28 @@ binds {
     "Mod+Shift+Tab" cycle-tab "prev"
     "Mod+S" split
     "Mod+Shift+S" toggle-stacking
-    "Mod+1" layout "wall"
-    "Mod+2" layout "halves"
+    "Mod+Ctrl+1" layout "wall"
+    "Mod+Ctrl+2" layout "halves"
+    "Mod+1" workspace 1
+    "Mod+2" workspace 2
+    "Mod+3" workspace 3
+    "Mod+4" workspace 4
+    "Mod+5" workspace 5
+    "Mod+6" workspace 6
+    "Mod+7" workspace 7
+    "Mod+8" workspace 8
+    "Mod+9" workspace 9
+    "Mod+0" workspace 10
+    "Mod+Shift+1" move-to-workspace 1
+    "Mod+Shift+2" move-to-workspace 2
+    "Mod+Shift+3" move-to-workspace 3
+    "Mod+Shift+4" move-to-workspace 4
+    "Mod+Shift+5" move-to-workspace 5
+    "Mod+Shift+6" move-to-workspace 6
+    "Mod+Shift+7" move-to-workspace 7
+    "Mod+Shift+8" move-to-workspace 8
+    "Mod+Shift+9" move-to-workspace 9
+    "Mod+Shift+0" move-to-workspace 10
     "Mod+Return" spawn "kitty"
     "Mod+Shift+Q" close           // as Hyprland's killactive
     "Mod+Space" show-tabs        // held: tab strips visible while down
@@ -307,9 +347,15 @@ cp examples/config.kdl /tmp/orrery-try.kdl
       focus.
 - [ ] `Super+Shift+L`: the current tab moves to the hero (the big 2x2 slot) and the focus follows; it fills the hero.
 - [ ] `Super+Ctrl+H` from the hero swaps everything in the hero with the top-left slot.
-- [ ] `Super+2`: layout `halves`, every kitty resizes (the left half keeps slot 0's tabs, the right half gets every
-      other slot's tabs); `Super+1`: back to `wall`, with the tabs now in slots 0 and 1 only (they stay there: the
-      round trip is not an identity, by design).
+- [ ] `Super+Ctrl+2`: layout `halves`, every kitty resizes (the left half keeps slot 0's tabs, the right half gets
+      every other slot's tabs); `Super+Ctrl+1`: back to `wall`, with the tabs now in slots 0 and 1 only (they stay
+      there: the round trip is not an identity, by design).
+- [ ] `Super+3`: an empty workspace 3 (`orrery msg state` shows `"workspace": 3` on the monitor); `Super+Return`
+      opens a kitty there. `Super+1`: back to the kittys of workspace 1; `Super+3` shows the lone kitty again.
+- [ ] `Super+Shift+1` from workspace 3: its kitty goes to workspace 1, and workspace 3 stays shown and focused, now
+      empty. `Super+1`: the kitty is there, as a new tab in the focused slot; `orrery msg state` no longer lists
+      workspace 3 under `workspaces` (left empty, it went).
+- [ ] `Super+Ctrl+2` on workspace 2 (`Super+2` first), then `Super+1`: workspace 1 still shows `wall`.
 - [ ] `Super+Shift+S`, then `kitty &` in the focused kitty: the new kitty opens as a new tab, not on top of the
       stack; `orrery msg state` shows `"stacking": false`. `Super+Shift+S` again and `kitty &` once more: it goes on
       top of the stack (as in the first step).
