@@ -409,6 +409,7 @@ impl Orrery {
 
     /// Puts a window into the stacks as `placement::decide` says, from its parent (a placed one), its client's
     /// pid chain and the launches. A window mapped again sees no launches: only its parent or `stacking` count.
+    /// A dialog that does not land as the focused window is marked for attention.
     fn place(&mut self, id: WinId, toplevel: &ToplevelSurface) {
         let now = Instant::now();
         let parent = toplevel.parent().and_then(|s| self.id_of_surface(&s));
@@ -430,8 +431,12 @@ impl Orrery {
         let launches = if first_time { &mut self.launches } else { &mut none };
         match placement::decide(parent, parent_placed, &chain, launches, now, self.stacking) {
             Landing::OnParent(p) => {
-                // decide checked the parent is placed, so this cannot miss; stacked if it ever does.
-                if !self.stacks.open_on(id, p) {
+                // decide checked the parent is placed, so this cannot miss; stacked if it ever does. A dialog
+                // that is not the focused window (in a background tab, or in a slot without focus) is marked, so
+                // a hidden modal shows as a badge.
+                if self.stacks.open_on(id, p) {
+                    self.stacks.mark(id);
+                } else {
                     self.stacks.open_stacked(id);
                 }
             }

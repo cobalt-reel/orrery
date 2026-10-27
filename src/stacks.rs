@@ -489,7 +489,8 @@ impl Stacks {
         }
     }
 
-    /// Drops `w`'s mark, if it has one.
+    /// Drops `w`'s mark, if it has one. Only tests take marks away by hand; `settle` drops the seen ones.
+    #[cfg(test)]
     pub fn clear_mark(&mut self, w: WinId) {
         self.attention.remove(&w);
     }

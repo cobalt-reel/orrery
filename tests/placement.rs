@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use orrery_wm::config;
 use serde_json::Value;
 use support::client::Client;
-use support::{Compositor, TIMEOUT, WATCHDOG, current_tabs, focused_slot, strs, tabs};
+use support::{Compositor, TIMEOUT, WATCHDOG, attention, current_tabs, focused_slot, strs, tabs};
 
 const SIZE: (i32, i32) = (1280, 720);
 
@@ -48,9 +48,13 @@ fn a_dialog_stacks_on_its_parent_wherever_focus_is() {
     assert_eq!(tabs(&state)[3], [strs(&["b"])]);
     assert_eq!(focused_slot(&state), Some(3), "focus stays where it was");
     assert!(client.window(b).activated() && !client.window(d).activated());
-
-    // A parent in a background tab: the dialog waits on top of it, the shown tab stays.
+    // Shown in a slot without focus, the dialog is marked until it is focused.
+    assert_eq!(attention(&state)[0], [true]);
+    assert_eq!(attention(&state)[3], [false]);
     orrery.msg_ok(&["focus-slot", "left"]);
+    assert_eq!(attention(&orrery.state())[0], [false]);
+
+    // A parent in a background tab: the dialog waits on top of it, marked; the shown tab stays.
     orrery.msg_ok(&["toggle-stacking"]);
     let c = client.create_window("c", "C");
     assert!(client.wait_for(|s| s.windows[c].mapped()));
@@ -59,7 +63,15 @@ fn a_dialog_stacks_on_its_parent_wherever_focus_is() {
     let state = orrery.state();
     assert_eq!(tabs(&state)[0], [strs(&["a", "d", "e"]), strs(&["c"])]);
     assert_eq!(current_tabs(&state)[0], Some(1));
+    assert_eq!(attention(&state)[0], [true, false]);
     assert!(client.window(c).mapped() && !client.window(e).mapped());
+
+    // A dialog of the focused window is shown and focused: no mark.
+    let f = client.create_dialog("f", "F", c);
+    assert!(client.wait_for(|s| s.windows[f].mapped() && !s.windows[c].mapped()));
+    let state = orrery.state();
+    assert_eq!(tabs(&state)[0], [strs(&["a", "d", "e"]), strs(&["c", "f"])]);
+    assert_eq!(attention(&state)[0], [true, false]);
     drop(client);
     assert!(orrery.stop().success());
 }

@@ -29,7 +29,8 @@ Fills in section 2 of `2026-10-26-orrery-design.md` with the decisions it leaves
 ## Where a new window goes (decided at its first buffer, as today)
 
 1. **Has a parent** (`xdg_toplevel.set_parent`) that is placed: on top of the parent's stack. The parent's tab
-   is not made current if it is in the background; the window waits there.
+   is not made current if it is in the background; the window waits there. A dialog that is not the focused
+   window (its parent's tab in the background, or a slot without focus) is marked **attention** (below).
 2. **A launch's window:** orrery records each launch (bind `spawn` or `msg spawn`): pid, an xdg-activation token
    (passed as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`), the target (monitor name and slot focused at the
    press), and the time. A window matches a launch when its client's pid is the launched pid or a descendant
