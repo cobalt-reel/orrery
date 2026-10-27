@@ -232,8 +232,7 @@ impl StateView {
                             .enumerate()
                             .map(|(t, stack)| TabView {
                                 current: t == slot.current(),
-                                // Nothing marks a window yet.
-                                attention: false,
+                                attention: stack.iter().any(|&w| stacks.is_marked(w)),
                                 windows: stack
                                     .iter()
                                     .map(|&id| {
@@ -772,6 +771,7 @@ mod tests {
         s.open_stacked(1);
         s.open_stacked(2);
         s.open_tab(3, None, None);
+        s.mark(1);
         s.add_monitor("second", uhd, layout("halves"));
         let v = StateView::new(&s, false, Some("broken".into()), |w| {
             (Some(format!("app{w}")), (w == 2).then(|| "two".into()))
@@ -797,7 +797,7 @@ mod tests {
                 tabs: vec![
                     TabView {
                         current: false,
-                        attention: false,
+                        attention: true,
                         windows: vec![
                             WindowView {
                                 id: 1,

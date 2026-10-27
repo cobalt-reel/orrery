@@ -4,6 +4,8 @@
 //! one place, and an operation that cannot apply (an edge, an empty slot, an unknown id) does nothing. The state
 //! is private so nothing outside these methods can break that; callers read it through accessors.
 
+use std::collections::BTreeSet;
+
 use crate::config::Cycle;
 use crate::layout::{Dir, Layout, Rect};
 
@@ -36,6 +38,9 @@ pub struct Stacks {
     /// Windows with no monitor to live on (none yet, or the last one went away), oldest first. The next monitor
     /// added takes them, as one stack, into its focused slot.
     pending: Vec<WinId>,
+    /// Windows that asked to be seen while waiting: placed, never the top of their slot's current tab. A mark
+    /// goes for good once its window is shown (see `settle`), or when it closes or loses its monitor.
+    attention: BTreeSet<WinId>,
 }
 
 /// What is drawn: the top window of a non-empty slot's current tab, at the slot's rectangle.
@@ -253,6 +258,7 @@ impl Stacks {
             slots,
             focus: 0,
         });
+        self.settle();
     }
 
     /// Its tabs (slot by slot) are appended to the focused monitor's focused slot, or the first monitor's when
@@ -273,6 +279,7 @@ impl Stacks {
             Some(m) => m.slots[m.focus].tabs.extend(tabs),
             None => self.pending.extend(tabs.flatten()),
         }
+        self.settle();
     }
 
     /// On top of the focused slot's current stack (its first tab when empty), or `pending` with no monitor.
@@ -288,6 +295,7 @@ impl Stacks {
             Some(stack) => stack.push(w),
             None => slot.insert_tab(vec![w]),
         }
+        self.settle();
     }
 
     /// A new tab right after the current one in `slot` of `monitor` (that monitor's focused slot without one),
@@ -317,6 +325,7 @@ impl Stacks {
         let mon = &mut self.monitors[m];
         mon.focus = s;
         mon.slots[s].insert_tab(vec![w]);
+        self.settle();
     }
 
     /// On top of `parent`'s stack, wherever it is; the current tab and focus stay. `false` (and nothing done)
@@ -329,6 +338,7 @@ impl Stacks {
             return false;
         };
         self.monitors[m].slots[s].tabs[t].push(w);
+        self.settle();
         true
     }
 
@@ -338,6 +348,7 @@ impl Stacks {
             self.monitors[m].slots[s].remove(t, p);
         }
         self.pending.retain(|&x| x != w);
+        self.settle();
     }
 
     /// Via `Layout::neighbour`; a slot at the edge has no neighbour past it.
@@ -358,6 +369,7 @@ impl Stacks {
                 };
             }
         }
+        self.settle();
     }
 
     /// The focused slot's current tab, its whole stack, becomes a tab of the neighbour right after its current
@@ -374,6 +386,7 @@ impl Stacks {
         let tab = from.remove_tab(from.current);
         mon.slots[to].insert_tab(tab);
         mon.focus = to;
+        self.settle();
     }
 
     /// Swaps the focused slot with the neighbour, every tab and the current one; focus follows.
@@ -383,6 +396,7 @@ impl Stacks {
             mon.slots.swap(mon.focus, to);
             mon.focus = to;
         }
+        self.settle();
     }
 
     /// The focused stack's top window leaves it for a tab of its own right after, made current. Nothing for a
@@ -395,6 +409,7 @@ impl Stacks {
         {
             slot.insert_tab(vec![top]);
         }
+        self.settle();
     }
 
     /// Slots keep their order and fill the new layout's in sequence; with fewer slots the extras' tabs are
@@ -419,6 +434,7 @@ impl Stacks {
         mon.slots[n - 1].tabs.extend(extras);
         mon.focus = mon.focus.min(n - 1);
         mon.layout = l;
+        self.settle();
     }
 
     /// Focuses the slot (and monitor) holding `w` when `w` is what it shows, the top of its current tab, and
@@ -433,6 +449,22 @@ impl Stacks {
         self.focused_monitor = m;
         self.monitors[m].focus = s;
         true
+    }
+
+    /// Marks `w` as asking for attention. Only a waiting window can be: one on top is already seen, and one not
+    /// placed has no slot to show it.
+    pub fn mark(&mut self, w: WinId) {
+        self.attention.insert(w);
+        self.settle();
+    }
+
+    pub fn clear_mark(&mut self, w: WinId) {
+        self.attention.remove(&w);
+    }
+
+    #[must_use]
+    pub fn is_marked(&self, w: WinId) -> bool {
+        self.attention.contains(&w)
     }
 
     /// One per non-empty slot: the top of its current tab at the slot's rectangle.
@@ -482,6 +514,18 @@ impl Stacks {
                     .find_map(|(ti, stack)| stack.iter().position(|&x| x == w).map(|p| (mi, si, ti, p)))
             })
         })
+    }
+
+    /// Keeps only the marks of windows waiting in a slot: a window shown (whatever showed it), closed or gone to
+    /// `pending` loses its mark for good. Every method that changes a slot's tabs or current tab ends with this
+    /// (their early returns change nothing); the random walk checks the rule after every operation, so a method
+    /// that forgets it fails there.
+    fn settle(&mut self) {
+        if self.attention.is_empty() {
+            return;
+        }
+        let waiting: BTreeSet<WinId> = self.placements().filter(|p| !p.on_top).map(|p| p.win).collect();
+        self.attention.retain(|w| waiting.contains(w));
     }
 
     /// Placed or pending: every open refuses such an id, so a window can never be in two places.
@@ -665,6 +709,14 @@ mod tests {
             .map(|t| (t.monitor, t.slot, t.rect, t.win, t.focused))
             .collect();
         assert_eq!(tops, from_tiles, "tiles are the top placements");
+
+        for &w in &s.attention {
+            let p = placements.iter().find(|p| p.win == w);
+            assert!(
+                p.is_some_and(|p| !p.on_top),
+                "window {w} marked but not waiting in a slot"
+            );
+        }
     }
 
     fn ids(s: &Stacks) -> BTreeSet<WinId> {
@@ -1312,6 +1364,104 @@ mod tests {
         assert_eq!(s.tiles()[0].rect, rect(0, 0, 640, 360));
     }
 
+    #[test]
+    fn only_a_waiting_window_can_be_marked() {
+        let mut s = three_tabs();
+        s.mark(3);
+        assert!(!s.is_marked(3), "the top of the current tab is already seen");
+        s.mark(99);
+        assert!(!s.is_marked(99), "unknown");
+        s.mark(2);
+        s.mark(4);
+        assert!(
+            s.is_marked(2) && s.is_marked(4),
+            "beneath the top, and in a background tab"
+        );
+        assert_invariants(&s);
+        s.clear_mark(2);
+        s.clear_mark(99);
+        assert!(!s.is_marked(2) && s.is_marked(4));
+        assert_invariants(&s);
+
+        let mut none = Stacks::new();
+        none.open_stacked(5);
+        none.mark(5);
+        assert!(!none.is_marked(5), "pending is not placed");
+    }
+
+    #[test]
+    fn a_mark_clears_for_good_when_its_window_comes_on_top() {
+        // Tabs [1], [2, 3], [4], the middle one current.
+        let mut s = three_tabs();
+        s.mark(1);
+        s.mark(2);
+        s.mark(4);
+        s.cycle_tab(Cycle::Next);
+        assert!(!s.is_marked(4), "shown by cycle_tab");
+        s.cycle_tab(Cycle::Prev);
+        assert!(!s.is_marked(4), "going back beneath does not bring it back");
+        s.close(3);
+        assert!(!s.is_marked(2), "uncovered by a close");
+        s.move_stack(Dir::Right);
+        // [2] left; the tab that took its place, [4], shows.
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![4]]);
+        assert_eq!(s.monitors[0].slots[0].top(), Some(4));
+        assert!(s.is_marked(1));
+        s.focus_at("winit", 0);
+        s.move_stack(Dir::Right);
+        assert_eq!(s.monitors[0].slots[0].top(), Some(1));
+        assert!(!s.is_marked(1), "shown when the last tab left");
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn closing_a_marked_window_drops_its_mark() {
+        let mut s = three_tabs();
+        s.mark(2);
+        s.close(2);
+        assert!(!s.is_marked(2));
+        assert!(s.attention.is_empty());
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn layout_merges_and_monitor_loss_clear_what_they_show() {
+        // Slot 4 holds the tabs [1], [2, 3], the second current; 1 and 2 are marked.
+        let mut s = wall_monitor();
+        s.focus_at("winit", 4);
+        s.open_stacked(1);
+        s.open_tab(2, None, None);
+        s.open_stacked(3);
+        s.mark(1);
+        s.mark(2);
+        // halves' last slot was empty, so it shows the first merged tab: 1 comes on top, 2 stays beneath.
+        s.set_layout("winit", layout("halves"));
+        assert_eq!(tabs(&s, 0, 1), [vec![1], vec![2, 3]]);
+        assert_eq!(current(&s, 0, 1), 0);
+        assert!(!s.is_marked(1) && s.is_marked(2));
+        assert_invariants(&s);
+
+        // The same when a monitor's tabs land in an empty focused slot.
+        s.focus_at("winit", 1);
+        s.cycle_tab(Cycle::Next);
+        s.mark(1);
+        assert!(s.is_marked(1));
+        s.add_monitor("other", UHD, layout("wall"));
+        s.focus_monitor("other");
+        s.remove_monitor("winit");
+        assert_eq!(tabs(&s, 0, 0), [vec![1], vec![2, 3]]);
+        assert_eq!(current(&s, 0, 0), 0);
+        assert!(!s.is_marked(1) && s.is_marked(2));
+        assert_invariants(&s);
+
+        // With no monitor left the windows wait in `pending`, which holds no marks.
+        let mut s = three_tabs();
+        s.mark(2);
+        s.remove_monitor("winit");
+        assert!(!s.is_marked(2));
+        assert_invariants(&s);
+    }
+
     /// xorshift64: enough randomness for a reproducible walk, no dependency.
     struct Rng(u64);
 
@@ -1340,8 +1490,9 @@ mod tests {
             .collect()
     }
 
-    /// One seeded walk of 1,000 operations; returns the most windows open at once.
-    fn walk(seed: u64) -> usize {
+    /// One seeded walk of 1,000 operations; returns the most windows open at once and the steps ending with a
+    /// mark.
+    fn walk(seed: u64) -> (usize, usize) {
         let layouts = [layout("wall"), layout("halves"), single()];
         let mut rng = Rng(seed);
         let mut s = wall_monitor();
@@ -1349,6 +1500,7 @@ mod tests {
         let mut next_id: WinId = 1;
         let mut next_monitor = 0;
         let mut most = 0;
+        let mut marked_steps = 0;
         for step in 0..1000 {
             let pick = |rng: &mut Rng, live: &BTreeSet<WinId>| -> WinId {
                 // Mostly a live id; sometimes one that never existed.
@@ -1374,7 +1526,7 @@ mod tests {
             let op = if live.len() > 12 && rng.below(2) == 0 {
                 3
             } else {
-                rng.below(18)
+                rng.below(20)
             };
             match op {
                 0 | 1 => {
@@ -1437,20 +1589,38 @@ mod tests {
                         assert_eq!(s, before, "seed {seed} step {step}: refused open_on changed things");
                     }
                 }
-                _ => s.split(),
+                16 => s.split(),
+                17 | 18 => {
+                    let w = pick(&mut rng, &live);
+                    s.mark(w);
+                    let waiting = before.placements().any(|p| p.win == w && !p.on_top);
+                    assert_eq!(s.is_marked(w), waiting, "seed {seed} step {step}: mark {w}");
+                }
+                _ => s.clear_mark(pick(&mut rng, &live)),
+            }
+            if !matches!(op, 17 | 18) {
+                assert!(
+                    s.attention.is_subset(&before.attention),
+                    "seed {seed} step {step}: only mark marks"
+                );
             }
             assert_invariants(&s);
             assert_eq!(ids(&s), live, "seed {seed} step {step}");
             most = most.max(live.len());
+            marked_steps += usize::from(!s.attention.is_empty());
         }
-        most
+        (most, marked_steps)
     }
 
     #[test]
     fn random_walks_lose_nothing() {
         let mut seed: u64 = 0x7472_616e_6365;
         for _ in 0..32 {
-            let most = walk(seed);
+            let (most, marked_steps) = walk(seed);
+            assert!(
+                marked_steps > 50,
+                "seed {seed}: marks held on {marked_steps} steps only"
+            );
             assert!(
                 (4..=40).contains(&most),
                 "seed {seed}: at most {most} open, the walk is unbalanced"

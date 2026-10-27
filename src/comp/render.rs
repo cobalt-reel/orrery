@@ -92,9 +92,18 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
             borders.extend(border(rect, colors.focus));
         }
         if slot.len() > 1 {
-            badges.extend(badge(rect, colors.badge));
+            let tabs: Vec<StripTab> = slot
+                .tabs()
+                .iter()
+                .map(|stack| StripTab {
+                    depth: stack.len(),
+                    attention: stack.iter().any(|&w| stacks.is_marked(w)),
+                })
+                .collect();
+            let marked = tabs.iter().any(|t| t.attention);
+            badges.extend(badge(rect, if marked { colors.attention } else { colors.badge }));
             if show_tabs {
-                strips.extend(strip(rect, slot.tabs().len(), slot.current(), colors.badge));
+                strips.extend(strip(rect, &tabs, slot.current(), colors));
             }
         }
     }
@@ -162,31 +171,72 @@ fn badge(r: Rect, color: Color) -> Option<Solid> {
     (r.w >= BADGE + 2 * BADGE_INSET && r.h >= BADGE + 2 * BADGE_INSET).then_some(Solid { rect, color })
 }
 
+/// One tab as its strip segment shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StripTab {
+    /// Windows in its stack.
+    depth: usize,
+    /// Its stack holds a marked window.
+    attention: bool,
+}
+
+/// The same colour at two fifths of its alpha: a tab not shown.
+fn dim(c: Color) -> Color {
+    Color {
+        a: (u16::from(c.a) * 2 / 5) as u8,
+        ..c
+    }
+}
+
 /// A STRIP-high bar along the slot's top, one segment per tab, left to right, split with the layout's integer
 /// math so segments tile the width exactly; a 1 px gap separates neighbours when there is room. The current tab
-/// is bright, the others dim.
-fn strip(r: Rect, tabs: usize, current: usize, color: Color) -> impl Iterator<Item = Solid> {
-    let n = i64::try_from(tabs).unwrap_or(i64::MAX).max(1);
-    let current = i64::try_from(current).unwrap_or(i64::MAX);
+/// is bright, the others dim; a tab holding a marked window is in `attention`, else `badge`. A stack of more
+/// than one window punches one background-coloured pip per window into its segment, each in front of it.
+fn strip(r: Rect, tabs: &[StripTab], current: usize, colors: &Colors) -> Vec<Solid> {
+    let n = i64::try_from(tabs.len()).unwrap_or(i64::MAX).max(1);
     let w = i64::from(r.w);
-    let edge = move |i: i64| r.x + i32::try_from(w * i / n).unwrap_or(r.w);
-    let dim = Color {
-        a: (u16::from(color.a) * 2 / 5) as u8,
-        ..color
-    };
-    (0..n).filter_map(move |i| {
-        let (x0, x1) = (edge(i), edge(i + 1));
-        let gap = i32::from(i + 1 < n && x1 - x0 > 1);
-        let rect = non_empty(Rect {
+    let edge = |i: i64| r.x + i32::try_from(w * i / n).unwrap_or(r.w);
+    let mut out = Vec::new();
+    for (i, tab) in tabs.iter().enumerate() {
+        let k = i64::try_from(i).unwrap_or(i64::MAX);
+        let (x0, x1) = (edge(k), edge(k + 1));
+        let gap = i32::from(k + 1 < n && x1 - x0 > 1);
+        let Some(rect) = non_empty(Rect {
             x: x0,
             y: r.y,
             w: x1 - x0 - gap,
             h: STRIP.min(r.h),
-        })?;
-        Some(Solid {
+        }) else {
+            continue;
+        };
+        let color = if tab.attention { colors.attention } else { colors.badge };
+        if tab.depth > 1 {
+            out.extend(pips(rect, tab.depth, colors.background));
+        }
+        out.push(Solid {
             rect,
-            color: if i == current { color } else { dim },
-        })
+            color: if i == current { color } else { dim(color) },
+        });
+    }
+    out
+}
+
+/// Up to `depth` squares a third of the segment high, left-aligned and inset by the space above them, a pip
+/// apart; those that would not fit are dropped.
+fn pips(seg: Rect, depth: usize, color: Color) -> impl Iterator<Item = Solid> {
+    let side = (seg.h / 3).max(1);
+    let inset = (seg.h - side) / 2;
+    let room = seg.w - 2 * inset - side;
+    let fit = if room < 0 { 0 } else { room / (2 * side) + 1 };
+    let count = usize::try_from(fit).unwrap_or(0).min(depth);
+    (0..count).map(move |i| Solid {
+        rect: Rect {
+            x: seg.x + inset + i32::try_from(i).unwrap_or(0) * 2 * side,
+            y: seg.y + inset,
+            w: side,
+            h: side,
+        },
+        color,
     })
 }
 
@@ -454,6 +504,143 @@ mod tests {
         assert_eq!(scene.solids.last().map(|s| s.color), Some(dim));
     }
 
+    /// The strip's segments: the full-height solids along the slot's top.
+    fn segments(scene: &Scene) -> Vec<Solid> {
+        scene.solids.iter().filter(|s| s.rect.h == STRIP).copied().collect()
+    }
+
+    #[test]
+    fn one_tab_of_depth_three_is_one_segment_with_three_pips() {
+        let (mut s, rects, colors) = wall();
+        for id in [1, 2, 3] {
+            s.open_stacked(id);
+        }
+        let scene = scene(&s, "m", &colors, true, false);
+        let r = rects[0];
+        assert_eq!(
+            segments(&scene),
+            [Solid {
+                rect: Rect {
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: STRIP
+                },
+                color: colors.badge
+            }],
+            "the whole width, bright"
+        );
+        // A third of the strip high, inset as much as they are below the strip's edge, a pip apart.
+        let pips: Vec<Rect> = (0..3)
+            .map(|i| Rect {
+                x: r.x + 2 + 4 * i,
+                y: r.y + 2,
+                w: 2,
+                h: 2,
+            })
+            .collect();
+        assert_eq!(of_color(&scene, colors.background), pips);
+        let first_pip = scene.solids.iter().position(|s| s.color == colors.background);
+        let segment = scene.solids.iter().position(|s| s.rect.h == STRIP);
+        assert!(first_pip < segment, "pips in front of their segment");
+
+        let hidden = super::scene(&s, "m", &colors, false, false);
+        assert!(of_color(&hidden, colors.background).is_empty(), "no strip, no pips");
+    }
+
+    #[test]
+    fn pips_left_align_and_drop_what_does_not_fit() {
+        let colors = config::default_config().colors;
+        let r = Rect {
+            x: 10,
+            y: 20,
+            w: 25,
+            h: 30,
+        };
+        let tabs = [
+            StripTab {
+                depth: 50,
+                attention: false,
+            },
+            StripTab {
+                depth: 1,
+                attention: false,
+            },
+        ];
+        let solids = strip(r, &tabs, 0, &colors);
+        let pips: Vec<Rect> = solids
+            .iter()
+            .filter(|s| s.color == colors.background)
+            .map(|s| s.rect)
+            .collect();
+        // The first segment is 12 wide less its 1 px gap: room for two 2 px pips with 2 px margins.
+        let seg = solids
+            .iter()
+            .find(|s| s.rect.h == STRIP && s.rect.x == r.x)
+            .expect("first segment")
+            .rect;
+        assert_eq!(seg.w, 11);
+        assert_eq!(
+            pips,
+            [
+                Rect {
+                    x: 12,
+                    y: 22,
+                    w: 2,
+                    h: 2
+                },
+                Rect {
+                    x: 16,
+                    y: 22,
+                    w: 2,
+                    h: 2
+                }
+            ],
+            "a depth of one has none"
+        );
+        assert!(pips.iter().all(|p| inside(*p, seg)));
+    }
+
+    #[test]
+    fn attention_colours_the_badge_and_the_marked_tabs() {
+        let (mut s, rects, colors) = wall();
+        s.open_stacked(1);
+        s.open_stacked(2);
+        s.open_tab(3, None, None);
+        s.open_tab(4, None, None);
+        s.cycle_tab(crate::config::Cycle::Next);
+        // Tabs [1, 2], [3], [4], the first current; 1 waits beneath 2 and 4 in the background.
+        s.mark(1);
+        s.mark(4);
+        let r = rects[0];
+        let badge = Rect {
+            x: r.x + r.w - 14,
+            y: r.y + 6,
+            w: 8,
+            h: 8,
+        };
+        let plain = scene(&s, "m", &colors, false, false);
+        assert_eq!(of_color(&plain, colors.attention), [badge]);
+        assert!(of_color(&plain, colors.badge).is_empty());
+
+        let held = scene(&s, "m", &colors, true, false);
+        let colours: Vec<Color> = segments(&held).iter().map(|s| s.color).collect();
+        assert_eq!(
+            colours,
+            [colors.attention, dim(colors.badge), dim(colors.attention)],
+            "bright or dim by current, attention by mark"
+        );
+        assert_eq!(of_color(&held, colors.background).len(), 2, "the current tab's depth");
+
+        // Shown windows lose their marks, and the colours go with them.
+        s.cycle_tab(crate::config::Cycle::Prev);
+        s.cycle_tab(crate::config::Cycle::Next);
+        s.close(2);
+        let after = scene(&s, "m", &colors, true, false);
+        assert!(of_color(&after, colors.attention).is_empty());
+        assert!(of_color(&after, dim(colors.attention)).is_empty());
+    }
+
     #[test]
     fn a_config_error_puts_a_red_bar_over_everything() {
         let (mut s, _, colors) = wall();
@@ -522,7 +709,11 @@ mod tests {
             "{edges:?}"
         );
         assert!(badge(Rect { w: 19, ..r }, colors.badge).is_none());
-        let segs: Vec<Solid> = strip(Rect { w: 2, h: 3, ..r }, 5, 4, colors.badge).collect();
+        let tabs = [StripTab {
+            depth: 3,
+            attention: true,
+        }; 5];
+        let segs = strip(Rect { w: 2, h: 3, ..r }, &tabs, 4, &colors);
         assert!(
             segs.iter().all(|e| inside(e.rect, Rect { w: 2, h: 3, ..r })),
             "{segs:?}"
