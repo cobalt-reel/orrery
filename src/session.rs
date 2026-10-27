@@ -9,6 +9,8 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::stacks::WORKSPACES;
 
 /// Workspace numbers to change, (from, to): what a join or a report hands a machine for `Stacks::apply_session`.
@@ -21,7 +23,7 @@ pub enum Role {
 }
 
 /// A machine's screen: its output's name and its number.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Screen {
     pub name: String,
     pub number: u8,

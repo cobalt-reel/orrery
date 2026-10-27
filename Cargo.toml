@@ -23,6 +23,8 @@ tracing-subscriber = "0.3.23"
 thiserror = "2.0.21"
 anyhow = "1.0.104"
 libc = "0.2.191"
+# The link's Noise handshake and transport; only the pure-Rust primitives `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` needs.
+snow = { version = "0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 # The nested windows' EGL surfaces (Smithay's winit backend uses it but does not re-export it).
 wayland-egl = "0.32.11"
 

@@ -1,10 +1,11 @@
-//! orrery: a static tiling Wayland compositor. The pure core (layout, config, stacks, placement, session, ipc) holds
-//! every decision; the compositor layer (`comp`) only translates Wayland events into core operations.
+//! orrery: a static tiling Wayland compositor. The pure core (layout, config, stacks, placement, session, ipc, link)
+//! holds every decision; the compositor layer (`comp`) only translates Wayland events into core operations.
 
 pub mod comp;
 pub mod config;
 pub mod ipc;
 pub mod layout;
+pub mod link;
 pub mod placement;
 pub mod session;
 pub mod stacks;
