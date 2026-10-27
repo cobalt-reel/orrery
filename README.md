@@ -352,8 +352,9 @@ name "side"
 primary "desk.lan:7340" secret-file="~/.config/orrery/secret"
 ```
 
-The **secret file** holds the same 32 or more random bytes on every machine and is readable by its owner only
-(orrery refuses it otherwise, naming the file, and never logs or shows its contents):
+The **secret file** holds the same secret on every machine, 32 to 4096 bytes (whitespace at either end aside, so a
+trailing newline does not matter), and gives group and others no permission at all (orrery refuses it otherwise,
+naming the file, and never logs or shows its contents):
 
 ```sh
 (umask 077; head -c 32 /dev/urandom | base64 > ~/.config/orrery/secret)   # then copy it to each machine, 0600
@@ -397,8 +398,9 @@ primary's address, with the port it picked for 0), `primary` (a satellite's prim
 workspace numbers other machines own), `error` (why a link last failed, until one opens), and `machines`: on the
 primary every machine in the session (itself first, then the satellites in join order), on a satellite itself, each
 as `{ name, role, monitors, workspaces, latency_ms, connected, focused }` (`monitors` as `{ name, number }`;
-`latency_ms` the link's round trip, pinged every 2 s, null for the primary itself and while a ping is overdue;
-`focused`: the session's focus marker is there).
+`latency_ms` the link's round trip, pinged every 2 s, null for the primary itself, before the first answer and while
+a ping is overdue; `focused`: the session's focus marker is there, known on the primary only: a satellite shows
+false).
 
 ## Limits
 

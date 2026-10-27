@@ -214,7 +214,7 @@ pub struct MachineView {
     /// The workspace numbers it owns, its screens' among them.
     pub workspaces: Vec<u8>,
     /// The round trip of its link to the primary (to this machine, for a satellite's own view); null for the
-    /// primary itself and before the first answer to a ping.
+    /// primary itself, before the first answer to a ping and while one is overdue.
     pub latency_ms: Option<u64>,
     /// Its link is up (on the primary every machine in the session is).
     pub connected: bool,
