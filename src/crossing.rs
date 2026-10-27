@@ -140,6 +140,19 @@ impl Crossing {
         went.then(|| self.place.clone())
     }
 
+    /// The modifier keys held, wherever input is: what a handoff presses where it goes, and what the escape key is
+    /// matched with.
+    #[must_use]
+    pub fn held(&self) -> Vec<RawKey> {
+        (self.keys.iter()).filter(|(_, m)| **m).map(|(k, _)| *k).collect()
+    }
+
+    /// This machine's keyboard lost its keys without their releases (the host took its focus): none is down any
+    /// more, so each one's next press goes where input is instead of reading as a repeat. Buttons stay.
+    pub fn forget_keys(&mut self) {
+        self.keys.clear();
+    }
+
     /// A button of this machine's pointer went down or up: where it goes, as for `key`.
     pub fn button(&mut self, code: u32, pressed: bool) -> Option<Place> {
         let went = match pressed {
@@ -535,6 +548,32 @@ mod tests {
         );
         assert_eq!(c.key(A, false, false), None);
         assert_eq!(c.reclaim(), None);
+    }
+
+    #[test]
+    fn the_modifiers_held_are_known_wherever_input_is_and_a_lost_keyboard_forgets_its_keys() {
+        let mut c = Crossing::new("p");
+        c.key(SUPER, true, true);
+        c.key(A, true, false);
+        assert_eq!(c.held(), [SUPER]);
+        c.handoff("a", None);
+        c.key(SHIFT, true, true);
+        assert_eq!(
+            c.held(),
+            [SHIFT, SUPER],
+            "the escape key and a resumed handoff read them"
+        );
+        // The keyboard lost its keys without releases (the host took its focus): nothing is down any more, so the
+        // next press of each goes where input is again instead of reading as a repeat.
+        c.button(LEFT, true);
+        c.forget_keys();
+        assert_eq!(c.held(), []);
+        assert_eq!(c.key(SUPER, true, true), Some(remote("a")));
+        assert_eq!(
+            c.button(LEFT, false),
+            Some(remote("a")),
+            "buttons are the pointer's: kept"
+        );
     }
 
     #[test]

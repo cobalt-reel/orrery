@@ -56,6 +56,17 @@ pub fn satellite_with(name: &str, port: u16, secret: &Path, args: &[&str]) -> Co
     Compositor::start_with(&format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT), SIZE, args)
 }
 
+/// `satellite_with` and environment variables.
+pub fn satellite_env(name: &str, port: u16, secret: &Path, args: &[&str], env: &[(&str, &str)]) -> Compositor {
+    let link = format!("primary \"127.0.0.1:{port}\" secret-file=\"{}\"", secret.display());
+    Compositor::start_with_env(
+        &format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT),
+        SIZE,
+        args,
+        env,
+    )
+}
+
 /// The port the primary listens on.
 pub fn port(primary: &Compositor) -> u16 {
     let listen = primary.state()["session"]["listen"].as_str().map(str::to_owned);

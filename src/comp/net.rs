@@ -7,11 +7,16 @@
 //! (`Orrery::link_tick`), the rest when the socket drains. The tick also reports this machine's workspaces when
 //! they changed (the primary to its own session, a satellite to the primary), hands each machine the numbers the
 //! others own when they changed, and drops closed connections.
+//!
+//! The primary's input on its way to a satellite waits in that connection's `Outbox` and goes into its link one
+//! message at a time, only when the link has written everything before: what waits meanwhile (motion) merges. A
+//! link's kernel buffers are kept small for that, so little input queues where it cannot merge.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _};
+use std::os::fd::AsRawFd as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,7 +29,7 @@ use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken}
 use super::{Orrery, ipc_server};
 use crate::NAME;
 use crate::config::{self, Config, LinkConfig, MAX_NAME};
-use crate::crossing::Edge;
+use crate::crossing::{Crossing, Edge, Landing, Outbox, Place, RowScreen};
 use crate::ipc::{MachineView, Request, Response, SessionView};
 use crate::link::{Link, Message, OPEN_DEADLINE, PROTOCOL_VERSION, Secret, SendError};
 use crate::session::{Role, Route, Screen, Session};
@@ -49,6 +54,10 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Read from one connection per wakeup, at most, so a busy link cannot hold the loop.
 const READ_BUDGET: usize = 256 * 1024;
+/// A link's kernel send and receive buffers (Linux doubles them): small, so input a stalled link cannot take waits
+/// in its `Outbox`, where motion merges, instead of in the kernels at either end, where it would all arrive late. A
+/// keymap still fits.
+const KERNEL_BUFFER: libc::c_int = 64 * 1024;
 
 /// Where a forwarded request's answer goes: called once, with the other machine's answer or an error.
 pub type Reply = Box<dyn FnOnce(Response)>;
@@ -81,6 +90,8 @@ struct Primary {
     /// The bound address (port 0 resolved); None when listening failed.
     listen: Option<SocketAddr>,
     session: Session,
+    /// Where this machine's keyboard and pointer go: kept with the session's focus marker.
+    crossing: Crossing,
     /// What the primary last told its own session.
     reported: Option<Report>,
     /// Commands sent and not answered yet, by id.
@@ -120,6 +131,9 @@ struct Conn {
     heard: Instant,
     /// Why the driver gives up on it while its link is still open (the socket failed, or it went silent).
     dropped: Option<String>,
+    /// The primary's input on its way to this satellite, and the keymap (xkb text) it was last sent.
+    outbox: Outbox,
+    keymap: Option<String>,
 }
 
 /// A command sent to a satellite, waiting for its answer.
@@ -193,6 +207,28 @@ fn send(conn: &mut Conn, msg: &Message) -> Result<(), SendError> {
     sent
 }
 
+/// Sets `stream`'s kernel send and receive buffers to `KERNEL_BUFFER`.
+fn small_buffers(stream: &TcpStream) -> std::io::Result<()> {
+    let size = KERNEL_BUFFER;
+    let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("an int's size fits");
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // Safety: a socket we own, and the option's value is a c_int of that length.
+        let set = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const size).cast(),
+                len,
+            )
+        };
+        if set != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -262,6 +298,7 @@ impl Orrery {
                 Side::Primary(Primary {
                     listen: None,
                     session,
+                    crossing: Crossing::new(&name),
                     reported: Some((screens, numbers)),
                     commands: HashMap::new(),
                     next_command: 1,
@@ -344,11 +381,38 @@ impl Orrery {
         self.link_reap();
         self.link_report();
         let ids: Vec<u64> = (self.net.iter().flat_map(|n| n.conns.iter()))
-            .filter(|(_, c)| c.writer.is_none() && !c.link.outgoing().is_empty())
+            .filter(|(_, c)| c.writer.is_none() && !(c.link.outgoing().is_empty() && c.outbox.is_empty()))
             .map(|(&id, _)| id)
             .collect();
         for id in ids {
-            self.link_flush(id);
+            if self.link_flush(id) {
+                self.link_drain(id);
+            }
+        }
+    }
+
+    /// Hands connection `id`'s link the input waiting for it, one message at a time, each only once the link has
+    /// written everything before (so what waits meanwhile merges). A message the link cannot take (too large, or
+    /// the link closed) drops the connection with the rest: never half a handoff.
+    fn link_drain(&mut self, id: u64) {
+        loop {
+            let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) else {
+                return;
+            };
+            if conn.dropped.is_some() || !conn.link.outgoing().is_empty() {
+                return;
+            }
+            let Some(msg) = conn.outbox.pop() else {
+                return;
+            };
+            if let Err(e) = send(conn, &msg) {
+                conn.dropped = Some(format!("cannot send it input: {e}"));
+                conn.outbox = Outbox::default();
+                return;
+            }
+            if !self.link_flush(id) {
+                return;
+            }
         }
     }
 
@@ -448,6 +512,9 @@ impl Orrery {
             .set_nonblocking(true)
             .and_then(|()| stream.set_nodelay(true))
             .and_then(|()| stream.try_clone());
+        if let Err(e) = small_buffers(&stream) {
+            tracing::warn!("link to {peer}: cannot make its kernel buffers small ({e}); input may arrive late");
+        }
         let writer = match prepared {
             Ok(w) => w,
             Err(e) => {
@@ -491,6 +558,8 @@ impl Orrery {
             latency: None,
             heard: Instant::now(),
             dropped: None,
+            outbox: Outbox::default(),
+            keymap: None,
         };
         self.net.as_mut()?.conns.insert(id, conn);
         Some(id)
@@ -567,6 +636,29 @@ impl Orrery {
 
     /// A satellite's message, on the primary. Its link has checked it may come here now.
     fn primary_got(&mut self, id: u64, msg: Message) {
+        let from = (self.net.as_ref())
+            .and_then(|n| n.conns.get(&id))
+            .and_then(|c| c.joined.clone());
+        match (msg, from) {
+            (Message::InputExit { edge, y }, Some(from)) => {
+                let side = match edge {
+                    Edge::Left => "left",
+                    Edge::Right => "right",
+                };
+                tracing::info!(
+                    "{from}'s pointer left its screens past the {side} edge, {:.0} % down",
+                    y * 100.0
+                );
+                self.input_cross(&from, edge, y);
+            }
+            (Message::SessionRequest { request }, Some(from)) => self.session_request(&from, request),
+            (Message::InputExit { .. } | Message::SessionRequest { .. }, None) => {}
+            (msg, _) => self.primary_got_link(id, msg),
+        }
+    }
+
+    /// `primary_got` for what the link and the session alone answer.
+    fn primary_got_link(&mut self, id: u64, msg: Message) {
         if let Message::Hello { name, .. } = &msg {
             self.link_take_over(id, name);
         }
@@ -657,19 +749,6 @@ impl Orrery {
                     resync(conn, p.session.foreign(&pending.machine));
                 }
                 pending.answer(response);
-            }
-            Message::InputExit { edge, y } => {
-                let Some(name) = &conn.joined else {
-                    return;
-                };
-                let edge = match edge {
-                    Edge::Left => "left",
-                    Edge::Right => "right",
-                };
-                tracing::info!(
-                    "{name}'s pointer left its screens past the {edge} edge, {:.0} % down",
-                    y * 100.0
-                );
             }
             other => tracing::debug!("unexpected on the primary: {other:?}"),
         }
@@ -845,6 +924,14 @@ impl Orrery {
                 Some(name) => {
                     tracing::info!("{name} left the session: {why}");
                     p.session.drop_satellite(&name);
+                    // Its outbox went with the connection; input there comes home.
+                    self.input_lost(&name);
+                    let Some(Net {
+                        side: Side::Primary(p), ..
+                    }) = &mut self.net
+                    else {
+                        return;
+                    };
                     let lost: Vec<u64> = (p.commands.iter())
                         .filter(|(_, c)| c.machine == name)
                         .map(|(&id, _)| id)
@@ -870,12 +957,15 @@ impl Orrery {
                 }
             },
             Side::Satellite(s) => {
-                if conn.joined.is_some() {
+                let joined = conn.joined.is_some();
+                if joined {
                     tracing::warn!("lost the primary at {}: {why}", s.primary);
                     s.backoff = BACKOFF_FIRST;
                     self.stacks.clear_foreign();
-                    // Nothing more comes from the primary's keyboard and pointer: what they have down goes up.
-                    self.remote_release();
+                }
+                // Nothing more comes from the primary's keyboard and pointer: what they have down goes up.
+                self.remote_lost();
+                if joined {
                     self.arrange();
                 }
                 self.link_retry(why);
@@ -1156,7 +1246,8 @@ impl Orrery {
     }
 
     /// `workspace n` in a session: shown here, or by the machine that has it (the session's focus marker moves to
-    /// it), or made on the focused machine.
+    /// it, and the primary's input with it), or made on the focused machine. A satellite asks the primary for a
+    /// number another machine has (`SessionRequest`), answered ok once sent.
     pub(super) fn session_workspace(&mut self, n: u8) -> Response {
         let here = Request::Workspace { number: n };
         let Some(net) = &mut self.net else {
@@ -1164,19 +1255,129 @@ impl Orrery {
         };
         let route = match &mut net.side {
             Side::Satellite(_) if self.stacks.foreign().contains(&n) => {
-                return Response::error(format!(
-                    "workspace {n} is on another machine: switch to it from the primary"
-                ));
+                let Some(conn) = net.conns.values_mut().find(|c| c.joined.is_some()) else {
+                    return Response::error(format!("workspace {n} is on another machine, and the primary is gone"));
+                };
+                return match send(conn, &Message::SessionRequest { request: here }) {
+                    Ok(()) => Response::ok(),
+                    Err(e) => Response::error(format!("cannot ask the primary for workspace {n}: {e}")),
+                };
             }
             Side::Satellite(_) => return self.apply(here),
             Side::Primary(p) => p.session.workspace(n),
         };
-        match route {
+        let response = match route {
             Err(e) => Response::error(e.to_string()),
             Ok(Route::Local) => self.apply(here),
             Ok(Route::Create(m)) if m == net.name => self.apply(here),
             Ok(Route::On(m) | Route::Create(m)) => self.link_command(&m, here, None).unwrap_or_else(Response::ok),
+        };
+        self.input_follow_marker();
+        response
+    }
+
+    /// Satellite `from` asks the primary to route `request` (a `workspace` it does not have): as the primary's own.
+    fn session_request(&mut self, from: &str, request: Request) {
+        let response = match request {
+            Request::Workspace { number } => self.session_workspace(number),
+            other => Response::error(format!("{} is no session request", other.verb())),
+        };
+        if let Some(e) = response.error {
+            tracing::info!("{from}'s request: {e}");
         }
+    }
+
+    /// The primary's crossing: where its input goes.
+    pub(super) fn crossing(&mut self) -> Option<&mut Crossing> {
+        match &mut self.net {
+            Some(Net {
+                side: Side::Primary(p), ..
+            }) => Some(&mut p.crossing),
+            _ => None,
+        }
+    }
+
+    /// Where the primary's input goes; None elsewhere.
+    pub(super) fn input_place(&self) -> Option<&Place> {
+        match &self.net {
+            Some(Net {
+                side: Side::Primary(p), ..
+            }) => Some(p.crossing.place()),
+            _ => None,
+        }
+    }
+
+    /// This machine's name in a session.
+    pub(super) fn this_machine(&self) -> Option<String> {
+        self.net.as_ref().map(|n| n.name.clone())
+    }
+
+    /// The machine holding the session's focus marker (the primary's view).
+    pub(super) fn marker(&self) -> Option<String> {
+        match &self.net {
+            Some(Net {
+                side: Side::Primary(p), ..
+            }) => Some(p.session.focused().name().to_owned()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn focus_marker(&mut self, machine: &str) {
+        if let Some(Net {
+            side: Side::Primary(p), ..
+        }) = &mut self.net
+        {
+            p.session.focus(machine);
+        }
+    }
+
+    /// Where machine `from`'s pointer lands, leaving its screens past `edge` at height `y`: the session's monitors
+    /// in a row (satellites' sizes never cross the link, and landing needs none).
+    pub(super) fn landing(&self, from: &str, edge: Edge, y: f64) -> Option<Landing> {
+        let Some(Net {
+            side: Side::Primary(p), ..
+        }) = &self.net
+        else {
+            return None;
+        };
+        let row: Vec<RowScreen> = (p.session.monitors())
+            .map(|(m, s)| RowScreen {
+                machine: m.name().to_owned(),
+                screen: s.name.clone(),
+                width: 0,
+                height: 0,
+            })
+            .collect();
+        crate::crossing::landing(&row, from, edge, y)
+    }
+
+    /// Queues input for satellite `machine` (dropped when it is gone: its drop brings input home).
+    pub(super) fn queue_input(&mut self, machine: &str, msg: Message) {
+        if let Some(conn) = self.joined_conn(machine) {
+            conn.outbox.push(msg);
+        }
+    }
+
+    /// Queues `keymap` (this machine's, when that satellite was not sent it yet) and `handoff` for `machine`; false
+    /// when it is gone.
+    pub(super) fn queue_handoff(&mut self, machine: &str, keymap: Option<String>, handoff: Message) -> bool {
+        let Some(conn) = self.joined_conn(machine) else {
+            return false;
+        };
+        if let Some(keymap) = keymap
+            && conn.keymap.as_ref() != Some(&keymap)
+        {
+            conn.outbox.push(Message::Keymap {
+                xkb: crate::link::Xkb(keymap.clone()),
+            });
+            conn.keymap = Some(keymap);
+        }
+        conn.outbox.push(handoff);
+        true
+    }
+
+    fn joined_conn(&mut self, machine: &str) -> Option<&mut Conn> {
+        (self.net.as_mut()?.conns.values_mut()).find(|c| c.joined.as_deref() == Some(machine) && c.dropped.is_none())
     }
 
     /// `move-to-workspace n` in a session: refused for another machine's number (windows never cross machines).
@@ -1218,6 +1419,9 @@ impl Orrery {
                         latency_ms: latency(m.name()),
                         connected: true,
                         focused: p.session.focused().name() == m.name(),
+                        queued: (net.conns.values())
+                            .find(|c| c.joined.as_deref() == Some(m.name()))
+                            .map_or(0, |c| c.outbox.len()),
                     })
                     .collect();
                 (p.listen.map(|a| a.to_string()), None, machines)
@@ -1233,6 +1437,7 @@ impl Orrery {
                     latency_ms: conn.and_then(latency_ms),
                     connected: conn.is_some(),
                     focused: false,
+                    queued: 0,
                 };
                 (None, Some(s.primary.clone()), vec![me])
             }
@@ -1246,6 +1451,13 @@ impl Orrery {
             listen,
             primary,
             machines,
+            input: match &net.side {
+                Side::Primary(p) => match p.crossing.place() {
+                    Place::Local => net.name.clone(),
+                    Place::Remote(m) => m.clone(),
+                },
+                Side::Satellite(_) => net.name.clone(),
+            },
             foreign,
             error: net.error.clone(),
         })

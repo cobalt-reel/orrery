@@ -65,6 +65,9 @@ pub enum Action {
     Close,
     ShowTabs,
     Quit,
+    /// Keyboard and pointer back to this machine from another in the session (the escape key): matched before
+    /// input is forwarded, so it works wherever input is.
+    Reclaim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,7 +909,8 @@ impl<'a> Parser<'a> {
             ("close", Some([])) => Action::Close,
             ("show-tabs", Some([])) => Action::ShowTabs,
             ("quit", Some([])) => Action::Quit,
-            ("split" | "toggle-stacking" | "close" | "show-tabs" | "quit", _) => {
+            ("reclaim", Some([])) => Action::Reclaim,
+            ("split" | "toggle-stacking" | "close" | "show-tabs" | "quit" | "reclaim", _) => {
                 self.err_at(arg_at, format!("`{verb}` takes no arguments"));
                 return None;
             }
@@ -1189,6 +1193,7 @@ mod tests {
                 bind(MOD_SHIFT, "Q", k::KEY_q, Action::Close),
                 bind(MOD, "Space", k::KEY_space, Action::ShowTabs),
                 bind(MOD_SHIFT, "E", k::KEY_e, Action::Quit),
+                bind(MOD, "Escape", k::KEY_Escape, Action::Reclaim),
             ])
             .collect(),
             link: None,
@@ -1340,6 +1345,8 @@ mod tests {
             n,
             "toggle-stacking",
         );
+        let n = line_of("\"Mod+Escape\"");
+        assert_problem(&with_line(n, "    \"Mod+Escape\" reclaim \"side\""), n, "no arguments");
     }
 
     #[test]

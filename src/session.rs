@@ -233,6 +233,16 @@ impl Session {
         })
     }
 
+    /// The focus marker to machine `name`: the pointer crossed onto it, or input came back to the primary. False
+    /// (and nothing done) for a machine not in the session.
+    pub fn focus(&mut self, name: &str) -> bool {
+        let Some(i) = self.index_of(name) else {
+            return false;
+        };
+        self.focused = i;
+        true
+    }
+
     /// `move-to-workspace n` run on machine `from`: refused when another machine owns `n`, as windows never cross
     /// machines. A number nobody owns is not claimed here: `from` makes it, and its next report claims it. Nothing
     /// changes, the focus marker included.
@@ -445,6 +455,23 @@ mod tests {
         assert!(!s.drop_satellite("p"));
         assert!(!s.drop_satellite("x"));
         assert_eq!(s, before);
+    }
+
+    #[test]
+    fn the_marker_moves_to_where_the_pointer_crossed() {
+        let mut s = primary();
+        s.join("a", vec![screen("a1", 2)], [2]).expect("joins");
+        s.join("b", vec![], [4]).expect("joins");
+        assert!(s.focus("a"));
+        assert_eq!(s.focused().name(), "a");
+        // A new number is then made there, as after a `workspace` that moved it.
+        assert_eq!(s.workspace(6), Ok(Route::Create("a".into())));
+        assert!(s.focus("p"));
+        assert_eq!(s.focused().name(), "p");
+        assert!(!s.focus("x"), "not in the session");
+        assert_eq!(s.focused().name(), "p");
+        assert!(s.focus("b"), "a machine without screens too");
+        assert_eq!(s.focused().name(), "b");
     }
 
     #[test]

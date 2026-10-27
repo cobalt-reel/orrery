@@ -75,8 +75,9 @@ pub struct State {
     pub enter_serial: Option<u32>,
     /// wl_keyboard.key events in order: (evdev keycode, pressed).
     pub keys: Vec<(u32, bool)>,
-    /// The latest wl_keyboard.modifiers' depressed mask.
+    /// The latest wl_keyboard.modifiers' depressed mask and layout (group).
     pub mods_depressed: u32,
+    pub group: u32,
     /// Each wl_keyboard.keymap's size, in order.
     pub keymaps: Vec<u32>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -84,6 +85,9 @@ pub struct State {
     pub pointer_focus: Option<usize>,
     /// wl_pointer.button events in order: (button, pressed).
     pub buttons: Vec<(u32, bool)>,
+    /// wl_pointer.motion events so far, and the latest one's position (surface-local).
+    pub motions: usize,
+    pub pointer_at: Option<(f64, f64)>,
     outputs: Vec<wl_output::WlOutput>,
     pub globals: Vec<String>,
     pub windows: Vec<Win>,
@@ -614,7 +618,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     .keys
                     .push((key, k == WEnum::Value(wl_keyboard::KeyState::Pressed)));
             }
-            wl_keyboard::Event::Modifiers { mods_depressed, .. } => state.mods_depressed = mods_depressed,
+            wl_keyboard::Event::Modifiers {
+                mods_depressed, group, ..
+            } => {
+                state.mods_depressed = mods_depressed;
+                state.group = group;
+            }
             wl_keyboard::Event::Keymap { size, .. } => state.keymaps.push(size),
             _ => {}
         }
@@ -633,6 +642,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         match event {
             wl_pointer::Event::Enter { surface, .. } => state.pointer_focus = surface.data::<usize>().copied(),
             wl_pointer::Event::Leave { .. } => state.pointer_focus = None,
+            wl_pointer::Event::Motion {
+                surface_x, surface_y, ..
+            } => {
+                state.motions += 1;
+                state.pointer_at = Some((surface_x, surface_y));
+            }
             wl_pointer::Event::Button { button, state: b, .. } => {
                 state
                     .buttons

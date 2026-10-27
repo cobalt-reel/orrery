@@ -28,6 +28,15 @@
 //! window, so client textures are shared; each window has its own EGL surface, made current before its frame (EGL
 //! reports the buffer age only for the current surface), with swap interval 0, and its own damage tracker.
 //!
+//! **Input away.** While the primary's input is on another machine (`Orrery::input_away`), the host's pointer is
+//! hidden and held: locked in place (Wayland's pointer constraints), else confined to the window it is in (X11), and
+//! its relative motion (`DeviceEvent::MouseMotion`) is what moves the other machine's pointer. Here, relative motion
+//! over a window only crosses: pushed past orrery's outer edges, input goes to the machine beside them. When input
+//! comes back the pointer is placed where it came in (set while still locked, as Wayland wants), let go and shown.
+//! Applied right after the input that moved input, and by the frame timer for any other cause (a `workspace` from
+//! the control socket, a link drop). A lock takes hold only while the host's pointer is in the window: crossing at a
+//! window edge with more host screen beside it, the pointer may slip out first.
+//!
 //! None of this is reachable from the headless tests.
 
 mod input;
@@ -49,8 +58,8 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{self, EventLoop, EventSource, Interest, PostAction, Readiness, Token};
 use smithay::reexports::winit::application::ApplicationHandler;
-use smithay::reexports::winit::dpi::LogicalSize;
-use smithay::reexports::winit::event::{ElementState, StartCause, WindowEvent};
+use smithay::reexports::winit::dpi::{LogicalSize, PhysicalPosition};
+use smithay::reexports::winit::event::{DeviceEvent, DeviceId, ElementState, StartCause, WindowEvent};
 use smithay::reexports::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop as HostLoop, OwnedDisplayHandle};
 use smithay::reexports::winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
 use smithay::reexports::winit::platform::scancode::PhysicalKeyExtScancode as _;
@@ -58,7 +67,7 @@ use smithay::reexports::winit::platform::wayland::WindowAttributesExtWayland as 
 use smithay::reexports::winit::raw_window_handle::{
     HasDisplayHandle as _, HasWindowHandle as _, RawDisplayHandle, RawWindowHandle,
 };
-use smithay::reexports::winit::window::{Window as WinitWindow, WindowId};
+use smithay::reexports::winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 use smithay::utils::{Clock, Monotonic, Physical, Rectangle, Size, Transform};
 use wayland_egl::WlEglSurface;
 
@@ -95,6 +104,8 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
         x11,
         windows: Table::new(),
         opening: Vec::new(),
+        pointer_in: None,
+        held: false,
     }));
 
     // The first window now, so a session that cannot open one fails to start rather than running blind.
@@ -132,6 +143,7 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
             for screen in timer_host.borrow().windows.values() {
                 screen.window.request_redraw();
             }
+            hold_pointer(&mut timer_host.borrow_mut(), state);
             TimeoutAction::ToDuration(FRAME)
         })
         .map_err(|e| anyhow::anyhow!("cannot start the frame timer: {e}"))?;
@@ -223,6 +235,10 @@ struct Host {
     windows: Table<Screen>,
     /// Outputs added by `open-screen` whose windows the next pump creates.
     opening: Vec<Output>,
+    /// The window the host's pointer is in, if one of ours.
+    pointer_in: Option<WindowId>,
+    /// The host's pointer is hidden and held: input is away.
+    held: bool,
 }
 
 /// One host window and what drawing it keeps between frames.
@@ -333,6 +349,8 @@ enum HostEvent {
     Close(WindowId),
     Focus(WindowId, bool),
     Input(WindowId, InputEvent<input::Nested>),
+    /// The host pointer's relative motion, over one of our windows or held by one.
+    Relative(f64, f64),
     /// A queued window could not be created.
     Failed {
         output: String,
@@ -370,10 +388,17 @@ fn handle(host: &RefCell<Host>, state: &mut Orrery, event: HostEvent) {
                 state.arrange();
             }
         }
+        // Input may have gone away or come back: the host's pointer is held or let go at once, not a frame later.
         HostEvent::Input(id, event) => {
             if let Some(name) = name_of(id) {
                 state.process_input_event(&name, event);
             }
+            hold_pointer(&mut host.borrow_mut(), state);
+        }
+        // The pointer moves by positions (`Input`): relative motion only crosses here, or goes to the machine away.
+        HostEvent::Relative(dx, dy) => {
+            state.device_motion(dx, dy, false);
+            hold_pointer(&mut host.borrow_mut(), state);
         }
         HostEvent::Failed { output, error } => {
             tracing::warn!("cannot open a nested window for {output}: {error}");
@@ -624,8 +649,22 @@ impl ApplicationHandler for Pump<'_> {
         self.open_windows(active);
     }
 
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        // Only over our windows (X11 reports it wherever the pointer is while a window has focus), or held.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+            && (self.host.held || self.host.pointer_in.is_some())
+        {
+            self.events.push(HostEvent::Relative(dx, dy));
+        }
+    }
+
     fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let time = self.time();
+        match event {
+            WindowEvent::CursorEntered { .. } | WindowEvent::CursorMoved { .. } => self.host.pointer_in = Some(id),
+            WindowEvent::CursorLeft { .. } if self.host.pointer_in == Some(id) => self.host.pointer_in = None,
+            _ => {}
+        }
         let event = match event {
             WindowEvent::Resized(size) => {
                 let (w, h): (i32, i32) = size.into();
@@ -765,6 +804,52 @@ fn disable_vsync(context: &EGLContext, surface: &EGLSurface) {
     }
 }
 
+/// Input went away or came back (`Orrery::input_away`): the host's pointer is hidden and held, or placed where the
+/// seat's pointer is (where it came in), let go and shown.
+fn hold_pointer(host: &mut Host, state: &Orrery) {
+    let away = state.input_away();
+    if away == host.held {
+        return;
+    }
+    host.held = away;
+    if away {
+        for screen in host.windows.values() {
+            screen.window.set_cursor_visible(false);
+        }
+        // Locked in every window (each lock takes hold when the pointer is in it); where the host cannot lock (X11),
+        // confined to the window it is in.
+        let locked = (host.windows.values()).all(|s| s.window.set_cursor_grab(CursorGrabMode::Locked).is_ok());
+        let confined = locked
+            || (host.pointer_in.or_else(|| host.windows.first_id()))
+                .and_then(|id| host.windows.get_mut(id))
+                .is_some_and(|(_, s)| s.window.set_cursor_grab(CursorGrabMode::Confined).is_ok());
+        if !confined {
+            tracing::warn!("the host can neither lock nor confine the pointer: it may wander while input is away");
+        }
+        return;
+    }
+    if let Some(at) = state.seat.get_pointer().map(|p| p.current_location())
+        && let Some(output) =
+            (state.outputs.iter()).find(|o| state.space.output_geometry(o).is_some_and(|g| g.to_f64().contains(at)))
+        && let Some(geometry) = state.space.output_geometry(output)
+        && let Some(screen) = host.windows.get_named(&output.name())
+    {
+        let local = at - geometry.loc.to_f64();
+        if let Err(e) = screen
+            .window
+            .set_cursor_position(PhysicalPosition::new(local.x, local.y))
+        {
+            tracing::debug!("cannot place the host's pointer: {e}");
+        }
+    }
+    for screen in host.windows.values() {
+        if let Err(e) = screen.window.set_cursor_grab(CursorGrabMode::None) {
+            tracing::debug!("cannot let the host's pointer go: {e}");
+        }
+        screen.window.set_cursor_visible(true);
+    }
+}
+
 /// The buffer age to render with. The damage tracker records every render, also those that found nothing to
 /// draw and were never submitted, so after an idle frame its history no longer matches what the buffers hold:
 /// redraw fully (age 0) until a frame is submitted again. Continuous updates keep partial damage.
@@ -799,6 +884,14 @@ impl<T> Table<T> {
         (self.rows.iter_mut())
             .find(|r| r.0 == id)
             .map(|(_, name, value)| (name.as_str(), value))
+    }
+
+    fn get_named(&self, name: &str) -> Option<&T> {
+        self.rows.iter().find(|r| r.1 == name).map(|r| &r.2)
+    }
+
+    fn first_id(&self) -> Option<WindowId> {
+        self.rows.first().map(|r| r.0)
     }
 
     fn remove_named(&mut self, name: &str) -> Option<T> {
@@ -856,6 +949,9 @@ mod tests {
         t.insert(a, "winit".into(), 'a');
         t.insert(b, "winit-2".into(), 'b');
         assert_eq!(t.name_of(b), Some("winit-2"));
+        assert_eq!(t.get_named("winit-2"), Some(&'b'));
+        assert_eq!(t.get_named("winit-3"), None);
+        assert_eq!(t.first_id(), Some(a), "in opening order");
         assert_eq!(
             t.name_of(WindowId::from(3)),
             None,

@@ -18,6 +18,7 @@ use super::Orrery;
 use crate::config::{Action, Bind, Mods};
 use crate::ipc::{KeyView, Request};
 use crate::layout::Rect;
+use crate::link::ScrollSource;
 use crate::stacks::{Stacks, WinId};
 
 /// Keys held for binds. A press matching a bind is swallowed and remembered, so its release is swallowed too;
@@ -71,6 +72,41 @@ pub fn mods_of(m: &ModifiersState) -> Mods {
         shift: m.shift,
         logo: m.logo,
     }
+}
+
+/// A key whose holding counts across a handoff (`Crossing::key`): Shift, Ctrl, Alt, Meta, Super, Hyper, AltGr and the
+/// like. Lock and latch keys (Caps, Num, the ISO locks) are not: each machine keeps its own lock state.
+#[must_use]
+pub fn held_modifier(sym: Keysym) -> bool {
+    use xkb::keysyms as k;
+    match sym.raw() {
+        k::KEY_Caps_Lock | k::KEY_Shift_Lock => false,
+        s => {
+            (k::KEY_Shift_L..=k::KEY_Hyper_R).contains(&s)
+                || matches!(
+                    s,
+                    k::KEY_ISO_Level3_Shift | k::KEY_ISO_Level5_Shift | k::KEY_Mode_switch
+                )
+        }
+    }
+}
+
+/// The bind modifiers the held modifier keys `syms` make, as the default keymap maps them (Super and Hyper are both
+/// Mod4): what the escape key is matched with while this machine's own seat does not see the keys.
+#[must_use]
+pub fn mods_held(syms: impl IntoIterator<Item = Keysym>) -> Mods {
+    use xkb::keysyms as k;
+    let mut mods = Mods::default();
+    for sym in syms {
+        match sym.raw() {
+            k::KEY_Shift_L | k::KEY_Shift_R => mods.shift = true,
+            k::KEY_Control_L | k::KEY_Control_R => mods.ctrl = true,
+            k::KEY_Alt_L | k::KEY_Alt_R | k::KEY_Meta_L | k::KEY_Meta_R => mods.alt = true,
+            k::KEY_Super_L | k::KEY_Super_R | k::KEY_Hyper_L | k::KEY_Hyper_R => mods.logo = true,
+            _ => {}
+        }
+    }
+    mods
 }
 
 /// A key press for `state`'s `last_key`, as the bind lookup read it. Typing (no Ctrl, Alt or Super, not a modifier
@@ -129,7 +165,8 @@ pub fn find_bind(binds: &[Bind], mods: Mods, sym: Keysym) -> Option<&Bind> {
     binds.iter().find(|b| matches(b, mods, sym))
 }
 
-/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs is a key only.
+/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs and reclaim are keys
+/// only.
 #[must_use]
 pub fn action_request(action: &Action) -> Option<Request> {
     Some(match action {
@@ -148,7 +185,7 @@ pub fn action_request(action: &Action) -> Option<Request> {
         Action::MoveToWorkspace(number) => Request::MoveToWorkspace { number: *number },
         Action::Close => Request::Close,
         Action::Quit => Request::Quit,
-        Action::ShowTabs => return None,
+        Action::ShowTabs | Action::Reclaim => return None,
     })
 }
 
@@ -221,6 +258,9 @@ impl Orrery {
     /// A bind's action. Failures are logged: a key has nowhere to answer. A program that would not start is a
     /// warning; a request with nothing to act on (no window to close, say) is not.
     pub fn run_action(&mut self, action: Action) {
+        if action == Action::Reclaim {
+            return self.input_reclaim();
+        }
         if let Some(request) = action_request(&action) {
             let response = self.handle_request(request);
             if let Some(e) = response.error {
@@ -233,10 +273,15 @@ impl Orrery {
         }
     }
 
-    /// The host window lost keyboard focus: no release will arrive for what is down now. Release every pressed
-    /// key through the usual path (a swallowed key stays swallowed, others reach the client), so neither the
-    /// seat's modifier state nor a client is left with Alt held, then forget held binds.
+    /// The host window lost keyboard focus: no release will arrive for what is down now. Input away comes back (the
+    /// other machine lets go of everything); every pressed key is released through the usual path (a swallowed key
+    /// stays swallowed, others reach the client), so neither the seat's modifier state nor a client is left with
+    /// Alt held; then held binds and keys are forgotten.
     pub fn keyboard_focus_lost(&mut self) {
+        self.input_reclaim();
+        if let Some(crossing) = self.crossing() {
+            crossing.forget_keys();
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
             self.release_keys(keyboard.pressed_keys());
         }
@@ -338,11 +383,12 @@ impl Orrery {
         pointer.frame(self);
     }
 
-    /// One input event from the window showing `output`; pointer positions are local to that window.
+    /// One input event from the window showing `output`, from this machine's devices (`forward`); pointer
+    /// positions are local to that window.
     pub fn process_input_event<I: InputBackend>(&mut self, output: &str, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event } => {
-                self.key_input(event.key_code(), event.state(), Event::time_msec(&event));
+                self.device_key(event.key_code(), event.state(), Event::time_msec(&event));
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let output = self.outputs.iter().find(|o| o.name() == output);
@@ -350,30 +396,26 @@ impl Orrery {
                     return;
                 };
                 let pos = on_output(event.position_transformed(output_geo.size), output_geo.loc);
-                self.pointer_to(pos, event.time_msec());
+                self.device_pointer_at(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
-                self.button_input(event.button_code(), event.state(), event.time_msec());
+                self.device_button(event.button_code(), event.state(), event.time_msec());
             }
             InputEvent::PointerAxis { event } => {
-                let source = event.source();
-                let mut frame = AxisFrame::new(event.time_msec()).source(source);
-                for axis in [Axis::Horizontal, Axis::Vertical] {
+                let source = match event.source() {
+                    AxisSource::Wheel => ScrollSource::Wheel,
+                    AxisSource::Finger => ScrollSource::Finger,
+                    AxisSource::Continuous => ScrollSource::Continuous,
+                    AxisSource::WheelTilt => ScrollSource::WheelTilt,
+                };
+                // An amount for each axis that moved (a wheel's from its steps), and its steps in 120ths.
+                let [h, v] = [Axis::Horizontal, Axis::Vertical].map(|axis| {
                     let discrete = event.amount_v120(axis);
-                    let amount = event
-                        .amount(axis)
-                        .unwrap_or_else(|| discrete.unwrap_or(0.0) * 15.0 / 120.0);
-                    if amount != 0.0 {
-                        frame = frame.value(axis, amount);
-                        if let Some(d) = discrete {
-                            frame = frame.v120(axis, d as i32);
-                        }
-                    }
-                    if source == AxisSource::Finger && event.amount(axis) == Some(0.0) {
-                        frame = frame.stop(axis);
-                    }
-                }
-                self.axis_input(frame);
+                    let amount = (event.amount(axis)).unwrap_or_else(|| discrete.unwrap_or(0.0) * 15.0 / 120.0);
+                    let steps = discrete.filter(|_| amount != 0.0).map_or(0, |d| d as i32);
+                    (amount, steps)
+                });
+                self.device_axis(source, (h.0, v.0), (h.1, v.1), event.time_msec());
             }
             _ => {}
         }
@@ -502,6 +544,56 @@ mod tests {
     }
 
     #[test]
+    fn modifier_keys_are_held_lock_keys_are_not() {
+        for raw in [
+            k::KEY_Shift_L,
+            k::KEY_Control_R,
+            k::KEY_Alt_L,
+            k::KEY_Meta_R,
+            k::KEY_Super_L,
+            k::KEY_Hyper_R,
+            k::KEY_ISO_Level3_Shift,
+            k::KEY_ISO_Level5_Shift,
+            k::KEY_Mode_switch,
+        ] {
+            assert!(held_modifier(sym(raw)), "{raw:#x}");
+        }
+        for raw in [
+            k::KEY_Caps_Lock,
+            k::KEY_Shift_Lock,
+            k::KEY_Num_Lock,
+            k::KEY_ISO_Level3_Lock,
+            k::KEY_ISO_Group_Lock,
+            k::KEY_ISO_Level3_Latch,
+            k::KEY_a,
+            k::KEY_Escape,
+        ] {
+            assert!(!held_modifier(sym(raw)), "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn held_modifier_keys_make_a_binds_modifiers() {
+        let of = |raws: &[u32]| mods_held(raws.iter().map(|r| sym(*r)));
+        assert_eq!(of(&[]), Mods::default());
+        assert_eq!(of(&[k::KEY_Super_R]), MOD);
+        assert_eq!(of(&[k::KEY_Super_L, k::KEY_Shift_R]), MOD_SHIFT);
+        assert_eq!(of(&[k::KEY_Control_L, k::KEY_Super_L]), MOD_CTRL);
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        assert_eq!(of(&[k::KEY_Alt_R]), alt);
+        assert_eq!(of(&[k::KEY_Meta_L]), alt);
+        assert_eq!(of(&[k::KEY_Hyper_L]), MOD, "Hyper is Mod4, as Super");
+        assert_eq!(
+            of(&[k::KEY_ISO_Level3_Shift]),
+            Mods::default(),
+            "AltGr names no bind modifier"
+        );
+    }
+
+    #[test]
     fn a_bind_swallows_its_release_and_show_tabs_holds() {
         let mut h = Held::default();
         let (q, space, a) = (Keycode::new(24), Keycode::new(65), Keycode::new(38));
@@ -600,6 +692,7 @@ mod tests {
         assert_eq!(action_request(&Action::Split), Some(Request::Split));
         assert_eq!(action_request(&Action::ToggleStacking), Some(Request::ToggleStacking));
         assert_eq!(action_request(&Action::ShowTabs), None);
+        assert_eq!(action_request(&Action::Reclaim), None);
         assert_eq!(
             action_request(&Action::Workspace(10)),
             Some(Request::Workspace { number: 10 })

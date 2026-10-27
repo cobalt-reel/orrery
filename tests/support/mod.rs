@@ -68,15 +68,20 @@ impl Compositor {
 
     /// `start` with more `run` options (`--debug-inject`, say).
     pub fn start_with(config: &str, size: (i32, i32), args: &[&str]) -> Self {
-        Self::launch(tempfile::tempdir().expect("temp runtime dir"), config, size, args)
+        Self::launch(tempfile::tempdir().expect("temp runtime dir"), config, size, args, &[])
+    }
+
+    /// `start_with` and environment variables (an xkb layout, say).
+    pub fn start_with_env(config: &str, size: (i32, i32), args: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::launch(tempfile::tempdir().expect("temp runtime dir"), config, size, args, env)
     }
 
     /// The same, in a runtime dir the test has prepared (a stale control socket, say).
     pub fn start_in(runtime: TempDir, config: &str, size: (i32, i32)) -> Self {
-        Self::launch(runtime, config, size, &[])
+        Self::launch(runtime, config, size, &[], &[])
     }
 
-    fn launch(runtime: TempDir, config: &str, size: (i32, i32), args: &[&str]) -> Self {
+    fn launch(runtime: TempDir, config: &str, size: (i32, i32), args: &[&str], env: &[(&str, &str)]) -> Self {
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let config_path = config_dir.path().join("config.kdl");
         std::fs::write(&config_path, config).expect("write the temp config");
@@ -97,6 +102,13 @@ impl Compositor {
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY")
+            // The default us layout (keycodes in tests are its), whatever the user's environment says.
+            .env_remove("XKB_DEFAULT_RULES")
+            .env_remove("XKB_DEFAULT_MODEL")
+            .env_remove("XKB_DEFAULT_LAYOUT")
+            .env_remove("XKB_DEFAULT_VARIANT")
+            .env_remove("XKB_DEFAULT_OPTIONS")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log)

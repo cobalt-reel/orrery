@@ -33,7 +33,7 @@ use crate::ipc::{Request, Response};
 use crate::session::{Renames, Role, Screen};
 
 /// The link protocol's version: both ends must speak the same one (the primary refuses a satellite's other one).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// The largest frame, its length prefix aside: Noise's largest message.
 pub const MAX_FRAME: usize = 65535;
@@ -251,6 +251,11 @@ pub enum Message {
         edge: Edge,
         y: f64,
     },
+    /// Satellite: `request` changes the session (`workspace N` for a number another machine has, from its keys or
+    /// its control socket): the primary routes it as its own.
+    SessionRequest {
+        request: Request,
+    },
 }
 
 /// A keymap as xkb text. Debug shows only its length: it is long.
@@ -310,6 +315,7 @@ impl Message {
             Self::Axis { .. } => "axis",
             Self::Release => "release",
             Self::InputExit { .. } => "input-exit",
+            Self::SessionRequest { .. } => "session-request",
         }
     }
 }
@@ -668,6 +674,7 @@ impl Link {
         let fits = match (self.role, msg) {
             (Role::Primary, M::Hello { .. }) | (Role::Satellite, M::Welcome { .. }) => first,
             (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputExit { .. })
+            | (Role::Primary, M::SessionRequest { .. })
             | (Role::Satellite, M::Renames { .. } | M::Command { .. })
             | (Role::Satellite, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
             | (Role::Satellite, M::Button { .. } | M::Axis { .. } | M::Release)
@@ -1164,6 +1171,36 @@ mod tests {
             Some(&Closed::Protocol("a keymap that does not compile".into())),
             "the first reason stays"
         );
+    }
+
+    #[test]
+    fn a_session_request_goes_from_a_satellite_to_the_primary_only() {
+        let request = Message::SessionRequest {
+            request: Request::Workspace { number: 3 },
+        };
+        let (mut sat, mut pri) = joined();
+        sat.send(&request).expect("queued");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut pri), std::slice::from_ref(&request));
+        assert!(pri.is_open() && !request.is_input());
+        // Never the other way, nor first.
+        let (mut sat, mut pri) = joined();
+        let welcome = Message::Welcome {
+            renames: vec![],
+            foreign: BTreeSet::new(),
+        };
+        pri.send(&welcome).expect("sent");
+        pri.send(&request).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sat), [welcome]);
+        let Some(Closed::Protocol(why)) = sat.closed() else {
+            panic!("{:?}", sat.closed());
+        };
+        assert_eq!(why, "a session-request to a satellite");
+        let (mut sat, mut pri) = pair();
+        sat.send(&request).expect("queued");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert!(matches!(pri.closed(), Some(Closed::Protocol(_))));
     }
 
     #[test]

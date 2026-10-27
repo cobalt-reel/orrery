@@ -237,6 +237,9 @@ pub struct SessionView {
     pub primary: Option<String>,
     /// The primary: itself, then the satellites in join order. A satellite: itself.
     pub machines: Vec<MachineView>,
+    /// Where this machine's keyboard and pointer go: the machine holding the focus marker, on the primary; a
+    /// satellite's own devices stay on it.
+    pub input: String,
     /// The workspace numbers other machines own here: switching or moving to them is not done on this machine.
     pub foreign: Vec<u8>,
     /// Why a link last failed (a handshake, a refusal, a connection lost), until the next one opens.
@@ -258,6 +261,9 @@ pub struct MachineView {
     pub connected: bool,
     /// It holds the session's focus marker: `workspace N` last went to it (the primary's view only).
     pub focused: bool,
+    /// The primary's input waiting for this machine's link to take more (motion merged): a stalled link shows here.
+    #[serde(default)]
+    pub queued: usize,
 }
 
 /// One recent spawn: the program's pid, the xdg-activation token it was handed, its age, and whether a window has
@@ -502,7 +508,7 @@ impl Request {
         Ok(())
     }
 
-    fn verb(&self) -> &'static str {
+    pub(crate) fn verb(&self) -> &'static str {
         match self {
             Request::State => "state",
             Request::FocusSlot { .. } => "focus-slot",
@@ -1026,7 +1032,9 @@ mod tests {
                     latency_ms: None,
                     connected: true,
                     focused: true,
+                    queued: 0,
                 }],
+                input: "desk".into(),
                 foreign: vec![2],
                 error: None,
             })),
@@ -1050,7 +1058,7 @@ mod tests {
         let session = concat!(
             r#""session":{"machine":"desk","role":"primary","listen":"127.0.0.1:7340","machines":[{"name":"desk","#,
             r#""role":"primary","monitors":[{"name":"winit","number":1}],"workspaces":[1,4],"latency_ms":null,"#,
-            r#""connected":true,"focused":true}],"foreign":[2],"error":null}"#
+            r#""connected":true,"focused":true,"queued":0}],"input":"desk","foreign":[2],"error":null}"#
         );
         assert!(json(&r).contains(session), "{}", json(&r));
         let alone = Response::with_state(StateView {
