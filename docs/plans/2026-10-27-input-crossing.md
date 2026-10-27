@@ -86,3 +86,49 @@ Full suite, clippy, fmt, cleanliness scan, README vs design, "As built". Then th
   send it through forwarding as device input goes, so the forwarding tests can drive the primary with it.
 - A bind typed while input is on a satellite runs there: `workspace N` for another machine's number is refused there
   ("switch to it from the primary"); no message carries a session bind to the primary yet.
+
+## As built
+
+Commits, by task: 1 `8edede8`, `3052cf5`; 2 `902fb74`; 3 `7caf2d9`, `71bbcb5`, `ccb7260`, `e0fef8d`, `7cc52fd`; 4 this
+one (design and plan: `e1c3996`). 379 tests (287 unit, 92 integration, 23 of them linked orrerys over loopback), one
+more ignored (slow: every prefix of the example config); fmt and clippy clean. Link protocol 3.
+
+Deviations from the design and the plan (folded into the design):
+- InputExit instead of an edge that "leads back": a satellite knows only its own screens and reports where its
+  pointer left; the primary lands it over the session's row (itself included), or answers with a Handoff when it
+  lands nowhere, so the satellite's pointer is never left held.
+- SessionRequest (satellite to primary): `workspace N` for another machine's number, typed on the satellite (its
+  keys, forwarded or its own, or its control socket), is routed by the primary, so `Super+1` there comes home.
+  `move-to-workspace` to such a number stays refused on the satellite.
+- Motion coalescing by an InputAck credit window, not kernel buffers: the satellite acknowledges the input it ran
+  (once per read), the primary keeps at most 32 input messages unacknowledged and the rest wait in its Outbox, where
+  motion (and touchpad scroll, its stop kept apart) merges. TCP_NOTSENT_LOWAT (8 KiB) is set, kernel buffers are
+  the defaults. Measured on loopback against a stopped satellite: NOTSENT_LOWAT alone took 19,200 motions to fill
+  the link, the window takes 40.
+- The receiver draws its cursor while it has the primary's input: the client's cursor surface at its hotspot, or a
+  built-in square for a named cursor; with its own input the host's cursor stands for it.
+- The Handoff carries the keyboard layout the primary is on (its index); the keymap goes once per link and the
+  satellite uses it again at each Handoff, then its own keymap comes back on the layout it was on.
+- Modifiers travel as the modifier keys held (keycodes pressed there), not a modifier mask; lock and latch keys stay
+  each machine's own.
+- Nothing crosses while a button is down (a drag stays on its machine); a marker move still hands input off.
+- Crossing the pointer moves the marker, so the keyboard follows; the escape key brings the marker home too.
+- The nested primary's input comes home when its window loses the host's keyboard focus (its keys forgotten, no
+  releases will come).
+- `inject` answers only with `--debug-inject` (no test build), and `inject-remote` was added for the receiving side.
+- `state.session` has `input` and each machine's `queued`.
+
+Known limits:
+- A keyboard layout switched while input is on a satellite (a group toggle) switches only there: the primary comes
+  home on the layout it was on, and the next handoff sends that one.
+- While the primary's input is on a satellite, the satellite's own keyboard types with the primary's keymap.
+- Two people at once: the satellite's own keyboard and the primary's forwarded one share its seat, so the same key
+  pressed on both is one key there (a release from either lets it go).
+- Scroll that does not merge (wheel steps, other sources) is replayed late after a stall, within the 32-message
+  window.
+- Nested-only behaviour is untested until the live test: the host pointer hidden, locked or confined (or loose, on a
+  host with neither) and placed on return; relative motion crossing at orrery's outer edge (a window edge with more
+  host screen beside it lets the pointer slip out before the lock holds); the receiver's drawn cursor; focus loss
+  reclaiming.
+
+Live one-machine test: pending.
