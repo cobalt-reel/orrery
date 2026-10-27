@@ -1,6 +1,6 @@
 //! The compositor: Smithay state, the event loop, and `arrange`, the one place where the core's placements become
-//! Wayland state. Every decision about where a window goes is made by `Stacks`; this layer only maps, unmaps and
-//! configures what `placements()` says.
+//! Wayland state. Every decision about where a window goes is made by the core (`placement` for a new one, then
+//! `Stacks`); this layer gathers the facts they need and maps, unmaps and configures what `placements()` says.
 
 mod backend_headless;
 mod backend_winit;
@@ -30,13 +30,13 @@ use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAct
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
-use smithay::wayland::shell::xdg::{XdgShellState, XdgToplevelSurfaceData};
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState, XdgToplevelSurfaceData};
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
@@ -44,6 +44,7 @@ use crate::NAME;
 use crate::config::{self, Config};
 use crate::ipc::{Request, Response, StateView};
 use crate::layout::{Layout, Rect};
+use crate::placement::{self, Landing, Launches};
 use crate::stacks::{Stacks, WinId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -241,6 +242,8 @@ pub struct Orrery {
     pub last_key: Option<crate::ipc::KeyView>,
     /// Spawned programs not yet reaped.
     children: Vec<std::process::Child>,
+    /// Recent spawns waiting for their window (see `placement`); expired on the next spawn or placement.
+    launches: Launches,
     next_id: WinId,
     /// Where every window is.
     pub stacks: Stacks,
@@ -323,6 +326,7 @@ impl Orrery {
             held: input::Held::default(),
             last_key: None,
             children: Vec::new(),
+            launches: Launches::default(),
             next_id: 1,
             stacks: Stacks::new(),
             stacking: config.stacking,
@@ -373,9 +377,8 @@ impl Orrery {
         id
     }
 
-    /// A toplevel's own surface committed. The first buffer opens it on top of the focused slot's current stack,
-    /// or with stacking off as a new tab there; a null buffer (unmap) takes it out of the stacks and back to
-    /// waiting.
+    /// A toplevel's own surface committed. The first buffer opens it where `place` says; a null buffer (unmap)
+    /// takes it out of the stacks and back to waiting.
     pub fn toplevel_committed(&mut self, id: WinId, has_buffer: bool) {
         let Some(toplevel) = self.windows.get(&id).and_then(|w| w.toplevel()).cloned() else {
             return;
@@ -392,13 +395,43 @@ impl Orrery {
             toplevel.send_configure();
         }
         if has_buffer && self.opened.insert(id) {
-            if self.stacking {
-                self.stacks.open_stacked(id);
-            } else {
-                self.stacks.open_tab(id, None, None);
-            }
+            self.place(id, &toplevel);
             self.arrange();
         }
+    }
+
+    /// Puts a window into the stacks as `placement::decide` says, from its parent (a placed one), its client's
+    /// pid chain and the launches.
+    fn place(&mut self, id: WinId, toplevel: &ToplevelSurface) {
+        let now = Instant::now();
+        let parent = toplevel.parent().and_then(|s| self.id_of_surface(&s));
+        let parent_placed = parent.is_some_and(|p| self.stacks.where_is(p).is_some());
+        // /proc is read only when a launch could match.
+        self.launches.expire(now);
+        let chain = match self.client_pid(toplevel.wl_surface()) {
+            Some(pid) if self.launches.waiting() => {
+                placement::pid_chain(pid, |p| std::fs::read_to_string(format!("/proc/{p}/stat")).ok())
+            }
+            _ => Vec::new(),
+        };
+        match placement::decide(parent, parent_placed, &chain, &mut self.launches, now, self.stacking) {
+            Landing::OnParent(p) => {
+                // decide checked the parent is placed, so this cannot miss; stacked if it ever does.
+                if !self.stacks.open_on(id, p) {
+                    self.stacks.open_stacked(id);
+                }
+            }
+            Landing::NewTab { monitor, slot } => self.stacks.open_tab(id, Some(&monitor), Some(slot)),
+            Landing::Stacked => self.stacks.open_stacked(id),
+            Landing::Tab => self.stacks.open_tab(id, None, None),
+        }
+    }
+
+    /// The pid of the client owning `surface`, from its socket's credentials.
+    fn client_pid(&self, surface: &WlSurface) -> Option<u32> {
+        let client = self.display_handle.get_client(surface.id()).ok()?;
+        let creds = client.get_credentials(&self.display_handle).ok()?;
+        u32::try_from(creds.pid).ok()
     }
 
     /// A toplevel went away (destroyed, or its client disconnected).

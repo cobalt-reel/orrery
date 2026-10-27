@@ -3,12 +3,15 @@
 //! Children are reaped on SIGCHLD (`Orrery::reap_children`, from the signal source in `run`). They are not
 //! signalled when orrery exits: each leads its own process group, deliberately, so a program started from
 //! orrery outlives it like one started from a launcher.
+//! Each start is recorded as a `Launch`, so its window opens where the start was made (see `placement`).
 
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
+use std::time::Instant;
 
 use super::Orrery;
+use crate::placement::Launch;
 
 /// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
 /// toolkit falls back to the host's Xwayland) for the child only (orrery's
@@ -44,8 +47,8 @@ pub fn command(argv: &[String], display: &OsStr) -> Option<Command> {
 }
 
 impl Orrery {
-    /// Starts `argv` (see `command`); the error says why it could not be started (a key logs it, `msg` answers
-    /// it).
+    /// Starts `argv` (see `command`) and records it as a launch aimed at the focused slot; the error says why it
+    /// could not be started (a key logs it, `msg` answers it).
     pub fn spawn(&mut self, argv: &[String]) -> Result<(), String> {
         let Some(mut cmd) = command(argv, &self.socket_name) else {
             return Err("nothing to spawn: the argv is empty".into());
@@ -53,11 +56,30 @@ impl Orrery {
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!("spawned {argv:?} (pid {})", child.id());
+                self.record_launch(child.id());
                 self.children.push(child);
                 Ok(())
             }
             Err(e) => Err(format!("cannot spawn {argv:?}: {e}")),
         }
+    }
+
+    /// A launch of `pid` aimed at the focused monitor's focused slot as it is now. Without a monitor there is no
+    /// target, and nothing is recorded: the window goes to `pending` either way.
+    fn record_launch(&mut self, pid: u32) {
+        let now = Instant::now();
+        self.launches.expire(now);
+        let Some(mon) = self.stacks.monitors().get(self.stacks.focused_monitor()) else {
+            return;
+        };
+        self.launches.push(Launch {
+            pid,
+            token: None,
+            monitor: mon.name().to_owned(),
+            slot: mon.focus(),
+            at: now,
+            claimed: false,
+        });
     }
 
     /// Waits for children that have exited, so none stays a zombie. Called on SIGCHLD; signals coalesce, so

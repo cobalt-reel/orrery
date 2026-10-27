@@ -108,20 +108,32 @@ impl Client {
     /// A new toplevel with a decoration request that maps (attaches its buffer) on its first configure;
     /// returns its index in `windows`.
     pub fn create_window(&mut self, app_id: &str, title: &str) -> usize {
-        self.create_window_with(app_id, title, true, false)
+        self.create_window_with(app_id, title, true, false, None)
+    }
+
+    /// `create_window` with `xdg_toplevel.set_parent(parent)` before its first commit, as a dialog does.
+    pub fn create_dialog(&mut self, app_id: &str, title: &str, parent: usize) -> usize {
+        self.create_window_with(app_id, title, true, false, Some(parent))
     }
 
     /// A toplevel that acks its configures but never attaches a buffer, so it never maps.
     pub fn create_unmapped_window(&mut self, app_id: &str, title: &str) -> usize {
-        self.create_window_with(app_id, title, false, false)
+        self.create_window_with(app_id, title, false, false, None)
     }
 
     /// Misbehaving: attaches a buffer in the initial commit, before any configure (a protocol error).
     pub fn create_window_attaching_early(&mut self, app_id: &str) -> usize {
-        self.create_window_with(app_id, app_id, true, true)
+        self.create_window_with(app_id, app_id, true, true, None)
     }
 
-    fn create_window_with(&mut self, app_id: &str, title: &str, auto_buffer: bool, early: bool) -> usize {
+    fn create_window_with(
+        &mut self,
+        app_id: &str,
+        title: &str,
+        auto_buffer: bool,
+        early: bool,
+        parent: Option<usize>,
+    ) -> usize {
         let qh = self.queue.handle();
         let i = self.state.windows.len();
         let s = &self.state;
@@ -130,6 +142,9 @@ impl Client {
         let toplevel = xdg_surface.get_toplevel(&qh, i);
         toplevel.set_app_id(app_id.to_owned());
         toplevel.set_title(title.to_owned());
+        if let Some(p) = parent {
+            toplevel.set_parent(Some(s.windows[p].toplevel.as_ref().expect("live parent")));
+        }
         let decoration = s.decorations.as_ref().map(|d| {
             let deco = d.get_toplevel_decoration(&toplevel, &qh, i);
             // Asks for client-side on purpose: orrery must answer server-side anyway.

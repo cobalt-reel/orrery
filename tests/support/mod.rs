@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use orrery_wm::NAME;
 use orrery_wm::comp::ipc_server::socket_path_in;
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// The binary under test: the one place a test names it.
@@ -247,6 +248,57 @@ impl Compositor {
             runtime,
         )
     }
+}
+
+/// Each slot's tabs, left to right, each its windows' app ids bottom to top, on the first monitor.
+pub fn tabs(state: &Value) -> Vec<Vec<Vec<String>>> {
+    state["monitors"][0]["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .map(|slot| {
+            slot["tabs"]
+                .as_array()
+                .expect("tabs")
+                .iter()
+                .map(|t| {
+                    t["windows"]
+                        .as_array()
+                        .expect("windows")
+                        .iter()
+                        .map(|w| w["app_id"].as_str().unwrap_or("?").to_owned())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Each slot's windows, tab by tab, bottom to top.
+pub fn windows(state: &Value) -> Vec<Vec<String>> {
+    tabs(state).into_iter().map(|slot| slot.concat()).collect()
+}
+
+/// The index of each slot's current tab (None for an empty slot).
+pub fn current_tabs(state: &Value) -> Vec<Option<usize>> {
+    state["monitors"][0]["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .map(|slot| slot["tabs"].as_array()?.iter().position(|t| t["current"] == true))
+        .collect()
+}
+
+pub fn focused_slot(state: &Value) -> Option<u64> {
+    state["monitors"][0]["slots"]
+        .as_array()?
+        .iter()
+        .find(|s| s["focused"] == true)
+        .and_then(|s| s["index"].as_u64())
+}
+
+pub fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// Waits up to TIMEOUT for the child, killing it and panicking with `why` after that.

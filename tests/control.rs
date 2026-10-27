@@ -15,7 +15,7 @@ use orrery_wm::config;
 use orrery_wm::layout::Rect;
 use serde_json::Value;
 use support::client::Client;
-use support::{Compositor, TIMEOUT, wait_or_kill};
+use support::{Compositor, TIMEOUT, current_tabs, focused_slot, strs, tabs, wait_or_kill, windows};
 
 const SIZE: (i32, i32) = (1280, 720);
 
@@ -38,57 +38,6 @@ fn start() -> (Compositor, Client) {
     let orrery = Compositor::start(config::DEFAULT, SIZE);
     let client = Client::new(orrery.connect());
     (orrery, client)
-}
-
-/// Each slot's tabs, left to right, each its windows' app ids bottom to top, on the first monitor.
-fn tabs(state: &Value) -> Vec<Vec<Vec<String>>> {
-    state["monitors"][0]["slots"]
-        .as_array()
-        .expect("slots")
-        .iter()
-        .map(|slot| {
-            slot["tabs"]
-                .as_array()
-                .expect("tabs")
-                .iter()
-                .map(|t| {
-                    t["windows"]
-                        .as_array()
-                        .expect("windows")
-                        .iter()
-                        .map(|w| w["app_id"].as_str().unwrap_or("?").to_owned())
-                        .collect()
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Each slot's windows, tab by tab, bottom to top.
-fn windows(state: &Value) -> Vec<Vec<String>> {
-    tabs(state).into_iter().map(|slot| slot.concat()).collect()
-}
-
-/// The index of each slot's current tab (None for an empty slot).
-fn current_tabs(state: &Value) -> Vec<Option<usize>> {
-    state["monitors"][0]["slots"]
-        .as_array()
-        .expect("slots")
-        .iter()
-        .map(|slot| slot["tabs"].as_array()?.iter().position(|t| t["current"] == true))
-        .collect()
-}
-
-fn focused_slot(state: &Value) -> Option<u64> {
-    state["monitors"][0]["slots"]
-        .as_array()?
-        .iter()
-        .find(|s| s["focused"] == true)
-        .and_then(|s| s["index"].as_u64())
-}
-
-fn strs(v: &[&str]) -> Vec<String> {
-    v.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// a, b, c opened (and mapped) in order into slot 0.
