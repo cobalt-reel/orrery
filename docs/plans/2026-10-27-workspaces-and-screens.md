@@ -121,3 +121,33 @@ Commit `nested: one window per screen`.
 
 Full suite + clippy + fmt, cleanliness scan (given by the controller), README vs design check, an "As built"
 section here. Commit `workspaces and screens: as built`.
+
+## As built
+
+Commits, by task: 1 `2f84622`, `6790033`, `3dc8870`; 2 `976bfa0`, `c4cc91c`; 3 `1386ddb`; 4 `6f79725`; 5 `9693b2c`
+and this one (design and plan: `f991722`). 291 tests (224 unit, 67 integration, most of them headless end to end),
+one more ignored (slow: every prefix of the example config); fmt and clippy clean.
+
+Deviations from the first design (folded into the design and this plan as they came):
+- Screens keep their numbers while they live, and a screen's workspaces move intact (tabs, layouts, focused slot)
+  to the focused remaining screen, hidden; no renumbering, no other screen's content moves (`6790033`, `3dc8870`).
+- Reload reaches every workspace using a redefined layout, hidden ones too, and every monitor's default.
+- Backends open and close screens through a `Screens` hook set at init (`Orrery::screens`); none means
+  `open-screen` and `close-screen` answer an error.
+- A removed output's global is disabled at once and destroyed 10 s later (`GLOBAL_GRACE`), so a client binding it
+  meanwhile gets no protocol error.
+- Nested is orrery's own winit backend (`src/comp/backend_winit/`), not Smithay's: one event loop pumped from
+  calloop, one EGL display made from the event loop's connection (not from a window, which closing would leave on
+  the host), one context and renderer, a surface and damage tracker per window. Input ported from Smithay's; touch
+  dropped.
+- A resized window lays every screen side by side again in opening order, and so does a closed one: global space
+  has no overlaps and no gaps. Headless keeps the gap (screens there never resize).
+- A `run` refused because another orrery holds the lock (still starting) retries joining it for up to 1 s.
+- Workspace numbers on the wire are any JSON number, so 1e20, 2^63 or 1.5 get the range in their error too.
+
+Known limits:
+- Layouts where digits need Shift (AZERTY, say): workspace binds must name the base symbol (`Mod+ampersand`).
+- Nested, `open-screen` blocks the loop until the host's first configure of the new window (milliseconds).
+- Nested, no touch input.
+
+Live-tested by the user 2026-10-27: all checklist items pass.
