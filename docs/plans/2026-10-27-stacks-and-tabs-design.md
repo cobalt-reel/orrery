@@ -44,6 +44,7 @@ target as a new tab (the launch is then claimed). Any other activation request:
 - the window is the top of its slot's current tab: that slot is focused;
 - otherwise it is never raised: it is marked **attention**, and its slot shows the badge in the new
   `attention` colour. The mark clears when the window becomes the top of its slot's current tab.
+- A mark is also dropped when its window closes or loses its monitor (goes pending); it does not come back.
 
 `stacking` toggled at runtime survives a reload unless the config's own `stacking` value changed.
 

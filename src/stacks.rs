@@ -458,6 +458,7 @@ impl Stacks {
         self.settle();
     }
 
+    /// Drops `w`'s mark, if it has one.
     pub fn clear_mark(&mut self, w: WinId) {
         self.attention.remove(&w);
     }
@@ -1614,7 +1615,7 @@ mod tests {
 
     #[test]
     fn random_walks_lose_nothing() {
-        let mut seed: u64 = 0x7472_616e_6365;
+        let mut seed: u64 = 0x51c3_9a07_d2e4;
         for _ in 0..32 {
             let (most, marked_steps) = walk(seed);
             assert!(

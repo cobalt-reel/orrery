@@ -180,18 +180,19 @@ struct StripTab {
     attention: bool,
 }
 
-/// The same colour at two fifths of its alpha: a tab not shown.
-fn dim(c: Color) -> Color {
+/// The same colour at `tenths` of its alpha: a tab not shown.
+fn faded(c: Color, tenths: u16) -> Color {
     Color {
-        a: (u16::from(c.a) * 2 / 5) as u8,
+        a: (u16::from(c.a) * tenths / 10) as u8,
         ..c
     }
 }
 
 /// A STRIP-high bar along the slot's top, one segment per tab, left to right, split with the layout's integer
 /// math so segments tile the width exactly; a 1 px gap separates neighbours when there is room. The current tab
-/// is bright, the others dim; a tab holding a marked window is in `attention`, else `badge`. A stack of more
-/// than one window punches one background-coloured pip per window into its segment, each in front of it.
+/// is bright, the others dim. A tab holding a marked window is in `attention`, else `badge`; it dims to 70%
+/// rather than 40%, so a background tab asking for attention stands out. A stack of more than one window
+/// punches one background-coloured pip per window into its segment, each in front of it.
 fn strip(r: Rect, tabs: &[StripTab], current: usize, colors: &Colors) -> Vec<Solid> {
     let n = i64::try_from(tabs.len()).unwrap_or(i64::MAX).max(1);
     let w = i64::from(r.w);
@@ -209,13 +210,17 @@ fn strip(r: Rect, tabs: &[StripTab], current: usize, colors: &Colors) -> Vec<Sol
         }) else {
             continue;
         };
-        let color = if tab.attention { colors.attention } else { colors.badge };
+        let (color, dim) = if tab.attention {
+            (colors.attention, 7)
+        } else {
+            (colors.badge, 4)
+        };
         if tab.depth > 1 {
             out.extend(pips(rect, tab.depth, colors.background));
         }
         out.push(Solid {
             rect,
-            color: if i == current { color } else { dim(color) },
+            color: if i == current { color } else { faded(color, dim) },
         });
     }
     out
@@ -504,6 +509,13 @@ mod tests {
         assert_eq!(scene.solids.last().map(|s| s.color), Some(dim));
     }
 
+    fn dim(c: Color) -> Color {
+        Color {
+            a: (u16::from(c.a) * 2 / 5) as u8,
+            ..c
+        }
+    }
+
     /// The strip's segments: the full-height solids along the slot's top.
     fn segments(scene: &Scene) -> Vec<Solid> {
         scene.solids.iter().filter(|s| s.rect.h == STRIP).copied().collect()
@@ -540,8 +552,12 @@ mod tests {
             })
             .collect();
         assert_eq!(of_color(&scene, colors.background), pips);
-        let first_pip = scene.solids.iter().position(|s| s.color == colors.background);
-        let segment = scene.solids.iter().position(|s| s.rect.h == STRIP);
+        let first_pip = scene
+            .solids
+            .iter()
+            .position(|s| s.color == colors.background)
+            .expect("pip");
+        let segment = scene.solids.iter().position(|s| s.rect.h == STRIP).expect("segment");
         assert!(first_pip < segment, "pips in front of their segment");
 
         let hidden = super::scene(&s, "m", &colors, false, false);
@@ -624,11 +640,15 @@ mod tests {
         assert!(of_color(&plain, colors.badge).is_empty());
 
         let held = scene(&s, "m", &colors, true, false);
+        let waiting = Color {
+            a: (u16::from(colors.attention.a) * 7 / 10) as u8,
+            ..colors.attention
+        };
         let colours: Vec<Color> = segments(&held).iter().map(|s| s.color).collect();
         assert_eq!(
             colours,
-            [colors.attention, dim(colors.badge), dim(colors.attention)],
-            "bright or dim by current, attention by mark"
+            [colors.attention, dim(colors.badge), waiting],
+            "bright or dim by current, attention by mark; a marked background tab dims less"
         );
         assert_eq!(of_color(&held, colors.background).len(), 2, "the current tab's depth");
 
@@ -638,7 +658,7 @@ mod tests {
         s.close(2);
         let after = scene(&s, "m", &colors, true, false);
         assert!(of_color(&after, colors.attention).is_empty());
-        assert!(of_color(&after, dim(colors.attention)).is_empty());
+        assert!(of_color(&after, waiting).is_empty());
     }
 
     #[test]
