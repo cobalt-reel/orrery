@@ -440,7 +440,8 @@ as if typed on it. The satellite's own keyboard and pointer keep working on it a
   host supports pointer constraints, else confined to the window it is in, or the next of orrery's it enters) and
   sends its relative motion; on return it is let go and shown where it came in. Pointer crossing nested needs the
   host's relative-pointer protocol (most Wayland compositors have it; X11 reports raw motion): pushing past orrery's
-  outer edge counts. Headless there is nothing to hold.
+  outer edge counts. Headless there is nothing to hold. The machine input went to draws the pointer itself while it
+  has it: the client's cursor, or a plain square where a client names one (orrery has no cursor theme).
 - **Motion merges, nothing else does:** when a link stalls, pointer movement waiting for it merges into one step and
   is never replayed late; keys, buttons and scroll all arrive, in order. The satellite acknowledges the input it ran,
   and the primary keeps at most 32 input messages unacknowledged: the rest wait on the primary, where they merge
@@ -464,9 +465,8 @@ socket (a satellite named `side` whose `primary` is the primary's `listen`):
 Put the `desk` window against the right edge of a host monitor (the host stops its pointer there, so `desk` can hold
 it; at a window edge with more host screen beside it, the pointer slips out before the lock takes hold) and `side`'s
 anywhere visible. Open a terminal in each (`Super+Return`) and hand `desk` the keys. Both nested windows also take
-the host's input directly when they have it, so drive everything from `desk`'s window. The satellite draws no cursor
-of its own nested: where its pointer is shows only in what its clients do (hover, a click focusing the slot under
-it).
+the host's input directly when they have it, so drive everything from `desk`'s window. While input is on `side` it
+draws the pointer itself: the cursor its client under it asked for, else a small light square in a dark outline.
 
 - [ ] `Super+2` on `desk`: `state` shows `input` and the marker on `side`; typing lands in `side`'s terminal, in
       `desk`'s layout; the host's pointer is hidden and stays put.
@@ -481,7 +481,8 @@ it).
 ## Limits
 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
-- The host's cursor only: orrery draws no cursor of its own and ignores cursor images clients set.
+- The host's cursor stands for orrery's own pointer: orrery draws a cursor only for a pointer moved from another
+  machine (the client's cursor surface, or a plain square for a named cursor: no cursor theme).
 - No popup grabs: menus open and work, but a click elsewhere does not dismiss them by itself.
 - Maximize and fullscreen requests are ignored: a window is always its slot's size.
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to

@@ -1,16 +1,20 @@
 //! Drawing one output. `scene` decides what is drawn, purely from the stacks: the top window of each slot,
 //! clipped to its slot, and the decorations (focus border, tab badges, held tab strips). `render_output` turns
-//! that into render elements for the GL renderer.
+//! that into render elements for the GL renderer, with the pointer in front while input from the primary moves it
+//! (`cursor_draw`): the host's cursor stands for this machine's own.
 
 use anyhow::Context;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::damage::{OutputDamageTracker, RenderOutputResult};
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree};
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind, render_elements};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
-use smithay::utils::{Physical, Point, Rectangle, Scale};
+use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale};
+use smithay::wayland::compositor::with_states;
 
 use super::Orrery;
 use crate::config::{Color, Colors};
@@ -31,6 +35,22 @@ pub const ERROR_RED: Color = Color {
     r: 0xe0,
     g: 0x20,
     b: 0x30,
+    a: 0xff,
+};
+
+/// The built-in cursor's side: a light square in a 1 px dark outline, its top-left corner the pointer's point, so it
+/// shows on any background.
+pub const CURSOR: i32 = 10;
+pub const CURSOR_DARK: Color = Color {
+    r: 0x10,
+    g: 0x10,
+    b: 0x10,
+    a: 0xff,
+};
+pub const CURSOR_LIGHT: Color = Color {
+    r: 0xf0,
+    g: 0xf0,
+    b: 0xf0,
     a: 0xff,
 };
 
@@ -249,16 +269,69 @@ fn pips(seg: Rect, depth: usize, color: Color) -> impl Iterator<Item = Solid> {
     })
 }
 
+/// The built-in cursor at `at` (output-local), front to back: the light fill, then the dark outline.
+#[must_use]
+pub fn fallback_cursor((x, y): (i32, i32)) -> [Solid; 2] {
+    let fill = Rect {
+        x: x + 1,
+        y: y + 1,
+        w: CURSOR - 2,
+        h: CURSOR - 2,
+    };
+    let outline = Rect {
+        x,
+        y,
+        w: CURSOR,
+        h: CURSOR,
+    };
+    [
+        Solid {
+            rect: fill,
+            color: CURSOR_LIGHT,
+        },
+        Solid {
+            rect: outline,
+            color: CURSOR_DARK,
+        },
+    ]
+}
+
+/// What orrery draws for the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorDraw {
+    None,
+    /// The built-in cursor (`fallback_cursor`).
+    Fallback,
+    /// The cursor surface a client set.
+    Surface(WlSurface),
+}
+
+/// What stands for the pointer: nothing while input is this machine's own (`remote` false: nested, the host's cursor
+/// stands for it), else the client's cursor surface, or the built-in cursor for a named one (orrery has no cursor
+/// theme). A cursor a client hid stays hidden.
+#[must_use]
+pub fn cursor_draw(remote: bool, image: &CursorImageStatus) -> CursorDraw {
+    match image {
+        _ if !remote => CursorDraw::None,
+        CursorImageStatus::Hidden => CursorDraw::None,
+        CursorImageStatus::Surface(s) if s.alive() => CursorDraw::Surface(s.clone()),
+        CursorImageStatus::Named(_) | CursorImageStatus::Surface(_) => CursorDraw::Fallback,
+    }
+}
+
 render_elements! {
     pub OrreryElement<=GlesRenderer>;
     Window=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
     Solid=SolidColorRenderElement,
 }
 
-/// Solid buffers kept across frames, so an unchanged decoration keeps its id and is not damage.
+/// Solid buffers kept across frames, so an unchanged decoration keeps its id and is not damage (and a moved one is
+/// damage only where it was and is).
 #[derive(Default)]
 pub struct Decorations {
     buffers: Vec<SolidColorBuffer>,
+    cursor: Vec<SolidColorBuffer>,
 }
 
 /// Puts `solids` into `buffers` (reusing them in order) and returns their elements.
@@ -286,6 +359,45 @@ fn physical(r: Rect) -> Rectangle<i32, Physical> {
     Rectangle::new((r.x, r.y).into(), (r.w, r.h).into())
 }
 
+/// The pointer on output `output`, if `cursor_draw` says to draw it and it is there.
+fn cursor_elements(
+    output: &str,
+    state: &Orrery,
+    renderer: &mut GlesRenderer,
+    buffers: &mut Vec<SolidColorBuffer>,
+) -> Vec<OrreryElement> {
+    let draw = cursor_draw(state.remote_input_active(), &state.cursor_image);
+    let geometry = (state.outputs.iter())
+        .find(|o| o.name() == output)
+        .and_then(|o| state.space.output_geometry(o));
+    let at = state.seat.get_pointer().map(|p| p.current_location());
+    let (Some(geometry), Some(at)) = (geometry, at) else {
+        return Vec::new();
+    };
+    if draw == CursorDraw::None || !geometry.to_f64().contains(at) {
+        return Vec::new();
+    }
+    let local = at - geometry.loc.to_f64();
+    let (x, y) = (local.x.floor() as i32, local.y.floor() as i32);
+    match draw {
+        CursorDraw::None => Vec::new(),
+        CursorDraw::Fallback => solid_elements(buffers, &fallback_cursor((x, y))),
+        CursorDraw::Surface(surface) => {
+            let hotspot = with_states(&surface, |states| {
+                (states.data_map.get::<CursorImageSurfaceData>())
+                    .map(|d| d.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hotspot)
+                    .unwrap_or_default()
+            });
+            let at = Point::<i32, Physical>::from((x - hotspot.x, y - hotspot.y));
+            let scale = Scale::from(1.0);
+            render_elements_from_surface_tree(renderer, &surface, at, scale, 1.0, Kind::Cursor)
+                .into_iter()
+                .map(OrreryElement::Cursor)
+                .collect()
+        }
+    }
+}
+
 /// Draws the monitor named after `output` (scale 1, output-local coordinates).
 pub fn render_output<'d>(
     output: &str,
@@ -304,8 +416,9 @@ pub fn render_output<'d>(
         state.config_error.is_some(),
     );
     let scale = Scale::from(1.0);
-    // Front to back: decorations, then windows.
-    let mut elements = solid_elements(&mut decorations.buffers, &scene.solids);
+    // Front to back: the pointer, decorations, then windows.
+    let mut elements = cursor_elements(output, state, renderer, &mut decorations.cursor);
+    elements.extend(solid_elements(&mut decorations.buffers, &scene.solids));
 
     for (id, slot) in &scene.windows {
         let Some(window) = state.windows.get(id) else {
@@ -339,6 +452,63 @@ pub fn render_output<'d>(
 mod tests {
     use super::*;
     use crate::config;
+    use smithay::backend::renderer::element::Element as _;
+
+    #[test]
+    fn the_fallback_cursor_points_at_its_corner_and_keeps_its_ids_as_it_moves() {
+        let [fill, outline] = fallback_cursor((5, 7));
+        assert_eq!(
+            outline,
+            Solid {
+                rect: Rect {
+                    x: 5,
+                    y: 7,
+                    w: CURSOR,
+                    h: CURSOR
+                },
+                color: CURSOR_DARK,
+            }
+        );
+        assert_eq!(
+            fill.rect,
+            Rect {
+                x: 6,
+                y: 8,
+                w: CURSOR - 2,
+                h: CURSOR - 2
+            }
+        );
+        assert_eq!(fill.color, CURSOR_LIGHT);
+        // Moved, its elements keep their ids (so only its old and new places are damage) and follow it.
+        let mut buffers = Vec::new();
+        let before = solid_elements(&mut buffers, &fallback_cursor((5, 7)));
+        let after = solid_elements(&mut buffers, &fallback_cursor((300, 200)));
+        let ids = |e: &[OrreryElement]| e.iter().map(|e| e.id().clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&before), ids(&after));
+        let scale = Scale::from(1.0);
+        assert_eq!(
+            after[1].geometry(scale),
+            physical(Rect {
+                x: 300,
+                y: 200,
+                w: CURSOR,
+                h: CURSOR
+            })
+        );
+    }
+
+    #[test]
+    fn a_cursor_is_drawn_only_for_remote_input_and_never_one_a_client_hid() {
+        use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+        let named = CursorImageStatus::Named(CursorIcon::Default);
+        assert_eq!(
+            cursor_draw(false, &named),
+            CursorDraw::None,
+            "the host's cursor stands for local input"
+        );
+        assert_eq!(cursor_draw(true, &named), CursorDraw::Fallback);
+        assert_eq!(cursor_draw(true, &CursorImageStatus::Hidden), CursorDraw::None);
+    }
 
     #[test]
     fn colour_is_scaled_to_unit_range() {

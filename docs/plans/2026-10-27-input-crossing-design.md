@@ -31,7 +31,9 @@ Fills in section 4 of `2026-10-26-orrery-design.md`. Agreed 2026-10-27.
   to hold) and sends relative motion, buttons and high-resolution scroll. The receiver moves its own cursor, entering
   at the same height (scaled to its screen). A satellite knows only its own screens: when its pointer leaves them it
   tells the primary which edge and at what height (InputExit), and the primary hands the pointer to the machine
-  beside that edge (itself included). Leaving past either end of the row goes nowhere.
+  beside that edge (itself included). Leaving past either end of the row goes nowhere. (As built: while it has the
+  primary's input the receiver draws the pointer, the client's cursor surface or a built-in square for a named
+  cursor; with its own input the host's cursor stands for it.)
 - Motion is coalesced: if the link stalls, pending movement merges into one step and is never replayed late. Keys and
   buttons are never merged or dropped. (As built: the receiver acknowledges the input it ran and the sender keeps at
   most 32 input messages unacknowledged; kernel buffers alone cannot bound this, a stalled receiver's kernel keeps

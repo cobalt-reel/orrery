@@ -204,7 +204,10 @@ impl SeatHandler for Orrery {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
+    /// Kept for drawing the pointer while input from the primary moves it (`render::cursor_draw`).
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+        self.cursor_image = image;
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         // The clipboard goes to the client with keyboard focus.

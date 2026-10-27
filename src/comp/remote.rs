@@ -33,6 +33,8 @@ pub struct Remote {
     /// The pointer left past an outer edge (InputExit sent): it holds still until the next Handoff, so motion still
     /// on its way here never pulls it back.
     exited: bool,
+    /// The primary's input is here (a Handoff, until a Release or the link drops): orrery draws the pointer.
+    active: bool,
 }
 
 impl Remote {
@@ -110,6 +112,7 @@ impl Orrery {
             }
             Message::Handoff { mods, pointer, layout } => {
                 self.remote.exited = false;
+                self.remote.active = true;
                 if self.remote.local_keymap.is_none()
                     && let Some(text) = self.remote.primary_keymap.clone()
                     && let Err(e) = self.remote_keymap(text)
@@ -229,6 +232,13 @@ impl Orrery {
             }
         }
         self.remote.exited = false;
+        self.remote.active = false;
+    }
+
+    /// The primary's input is here: the pointer it moves is drawn here (`render::cursor_draw`).
+    #[must_use]
+    pub fn remote_input_active(&self) -> bool {
+        self.remote.active
     }
 
     /// The keymap in use to its layout `layout`, if it has that many.

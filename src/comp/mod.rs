@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 use smithay::desktop::{PopupManager, Space, Window, find_popup_root_surface};
-use smithay::input::pointer::MotionEvent;
+use smithay::input::pointer::{CursorImageStatus, MotionEvent};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::generic::Generic;
@@ -284,6 +284,8 @@ pub struct Orrery {
     pub pointer_seen: bool,
     /// The surface (and its origin) the pointer was last pointed at by arrange or real motion.
     pub pointer_target: Option<(WlSurface, Point<f64, Logical>)>,
+    /// The cursor the client under the pointer asked for, drawn while input from the primary moves the pointer.
+    pub cursor_image: CursorImageStatus,
     /// Keys held for binds (swallowed, show-tabs).
     pub held: input::Held,
     /// The last key press, for `state` (see `input::key_note`).
@@ -386,6 +388,7 @@ impl Orrery {
             opened_before: HashSet::new(),
             pointer_seen: false,
             pointer_target: None,
+            cursor_image: CursorImageStatus::default_named(),
             held: input::Held::default(),
             last_key: None,
             children: Vec::new(),
@@ -774,11 +777,19 @@ impl Orrery {
         self.popups.cleanup();
     }
 
-    /// Frame callbacks for every window on `output`, so clients keep drawing.
+    /// Frame callbacks for every window on `output`, and the cursor surface while it is drawn, so clients keep
+    /// drawing.
     pub fn send_frames(&self, output: &Output) {
         let now = self.start_time.elapsed();
         for window in self.space.elements() {
             window.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+        if let render::CursorDraw::Surface(surface) =
+            render::cursor_draw(self.remote_input_active(), &self.cursor_image)
+        {
+            smithay::desktop::utils::send_frames_surface_tree(&surface, output, now, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
         }
