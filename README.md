@@ -150,7 +150,7 @@ workspace it shows, and that workspace's layout and slots; and `workspaces`, eve
 `{ number, monitor, shown, layout, focused_slot, slots }` (`monitor` by name; `slots` as a monitor lists them, a
 hidden workspace's never focused). Each slot is `{ index, name, rect, focused, tabs }`. Each slot's `tabs` lists its
 tabs left to right, each as `{ current, attention, windows }` with `windows` (`id`, `app_id`, `title`) bottom to
-top; `attention` is true when a window of that tab asked to be seen. Besides the monitors, `state` carries
+top; `attention` is true when a window of that tab asked to be seen. Besides these, `state` carries
 `stacking` (the running value), `config_error` (why the config file was not loaded, or null), `launches` (recent
 spawns, oldest first, as `{ pid, token, age_ms, claimed }`: the activation token each was handed and whether a
 window has taken it; a debug aid; one over 5 s old no longer counts and goes on the next spawn, new window or
@@ -211,7 +211,9 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
 - `binds { "COMBO" ACTION [ARGS...] }`: `COMBO` is modifiers and one key joined by `+`, e.g. `"Mod+Shift+H"`:
   modifiers `Mod`, `Alt`, `Ctrl`/`Control`, `Shift`, `Super`/`Logo`; the key is an xkb keysym name, any case
   (`H`, `Return`, `Tab`, `Space`, `1`, `F5`); the `+` key is written `plus` (`"Mod+plus"`). Write the unshifted key
-  with `Shift`, not the shifted symbol. Caps and Num Lock are ignored. Actions:
+  with `Shift`, not the shifted symbol: binds match the key's unshifted symbol on the current keyboard layout, so
+  where digits need Shift (AZERTY, say) write the base symbol, e.g. `"Mod+ampersand"` for the `1` key. Caps and Num
+  Lock are ignored. Actions:
 
   | Action | Arguments | Does |
   |--------|-----------|------|

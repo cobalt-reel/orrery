@@ -71,8 +71,9 @@ enum Wire {
     Split {},
     ToggleStacking {},
     Spawn { argv: Vec<String> },
-    Workspace { number: u8 },
-    MoveToWorkspace { number: u8 },
+    // Wide, so every number out of range gets the range in its error, not serde's "expected u8".
+    Workspace { number: i64 },
+    MoveToWorkspace { number: i64 },
     OpenScreen {},
 }
 
@@ -107,8 +108,13 @@ impl TryFrom<Wire> for Request {
 }
 
 /// A workspace number as a request carries it: 1..=WORKSPACES.
-fn workspace(number: impl Into<i128>, verb: &str) -> Result<u8, String> {
-    workspace_number(number.into()).ok_or_else(|| format!("`{verb}` takes a workspace number from 1 to {WORKSPACES}"))
+fn workspace(number: i64, verb: &str) -> Result<u8, String> {
+    workspace_number(number.into()).ok_or_else(|| numbers(verb))
+}
+
+/// What a bad workspace number is told.
+fn numbers(verb: &str) -> String {
+    format!("`{verb}` takes a workspace number from 1 to {WORKSPACES}")
 }
 
 /// A spawn's argv as a request carries it: a program, which is not empty, then its arguments.
@@ -368,6 +374,8 @@ impl Request {
                 }
                 stacks.workspace(*number);
             }
+            // No monitor means no focused stack: nothing to move, a no-op like moving from an empty slot, whereas
+            // `workspace` would have nowhere to show what it asks for.
             Request::MoveToWorkspace { number } => stacks.move_to_workspace(*number),
             Request::State
             | Request::Close
@@ -420,8 +428,10 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
         _ => Err(format!("`{verb}` takes one direction (left, right, up, down)")),
     };
     let number = |args: &[&str]| match args {
-        [n] => workspace(n.parse::<i128>().unwrap_or(0), verb),
-        _ => workspace(0, verb),
+        [n] => (n.parse().ok())
+            .and_then(workspace_number)
+            .ok_or_else(|| format!("{}, not {n:?}", numbers(verb))),
+        _ => Err(numbers(verb)),
     };
     let none = |r: Request| {
         if args.is_empty() {
@@ -495,8 +505,8 @@ mod tests {
             Request::Split => (9, Wire::Split {}),
             Request::ToggleStacking => (10, Wire::ToggleStacking {}),
             Request::Spawn { argv } => (11, Wire::Spawn { argv }),
-            Request::Workspace { number } => (12, Wire::Workspace { number }),
-            Request::MoveToWorkspace { number } => (13, Wire::MoveToWorkspace { number }),
+            Request::Workspace { number } => (12, Wire::Workspace { number: number.into() }),
+            Request::MoveToWorkspace { number } => (13, Wire::MoveToWorkspace { number: number.into() }),
             Request::OpenScreen => (14, Wire::OpenScreen {}),
         }
     }
@@ -595,6 +605,17 @@ mod tests {
             r#"{"cmd":"move-to-workspace","number":10}"#
         );
         assert_eq!(json(&Request::OpenScreen), r#"{"cmd":"open-screen"}"#);
+    }
+
+    #[test]
+    fn every_out_of_range_workspace_number_gets_the_range() {
+        for n in ["0", "11", "256", "-1", "70000", "-9999999999"] {
+            for verb in ["workspace", "move-to-workspace"] {
+                let json = format!(r#"{{"cmd":"{verb}","number":{n}}}"#);
+                let err = serde_json::from_str::<Request>(&json).expect_err(&json).to_string();
+                assert!(err.contains("1 to 10"), "{json}: {err}");
+            }
+        }
     }
 
     #[test]
@@ -701,13 +722,11 @@ mod tests {
             "{}",
             json(&r)
         );
-        assert!(
-            json(&r).contains(
-                r#""workspaces":[{"number":4,"monitor":"winit","shown":false,"layout":"halves","focused_slot":1,"slots":[]}]"#
-            ),
-            "{}",
-            json(&r)
+        let workspaces = concat!(
+            r#""workspaces":[{"number":4,"monitor":"winit","shown":false,"layout":"halves","#,
+            r#""focused_slot":1,"slots":[]}]"#
         );
+        assert!(json(&r).contains(workspaces), "{}", json(&r));
     }
 
     fn words(s: &str) -> Vec<String> {
@@ -790,7 +809,8 @@ mod tests {
             ("workspace 0", "1 to 10"),
             ("workspace 11", "1 to 10"),
             ("workspace -3", "1 to 10"),
-            ("workspace three", "1 to 10"),
+            ("workspace three", "not \"three\""),
+            ("workspace 11", "not \"11\""),
             ("workspace 1 2", "1 to 10"),
             ("move-to-workspace", "1 to 10"),
             ("move-to-workspace 300", "1 to 10"),
