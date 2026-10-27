@@ -97,15 +97,17 @@ pub struct Handoff {
 }
 
 impl Handoff {
-    /// The machine input goes to and the `Message::Handoff` to send it; none when input came here.
+    /// The machine input goes to and the `Message::Handoff` to send it, with the keyboard `layout` this machine is
+    /// on; none when input came here.
     #[must_use]
-    pub fn message(&self) -> Option<(String, Message)> {
+    pub fn message(&self, layout: u32) -> Option<(String, Message)> {
         let Place::Remote(to) = &self.to else {
             return None;
         };
         let msg = Message::Handoff {
             mods: self.held.clone(),
             pointer: self.entry,
+            layout,
         };
         Some((to.clone(), msg))
     }
@@ -466,8 +468,9 @@ mod tests {
         let msg = Message::Handoff {
             mods: vec![SUPER],
             pointer: Some(entry),
+            layout: 2,
         };
-        assert_eq!(h.message(), Some(("a".into(), msg)));
+        assert_eq!(h.message(2), Some(("a".into(), msg)), "with the keyboard layout in use");
         assert_eq!(c.place(), &remote("a"));
         // A's press stayed behind (released here); Super's went along.
         assert_eq!(c.key(A, false, false), None);
@@ -539,7 +542,7 @@ mod tests {
                 entry: None,
             }
         );
-        assert_eq!(h.message(), None, "nothing to send for input coming here");
+        assert_eq!(h.message(0), None, "nothing to send for input coming here");
         assert_eq!(c.place(), &Place::Local);
         assert_eq!(
             c.key(SUPER, false, true),

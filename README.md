@@ -426,23 +426,25 @@ as if typed on it. The satellite's own keyboard and pointer keep working on it a
   screen crosses onto the next machine's first, past the left edge of a machine's first onto the previous machine's
   last, at the same height (as a fraction of the screen's). The marker crosses with it, so the keyboard follows.
   Past either end of the row nothing happens. While a button is down the pointer stays on its machine (a drag).
-- **Keys:** raw keycodes travel, with the primary's keymap (once per link), so the user's layout follows them. At
-  each handoff everything down on the machine input leaves is released there, and the machine it goes to is told
-  which modifiers are held: hold `Super`, press `2`, and Super is still down on the satellite. Lock keys (Caps, Num)
-  stay each machine's own. Receivers repeat keys themselves; nothing repeats over the link. While the primary's input
-  is on a satellite, the satellite's own keyboard types with the primary's layout too; its own comes back, on the
-  layout it was on, when input leaves.
+- **Keys:** raw keycodes travel, with the primary's keymap (once per link) and the layout it is on (at each
+  handoff), so the user's layout follows them. At each handoff everything down on the machine input leaves is
+  released there, and the machine it goes to is told which modifiers are held: hold `Super`, press `2`, and Super is
+  still down on the satellite. Lock keys (Caps, Num) stay each machine's own. Receivers repeat keys themselves;
+  nothing repeats over the link. While the primary's input is on a satellite, the satellite's own keyboard types
+  with the primary's layout too; its own comes back, on the layout it was on, when input leaves.
 - **`Super+Escape`** (bind action `reclaim`) is matched on the primary before anything is forwarded and never
   crosses: keyboard and pointer come home, the marker with them, and the satellite lets go of everything the
   primary had down. Losing the link while input is away does the same at once, and so does the nested window
   losing the host's keyboard focus.
 - **The pointer while away:** nested, the primary hides the host's pointer and holds it (locked in place where the
-  host supports pointer constraints, else confined to the window) and sends its relative motion; on return it is
-  let go and shown where it came in. Pointer crossing nested needs the host's relative-pointer protocol (most
-  Wayland compositors have it; X11 reports raw motion): pushing past orrery's outer edge counts. Headless there is
-  nothing to hold.
+  host supports pointer constraints, else confined to the window it is in, or the next of orrery's it enters) and
+  sends its relative motion; on return it is let go and shown where it came in. Pointer crossing nested needs the
+  host's relative-pointer protocol (most Wayland compositors have it; X11 reports raw motion): pushing past orrery's
+  outer edge counts. Headless there is nothing to hold.
 - **Motion merges, nothing else does:** when a link stalls, pointer movement waiting for it merges into one step and
-  is never replayed late; keys, buttons and scroll all arrive, in order. Links keep small kernel buffers for this.
+  is never replayed late; keys, buttons and scroll all arrive, in order. The satellite acknowledges the input it ran,
+  and the primary keeps at most 32 input messages unacknowledged: the rest wait on the primary, where they merge
+  (`queued` in `state` shows them).
 - Plain typing never shows in `last_key` on the primary while it is forwarded, and keystrokes are never logged.
 
 **Trying it on one machine:** two nested orrerys side by side in the host, each with its own config and control

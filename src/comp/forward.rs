@@ -93,8 +93,16 @@ impl Orrery {
         }
     }
 
-    /// Scroll: amounts, and wheel steps in 120ths (0: none).
-    pub fn device_axis(&mut self, source: ScrollSource, (h, v): (f64, f64), (v120_h, v120_v): (i32, i32), time: u32) {
+    /// Scroll: amounts, wheel steps in 120ths (0: none), and which axes a lifted finger stopped (here only: the
+    /// link carries no stops, its receiver reads a finger frame with nothing on either axis as both).
+    pub fn device_axis(
+        &mut self,
+        source: ScrollSource,
+        (h, v): (f64, f64),
+        (v120_h, v120_v): (i32, i32),
+        stops: (bool, bool),
+        time: u32,
+    ) {
         match self.input_place().cloned() {
             Some(Place::Remote(m)) => self.queue_input(
                 &m,
@@ -106,7 +114,7 @@ impl Orrery {
                     v120_v,
                 },
             ),
-            _ => self.axis_input(axis_frame(source, (h, v), (v120_h, v120_v), time)),
+            _ => self.axis_input(axis_frame(source, (h, v), (v120_h, v120_v), stops, time)),
         }
     }
 
@@ -156,7 +164,13 @@ impl Orrery {
                     && m == from
                 {
                     let mods = self.crossing().map(|c| c.held()).unwrap_or_default();
-                    self.queue_input(&m, Message::Handoff { mods, pointer: None });
+                    let layout = self.keymap().map_or(0, |(_, l)| l.0);
+                    let handoff = Message::Handoff {
+                        mods,
+                        pointer: None,
+                        layout,
+                    };
+                    self.queue_input(&m, handoff);
                 }
             }
         }
@@ -194,7 +208,8 @@ impl Orrery {
         if let Some(m) = &h.release {
             self.queue_input(m, Message::Release);
         }
-        match h.message() {
+        let keymap = self.keymap();
+        match h.message(keymap.as_ref().map_or(0, |(_, l)| l.0)) {
             None => {
                 tracing::info!("input is here");
                 for k in &h.held {
@@ -208,8 +223,7 @@ impl Orrery {
             }
             Some((to, handoff)) => {
                 tracing::info!("input goes to {to}");
-                let keymap = self.keymap().map(|(text, _)| text);
-                if !self.queue_handoff(&to, keymap, handoff) {
+                if !self.queue_handoff(&to, keymap.map(|(text, _)| text), handoff) {
                     // Gone meanwhile (its drop not handled yet): as if handled now.
                     self.input_lost(&to);
                 }

@@ -9,8 +9,10 @@
 //! others own when they changed, and drops closed connections.
 //!
 //! The primary's input on its way to a satellite waits in that connection's `Outbox` and goes into its link one
-//! message at a time, only when the link has written everything before: what waits meanwhile (motion) merges. A
-//! link's kernel buffers are kept small for that, so little input queues where it cannot merge.
+//! message at a time, only when the link has written everything before and fewer than `INPUT_WINDOW` input messages
+//! are unacknowledged (the satellite acknowledges what it ran, `InputAck`, once per read): what waits meanwhile
+//! (motion) merges. A stalled satellite or network so holds back only a few messages, never seconds of input to
+//! replay late; kernel buffers alone cannot bound that (a stalled receiver's kernel keeps taking data).
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
@@ -31,7 +33,7 @@ use crate::NAME;
 use crate::config::{self, Config, LinkConfig, MAX_NAME};
 use crate::crossing::{Crossing, Edge, Landing, Outbox, Place, RowScreen};
 use crate::ipc::{MachineView, Request, Response, SessionView};
-use crate::link::{Link, Message, OPEN_DEADLINE, PROTOCOL_VERSION, Secret, SendError};
+use crate::link::{INPUT_WINDOW, Link, Message, OPEN_DEADLINE, PROTOCOL_VERSION, Secret, SendError};
 use crate::session::{Role, Route, Screen, Session};
 use crate::stacks::Stacks;
 
@@ -54,10 +56,8 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Read from one connection per wakeup, at most, so a busy link cannot hold the loop.
 const READ_BUDGET: usize = 256 * 1024;
-/// A link's kernel send and receive buffers (Linux doubles them): small, so input a stalled link cannot take waits
-/// in its `Outbox`, where motion merges, instead of in the kernels at either end, where it would all arrive late. A
-/// keymap still fits.
-const KERNEL_BUFFER: libc::c_int = 64 * 1024;
+/// Unsent bytes a link's kernel holds before it takes no more (TCP_NOTSENT_LOWAT).
+const UNSENT_LOW: libc::c_int = 8 * 1024;
 
 /// Where a forwarded request's answer goes: called once, with the other machine's answer or an error.
 pub type Reply = Box<dyn FnOnce(Response)>;
@@ -134,6 +134,8 @@ struct Conn {
     /// The primary's input on its way to this satellite, and the keymap (xkb text) it was last sent.
     outbox: Outbox,
     keymap: Option<String>,
+    /// Input messages sent and not acknowledged (primary), or run and not acknowledged yet (satellite).
+    unacked: u32,
 }
 
 /// A command sent to a satellite, waiting for its answer.
@@ -207,26 +209,26 @@ fn send(conn: &mut Conn, msg: &Message) -> Result<(), SendError> {
     sent
 }
 
-/// Sets `stream`'s kernel send and receive buffers to `KERNEL_BUFFER`.
-fn small_buffers(stream: &TcpStream) -> std::io::Result<()> {
-    let size = KERNEL_BUFFER;
+/// Sets `stream`'s TCP_NOTSENT_LOWAT: the kernel takes more only while little of what it holds is unsent, so the
+/// link's own queue (and the outbox before it) is where input waits on a slow network.
+fn low_unsent(stream: &TcpStream) -> std::io::Result<()> {
+    let size = UNSENT_LOW;
     let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("an int's size fits");
-    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // Safety: a socket we own, and the option's value is a c_int of that length.
-        let set = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                option,
-                (&raw const size).cast(),
-                len,
-            )
-        };
-        if set != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    // Safety: a socket we own, and the option's value is a c_int of that length.
+    let set = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&raw const size).cast(),
+            len,
+        )
+    };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    Ok(())
 }
 
 fn millis(d: Duration) -> u64 {
@@ -392,14 +394,15 @@ impl Orrery {
     }
 
     /// Hands connection `id`'s link the input waiting for it, one message at a time, each only once the link has
-    /// written everything before (so what waits meanwhile merges). A message the link cannot take (too large, or
-    /// the link closed) drops the connection with the rest: never half a handoff.
+    /// written everything before and while fewer than `INPUT_WINDOW` are unacknowledged (so what waits meanwhile
+    /// merges). A message the link cannot take (too large, or the link closed) drops the connection with the rest:
+    /// never half a handoff.
     fn link_drain(&mut self, id: u64) {
         loop {
             let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) else {
                 return;
             };
-            if conn.dropped.is_some() || !conn.link.outgoing().is_empty() {
+            if conn.dropped.is_some() || !conn.link.outgoing().is_empty() || conn.unacked >= INPUT_WINDOW {
                 return;
             }
             let Some(msg) = conn.outbox.pop() else {
@@ -410,6 +413,7 @@ impl Orrery {
                 conn.outbox = Outbox::default();
                 return;
             }
+            conn.unacked += 1;
             if !self.link_flush(id) {
                 return;
             }
@@ -512,8 +516,8 @@ impl Orrery {
             .set_nonblocking(true)
             .and_then(|()| stream.set_nodelay(true))
             .and_then(|()| stream.try_clone());
-        if let Err(e) = small_buffers(&stream) {
-            tracing::warn!("link to {peer}: cannot make its kernel buffers small ({e}); input may arrive late");
+        if let Err(e) = low_unsent(&stream) {
+            tracing::debug!("link to {peer}: no TCP_NOTSENT_LOWAT ({e}); the input window still bounds input");
         }
         let writer = match prepared {
             Ok(w) => w,
@@ -560,6 +564,7 @@ impl Orrery {
             dropped: None,
             outbox: Outbox::default(),
             keymap: None,
+            unacked: 0,
         };
         self.net.as_mut()?.conns.insert(id, conn);
         Some(id)
@@ -610,7 +615,15 @@ impl Orrery {
                 return;
             };
             let primary = matches!(net.side, Side::Primary(_));
-            let Some(msg) = net.conns.get_mut(&id).and_then(|c| c.link.recv()) else {
+            let Some(conn) = net.conns.get_mut(&id) else {
+                return;
+            };
+            let Some(msg) = conn.link.recv() else {
+                // A satellite acknowledges the input it ran, once for all it read.
+                if conn.unacked > 0 && !primary {
+                    let count = std::mem::take(&mut conn.unacked);
+                    let _ = send(conn, &Message::InputAck { count });
+                }
                 return;
             };
             match msg {
@@ -652,6 +665,11 @@ impl Orrery {
                 self.input_cross(&from, edge, y);
             }
             (Message::SessionRequest { request }, Some(from)) => self.session_request(&from, request),
+            (Message::InputAck { count }, _) => {
+                if let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) {
+                    conn.unacked = conn.unacked.saturating_sub(count);
+                }
+            }
             (Message::InputExit { .. } | Message::SessionRequest { .. }, None) => {}
             (msg, _) => self.primary_got_link(id, msg),
         }
@@ -803,6 +821,7 @@ impl Orrery {
                 let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) else {
                     return;
                 };
+                conn.unacked += 1;
                 match answer {
                     Ok(Some(answer)) => {
                         let _ = send(conn, &answer);

@@ -274,14 +274,16 @@ impl Orrery {
     }
 
     /// The host window lost keyboard focus: no release will arrive for what is down now. Input away comes back (the
-    /// other machine lets go of everything); every pressed key is released through the usual path (a swallowed key
+    /// other machine lets go of everything, nothing is pressed here); every pressed key is released through the usual
+    /// path (a swallowed key
     /// stays swallowed, others reach the client), so neither the seat's modifier state nor a client is left with
     /// Alt held; then held binds and keys are forgotten.
     pub fn keyboard_focus_lost(&mut self) {
-        self.input_reclaim();
+        // Forgotten first: input coming home presses none of them here only to release them at once.
         if let Some(crossing) = self.crossing() {
             crossing.forget_keys();
         }
+        self.input_reclaim();
         if let Some(keyboard) = self.seat.get_keyboard() {
             self.release_keys(keyboard.pressed_keys());
         }
@@ -408,14 +410,16 @@ impl Orrery {
                     AxisSource::Continuous => ScrollSource::Continuous,
                     AxisSource::WheelTilt => ScrollSource::WheelTilt,
                 };
-                // An amount for each axis that moved (a wheel's from its steps), and its steps in 120ths.
+                // An amount for each axis that moved (a wheel's from its steps), its steps in 120ths, and whether a
+                // lifted finger stopped it (a finger axis reported as 0).
                 let [h, v] = [Axis::Horizontal, Axis::Vertical].map(|axis| {
                     let discrete = event.amount_v120(axis);
                     let amount = (event.amount(axis)).unwrap_or_else(|| discrete.unwrap_or(0.0) * 15.0 / 120.0);
                     let steps = discrete.filter(|_| amount != 0.0).map_or(0, |d| d as i32);
-                    (amount, steps)
+                    let stop = source == ScrollSource::Finger && event.amount(axis) == Some(0.0);
+                    (amount, steps, stop)
                 });
-                self.device_axis(source, (h.0, v.0), (h.1, v.1), event.time_msec());
+                self.device_axis(source, (h.0, v.0), (h.1, v.1), (h.2, v.2), event.time_msec());
             }
             _ => {}
         }

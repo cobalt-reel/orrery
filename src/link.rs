@@ -41,6 +41,9 @@ pub const MAX_FRAME: usize = 65535;
 pub const MAX_MESSAGE: usize = MAX_FRAME - TAG;
 /// Bytes queued and not yet written, at most: one more message fails the link (`Closed::Stalled`).
 pub const MAX_OUTPUT: usize = 1 << 20;
+/// Input messages the primary has sent a satellite and that it has not acknowledged (`Message::InputAck`), at most:
+/// the rest wait on the primary, where motion merges. A few dozen milliseconds of a fast mouse.
+pub const INPUT_WINDOW: u32 = 32;
 /// What the other end sent, quoted in a close reason, is cut to this many bytes.
 pub const MAX_REASON: usize = 200;
 /// A link not open this long after its connection was made is closed (`Link::expire`): the driver keeps the time.
@@ -214,10 +217,12 @@ pub enum Message {
         xkb: Xkb,
     },
     /// Primary: input comes here now. `mods`: the modifier keys held, to press. `pointer`: where the pointer
-    /// enters; none: its cursor stays where it is.
+    /// enters; none: its cursor stays where it is. `layout`: the keymap's layout the primary is on (its index).
     Handoff {
         mods: Vec<RawKey>,
         pointer: Option<Entry>,
+        #[serde(default)]
+        layout: u32,
     },
     /// Primary: a key went down or up; `time` in milliseconds, the sender's clock.
     Key {
@@ -250,6 +255,11 @@ pub enum Message {
     InputExit {
         edge: Edge,
         y: f64,
+    },
+    /// Satellite: it ran `count` more input messages. The primary keeps only a few unanswered (`INPUT_WINDOW`), so
+    /// input a stalled satellite has not run waits on the primary, where motion merges, and never arrives late.
+    InputAck {
+        count: u32,
     },
     /// Satellite: `request` changes the session (`workspace N` for a number another machine has, from its keys or
     /// its control socket): the primary routes it as its own.
@@ -315,6 +325,7 @@ impl Message {
             Self::Axis { .. } => "axis",
             Self::Release => "release",
             Self::InputExit { .. } => "input-exit",
+            Self::InputAck { .. } => "input-ack",
             Self::SessionRequest { .. } => "session-request",
         }
     }
@@ -674,7 +685,7 @@ impl Link {
         let fits = match (self.role, msg) {
             (Role::Primary, M::Hello { .. }) | (Role::Satellite, M::Welcome { .. }) => first,
             (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputExit { .. })
-            | (Role::Primary, M::SessionRequest { .. })
+            | (Role::Primary, M::SessionRequest { .. } | M::InputAck { .. })
             | (Role::Satellite, M::Renames { .. } | M::Command { .. })
             | (Role::Satellite, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
             | (Role::Satellite, M::Button { .. } | M::Axis { .. } | M::Release)
@@ -1060,10 +1071,12 @@ mod tests {
                     edge: Edge::Left,
                     y: 0.375,
                 }),
+                layout: 1,
             },
             Message::Handoff {
                 mods: vec![],
                 pointer: None,
+                layout: 0,
             },
             Message::Key {
                 keycode: RawKey(38),
@@ -1201,6 +1214,28 @@ mod tests {
         sat.send(&request).expect("queued");
         pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
         assert!(matches!(pri.closed(), Some(Closed::Protocol(_))));
+    }
+
+    #[test]
+    fn an_input_ack_goes_from_a_satellite_to_the_primary_only() {
+        let ack = Message::InputAck { count: 7 };
+        let (mut sat, mut pri) = joined();
+        sat.send(&ack).expect("queued");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut pri), std::slice::from_ref(&ack));
+        assert!(!ack.is_input(), "it answers input");
+        let (mut sat, mut pri) = joined();
+        let welcome = Message::Welcome {
+            renames: vec![],
+            foreign: BTreeSet::new(),
+        };
+        pri.send(&welcome).expect("sent");
+        pri.send(&ack).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        let Some(Closed::Protocol(why)) = sat.closed() else {
+            panic!("{:?}", sat.closed());
+        };
+        assert_eq!(why, "a input-ack to a satellite");
     }
 
     #[test]

@@ -10,8 +10,8 @@ use orrery_wm::config;
 use serde_json::{Value, json};
 use support::client::Client;
 use support::session::{
-    SIZE, connected, joined, port, primary_with, random_secret, satellite_env, satellite_with, secret_file, wait,
-    wait_log,
+    SIZE, connected, joined, port, primary_env, primary_with, random_secret, satellite_env, satellite_with,
+    secret_file, wait, wait_log,
 };
 use support::{Compositor, TIMEOUT};
 use tempfile::TempDir;
@@ -443,6 +443,43 @@ fn the_satellites_own_layout_is_back_after_the_primarys_keymap() {
 }
 
 #[test]
+fn the_satellite_types_on_the_layout_the_primary_is_on() {
+    let (dir, secret) = secret_file(&random_secret());
+    let xkb = [
+        ("XKB_DEFAULT_LAYOUT", "us,de"),
+        ("XKB_DEFAULT_OPTIONS", "grp:caps_toggle"),
+    ];
+    let p = primary_env("desk", 0, &secret, INJECT, &xkb);
+    let s = satellite_with("side", port(&p), &secret, INJECT);
+    wait("the satellite to join", &p, joined);
+    wait("the satellite to see it", &s, connected);
+    let (mut c, _) = focused_window(&s);
+    // The primary's keyboard to its second layout, then input to the satellite: its keymap, on that layout.
+    keys(&p, &[(CAPS, true), (CAPS, false)]);
+    p.msg_ok(&["workspace", "2"]);
+    wait("input on side", &p, at("side"));
+    assert!(
+        c.wait_for(|st| st.keymaps.len() == 2 && st.group == 1),
+        "{:?} group {}",
+        c.state.keymaps,
+        c.state.group
+    );
+    // Home, the primary back on its first layout, and there again: the keymap is not sent again, the layout is.
+    p.msg_ok(&["workspace", "1"]);
+    wait("input home", &p, at("desk"));
+    keys(&p, &[(CAPS, true), (CAPS, false)]);
+    p.msg_ok(&["workspace", "2"]);
+    wait("input on side", &p, at("side"));
+    assert!(
+        c.wait_for(|st| st.keymaps.len() == 4 && st.group == 0),
+        "{:?} group {}",
+        c.state.keymaps,
+        c.state.group
+    );
+    drop(dir);
+}
+
+#[test]
 fn keys_typed_on_the_primary_go_where_the_marker_is() {
     let (_dir, p, s) = pair();
     let (mut here, _) = focused_window(&p);
@@ -614,11 +651,12 @@ fn motion_merges_while_the_link_is_stalled_and_keys_all_arrive_in_order() {
     signal(&s, "-STOP");
     let mut sent = 0;
     while queued(&p.state()) == 0 {
-        for _ in 0..100 {
+        for _ in 0..10 {
             inject_raw(&p, &wiggle(sent));
             sent += 1;
         }
-        assert!(sent < 50_000, "the link never filled");
+        // Few steps are ever on their way unanswered: never seconds of motion to replay late.
+        assert!(sent < 500, "{sent} steps and the link still takes more");
     }
     // Keys between long runs of motion: the motion merges, the keys wait as they are.
     let flood = |n: usize| {

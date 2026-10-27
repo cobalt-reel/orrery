@@ -45,6 +45,17 @@ pub fn primary_with(name: &str, port: u16, secret: &Path, args: &[&str]) -> Comp
     Compositor::start_with(&format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT), SIZE, args)
 }
 
+/// `primary_with` and environment variables.
+pub fn primary_env(name: &str, port: u16, secret: &Path, args: &[&str], env: &[(&str, &str)]) -> Compositor {
+    let link = format!("listen \"127.0.0.1:{port}\" secret-file=\"{}\"", secret.display());
+    Compositor::start_with_env(
+        &format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT),
+        SIZE,
+        args,
+        env,
+    )
+}
+
 /// A satellite named `name` of the primary on loopback `port`.
 pub fn satellite(name: &str, port: u16, secret: &Path) -> Compositor {
     satellite_with(name, port, secret, &[])

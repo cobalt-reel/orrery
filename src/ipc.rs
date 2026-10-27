@@ -662,6 +662,7 @@ fn input_words(args: &[&str]) -> Result<Message, String> {
                 })
                 .collect::<Result<_, _>>()?,
             pointer: None,
+            layout: 0,
         }),
         ["key" | "button", ..] => Err("`key` and `button` take a code and down or up".into()),
         ["motion" | "axis", ..] => Err("`motion` and `axis` take two numbers".into()),
@@ -780,6 +781,7 @@ mod tests {
                         edge: Edge::Left,
                         y: 0.5,
                     }),
+                    layout: 1,
                 },
             ),
             remote(
@@ -1142,6 +1144,7 @@ mod tests {
                     Message::Handoff {
                         mods: vec![RawKey(133), RawKey(50)],
                         pointer: None,
+                        layout: 0,
                     },
                 ),
             ),
@@ -1152,6 +1155,7 @@ mod tests {
                     Message::Handoff {
                         mods: vec![],
                         pointer: None,
+                        layout: 0,
                     },
                 ),
             ),

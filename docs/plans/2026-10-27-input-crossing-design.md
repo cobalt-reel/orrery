@@ -15,8 +15,8 @@ Fills in section 4 of `2026-10-26-orrery-design.md`. Agreed 2026-10-27.
 
 ## Keyboard
 
-- Raw keycodes travel. At handoff the sender's keymap (as an xkb keymap string) goes along once, so the user's layout
-  follows them.
+- Raw keycodes travel. At handoff the sender's keymap (as an xkb keymap string) goes along once, and the layout it is
+  on at every handoff, so the user's layout follows them.
 - Handoff is explicit: the machine losing input releases every key it had down (to its seat and clients); the one
   gaining input is told which modifiers are held. No stuck keys, no missing Super.
 - Key repeat happens on the receiver (clients repeat from the seat's repeat info); nothing repeats over the network.
@@ -33,7 +33,9 @@ Fills in section 4 of `2026-10-26-orrery-design.md`. Agreed 2026-10-27.
   tells the primary which edge and at what height (InputExit), and the primary hands the pointer to the machine
   beside that edge (itself included). Leaving past either end of the row goes nowhere.
 - Motion is coalesced: if the link stalls, pending movement merges into one step and is never replayed late. Keys and
-  buttons are never merged or dropped.
+  buttons are never merged or dropped. (As built: the receiver acknowledges the input it ran and the sender keeps at
+  most 32 input messages unacknowledged; kernel buffers alone cannot bound this, a stalled receiver's kernel keeps
+  taking data.)
 
 ## Safety
 

@@ -54,12 +54,12 @@ fn button_state(pressed: bool) -> ButtonState {
     }
 }
 
-/// Scroll as the link carries it: amounts, and wheel steps in 120ths (0: none). A finger lifted (nothing on either
-/// axis) stops both.
+/// Scroll: amounts, wheel steps in 120ths (0: none), and which axes a lifted finger stopped.
 pub(super) fn axis_frame(
     source: ScrollSource,
     (h, v): (f64, f64),
     (v120_h, v120_v): (i32, i32),
+    (stop_h, stop_v): (bool, bool),
     time: u32,
 ) -> AxisFrame {
     let source = match source {
@@ -77,10 +77,19 @@ pub(super) fn axis_frame(
             frame = frame.v120(axis, v120);
         }
     }
-    if source == AxisSource::Finger && h == 0.0 && v == 0.0 {
-        frame = frame.stop(Axis::Horizontal).stop(Axis::Vertical);
+    for (axis, stop) in [(Axis::Horizontal, stop_h), (Axis::Vertical, stop_v)] {
+        if stop {
+            frame = frame.stop(axis);
+        }
     }
     frame
+}
+
+/// The axes scroll from the link stops: the link carries no stops, so a finger frame with nothing on either axis
+/// (the finger lifted) stops both.
+pub(super) fn remote_stops(source: ScrollSource, (h, v): (f64, f64)) -> (bool, bool) {
+    let lifted = source == ScrollSource::Finger && h == 0.0 && v == 0.0;
+    (lifted, lifted)
 }
 
 impl Orrery {
@@ -99,13 +108,16 @@ impl Orrery {
                 self.remote_keymap(xkb.0.clone())?;
                 self.remote.primary_keymap = Some(xkb.0);
             }
-            Message::Handoff { mods, pointer } => {
+            Message::Handoff { mods, pointer, layout } => {
                 self.remote.exited = false;
                 if self.remote.local_keymap.is_none()
                     && let Some(text) = self.remote.primary_keymap.clone()
                     && let Err(e) = self.remote_keymap(text)
                 {
                     tracing::warn!("cannot use the primary's keymap again: {e}");
+                }
+                if self.remote.local_keymap.is_some() {
+                    self.select_layout(Layout(layout));
                 }
                 for key in mods {
                     self.remote_key(key.0, true);
@@ -133,7 +145,10 @@ impl Orrery {
                 v,
                 v120_h,
                 v120_v,
-            } => self.axis_input(axis_frame(source, (h, v), (v120_h, v120_v), time)),
+            } => {
+                let stops = remote_stops(source, (h, v));
+                self.axis_input(axis_frame(source, (h, v), (v120_h, v120_v), stops, time));
+            }
             Message::Release => self.remote_release(),
             _ => {}
         }
@@ -209,21 +224,26 @@ impl Orrery {
         {
             match keyboard.set_keymap_from_string(self, local) {
                 // A new keymap starts on its first layout: back to the one it was on.
-                Ok(()) => keyboard.with_xkb_state(self, |mut context| {
-                    let layouts = context
-                        .xkb()
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .layouts()
-                        .count();
-                    if usize::try_from(layout.0).is_ok_and(|l| l < layouts) {
-                        context.set_layout(layout);
-                    }
-                }),
+                Ok(()) => self.select_layout(layout),
                 Err(e) => tracing::warn!("cannot go back to this machine's keymap: {e}"),
             }
         }
         self.remote.exited = false;
+    }
+
+    /// The keymap in use to its layout `layout`, if it has that many.
+    fn select_layout(&mut self, layout: Layout) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        keyboard.with_xkb_state(self, |mut context| {
+            let layouts = (context.xkb().lock().unwrap_or_else(PoisonError::into_inner))
+                .layouts()
+                .count();
+            if usize::try_from(layout.0).is_ok_and(|l| l < layouts) {
+                context.set_layout(layout);
+            }
+        });
     }
 
     /// The link to the primary dropped, joined or not: everything it had down here goes up, and its keymap is
@@ -259,9 +279,32 @@ impl Orrery {
                 v,
                 v120_h,
                 v120_v,
-            } => self.device_axis(source, (h, v), (v120_h, v120_v), time),
+            } => {
+                let stops = remote_stops(source, (h, v));
+                self.device_axis(source, (h, v), (v120_h, v120_v), stops, time);
+            }
             _ => return Response::error("`inject` takes a key, motion, button or axis"),
         }
         Response::ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finger_lifted_stops_the_axes_it_names() {
+        // From this machine's own touchpad: each axis that ended stops, on its own.
+        let f = axis_frame(ScrollSource::Finger, (0.0, 4.0), (0, 0), (true, false), 9);
+        assert_eq!((f.axis, f.stop, f.time), ((0.0, 4.0), (true, false), 9));
+        assert_eq!(f.source, Some(AxisSource::Finger));
+        // A wheel's steps go along with its amounts; nothing stops.
+        let w = axis_frame(ScrollSource::Wheel, (0.0, 15.0), (0, 120), (false, false), 1);
+        assert_eq!((w.axis, w.v120, w.stop), ((0.0, 15.0), Some((0, 120)), (false, false)));
+        // From the link (which carries no stops): a finger frame with nothing on either axis stops both.
+        assert_eq!(remote_stops(ScrollSource::Finger, (0.0, 0.0)), (true, true));
+        assert_eq!(remote_stops(ScrollSource::Finger, (0.0, 2.0)), (false, false));
+        assert_eq!(remote_stops(ScrollSource::Wheel, (0.0, 0.0)), (false, false));
     }
 }

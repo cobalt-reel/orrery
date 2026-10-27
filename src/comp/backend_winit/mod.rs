@@ -29,13 +29,15 @@
 //! reports the buffer age only for the current surface), with swap interval 0, and its own damage tracker.
 //!
 //! **Input away.** While the primary's input is on another machine (`Orrery::input_away`), the host's pointer is
-//! hidden and held: locked in place (Wayland's pointer constraints), else confined to the window it is in (X11), and
-//! its relative motion (`DeviceEvent::MouseMotion`) is what moves the other machine's pointer. Here, relative motion
+//! hidden and held: locked in place (Wayland's pointer constraints; a window that cannot lock lets every lock go),
+//! else confined to the window it is in, or the next of ours it enters (X11); windows opened meanwhile are held too.
+//! Its relative motion (`DeviceEvent::MouseMotion`) is what moves the other machine's pointer. Here, relative motion
 //! over a window only crosses: pushed past orrery's outer edges, input goes to the machine beside them. When input
-//! comes back the pointer is placed where it came in (set while still locked, as Wayland wants), let go and shown.
-//! Applied right after the input that moved input, and by the frame timer for any other cause (a `workspace` from
-//! the control socket, a link drop). A lock takes hold only while the host's pointer is in the window: crossing at a
-//! window edge with more host screen beside it, the pointer may slip out first.
+//! comes back the pointer is placed where it came in (on the window holding the lock and while still locked, as
+//! Wayland wants; confined, after letting go), let go and shown. Applied right after the input that moved input,
+//! and by the frame timer for any other cause (a `workspace` from the control socket, a link drop). A lock takes hold
+//! only while the host's pointer is in the window: crossing at a window edge with more host screen beside it, the
+//! pointer may slip out first.
 //!
 //! None of this is reachable from the headless tests.
 
@@ -105,7 +107,7 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
         windows: Table::new(),
         opening: Vec::new(),
         pointer_in: None,
-        held: false,
+        hold: Hold::Free,
     }));
 
     // The first window now, so a session that cannot open one fails to start rather than running blind.
@@ -237,8 +239,8 @@ struct Host {
     opening: Vec<Output>,
     /// The window the host's pointer is in, if one of ours.
     pointer_in: Option<WindowId>,
-    /// The host's pointer is hidden and held: input is away.
-    held: bool,
+    /// While input is away, the host's pointer is hidden and held so.
+    hold: Hold,
 }
 
 /// One host window and what drawing it keeps between frames.
@@ -623,6 +625,15 @@ impl Pump<'_> {
             match open_window(active, self.host, &output) {
                 Ok(screen) => {
                     let id = screen.window.id();
+                    // Opened while input is away: held as the others are.
+                    if self.host.hold != Hold::Free {
+                        screen.window.set_cursor_visible(false);
+                        if self.host.hold == Hold::Locked
+                            && let Err(e) = screen.window.set_cursor_grab(CursorGrabMode::Locked)
+                        {
+                            tracing::warn!("cannot lock the host's pointer in the new window: {e}");
+                        }
+                    }
                     // The output was added at the start size; the window may already be another.
                     self.events.push(HostEvent::Resized(id, window_size(&screen.window)));
                     self.host.windows.insert(id, output.name(), screen);
@@ -652,7 +663,7 @@ impl ApplicationHandler for Pump<'_> {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         // Only over our windows (X11 reports it wherever the pointer is while a window has focus), or held.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
-            && (self.host.held || self.host.pointer_in.is_some())
+            && (self.host.hold != Hold::Free || self.host.pointer_in.is_some())
         {
             self.events.push(HostEvent::Relative(dx, dy));
         }
@@ -661,7 +672,13 @@ impl ApplicationHandler for Pump<'_> {
     fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let time = self.time();
         match event {
-            WindowEvent::CursorEntered { .. } | WindowEvent::CursorMoved { .. } => self.host.pointer_in = Some(id),
+            WindowEvent::CursorEntered { .. } | WindowEvent::CursorMoved { .. } => {
+                self.host.pointer_in = Some(id);
+                // Held but not yet confined (the pointer was outside our windows): confined to this one now.
+                if self.host.hold == Hold::Confined(None) {
+                    self.host.hold = Hold::Confined(confine(self.host, id).then_some(id));
+                }
+            }
             WindowEvent::CursorLeft { .. } if self.host.pointer_in == Some(id) => self.host.pointer_in = None,
             _ => {}
         }
@@ -804,40 +821,49 @@ fn disable_vsync(context: &EGLContext, surface: &EGLSurface) {
     }
 }
 
+/// How the host's pointer is held while input is away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Input is here: nothing held.
+    Free,
+    /// Locked in every window (each lock takes hold while the pointer is in it).
+    Locked,
+    /// Where the host cannot lock (X11): confined to that window, or (None) to the next one the pointer enters.
+    Confined(Option<WindowId>),
+}
+
 /// Input went away or came back (`Orrery::input_away`): the host's pointer is hidden and held, or placed where the
 /// seat's pointer is (where it came in), let go and shown.
 fn hold_pointer(host: &mut Host, state: &Orrery) {
     let away = state.input_away();
-    if away == host.held {
+    if away == (host.hold != Hold::Free) {
         return;
     }
-    host.held = away;
     if away {
         for screen in host.windows.values() {
             screen.window.set_cursor_visible(false);
         }
-        // Locked in every window (each lock takes hold when the pointer is in it); where the host cannot lock (X11),
-        // confined to the window it is in.
-        let locked = (host.windows.values()).all(|s| s.window.set_cursor_grab(CursorGrabMode::Locked).is_ok());
-        let confined = locked
-            || (host.pointer_in.or_else(|| host.windows.first_id()))
-                .and_then(|id| host.windows.get_mut(id))
-                .is_some_and(|(_, s)| s.window.set_cursor_grab(CursorGrabMode::Confined).is_ok());
-        if !confined {
-            tracing::warn!("the host can neither lock nor confine the pointer: it may wander while input is away");
-        }
+        host.hold = hold(host);
         return;
     }
-    if let Some(at) = state.seat.get_pointer().map(|p| p.current_location())
-        && let Some(output) =
-            (state.outputs.iter()).find(|o| state.space.output_geometry(o).is_some_and(|g| g.to_f64().contains(at)))
-        && let Some(geometry) = state.space.output_geometry(output)
-        && let Some(screen) = host.windows.get_named(&output.name())
+    let at = state.seat.get_pointer().map(|p| p.current_location());
+    let window_of = |id: WindowId| {
+        let name = host.windows.name_of(id)?;
+        let output = state.outputs.iter().find(|o| o.name() == name)?;
+        Some((host.windows.get(id)?, state.space.output_geometry(output)?))
+    };
+    // Wayland takes a locked pointer's position (a hint on the window holding the lock) for where it is let go:
+    // set before unlocking, kept inside that window.
+    if host.hold == Hold::Locked
+        && let Some(at) = at
+        && let Some((screen, geometry)) = host.pointer_in.and_then(window_of)
     {
         let local = at - geometry.loc.to_f64();
+        let inside = |v: f64, len: i32| v.clamp(0.0, f64::from((len - 1).max(0)));
+        let local = (inside(local.x, geometry.size.w), inside(local.y, geometry.size.h));
         if let Err(e) = screen
             .window
-            .set_cursor_position(PhysicalPosition::new(local.x, local.y))
+            .set_cursor_position(PhysicalPosition::new(local.0, local.1))
         {
             tracing::debug!("cannot place the host's pointer: {e}");
         }
@@ -847,6 +873,57 @@ fn hold_pointer(host: &mut Host, state: &Orrery) {
             tracing::debug!("cannot let the host's pointer go: {e}");
         }
         screen.window.set_cursor_visible(true);
+    }
+    // Confined (X11): let go first, then warped into the window showing that point.
+    if matches!(host.hold, Hold::Confined(_))
+        && let Some(at) = at
+        && let Some((screen, geometry)) = (host.windows.ids())
+            .filter_map(window_of)
+            .find(|(_, g)| g.to_f64().contains(at))
+    {
+        let local = at - geometry.loc.to_f64();
+        if let Err(e) = screen
+            .window
+            .set_cursor_position(PhysicalPosition::new(local.x, local.y))
+        {
+            tracing::debug!("cannot place the host's pointer: {e}");
+        }
+    }
+    host.hold = Hold::Free;
+}
+
+/// Holds the host's pointer: locked in every window, or, where a lock fails, none locked (those that took it let go)
+/// and confined to the window the pointer is in, or the next one it enters.
+fn hold(host: &Host) -> Hold {
+    let screens: Vec<&Screen> = host.windows.values().collect();
+    let took = (screens.iter())
+        .take_while(|s| s.window.set_cursor_grab(CursorGrabMode::Locked).is_ok())
+        .count();
+    if took == screens.len() {
+        return Hold::Locked;
+    }
+    for screen in &screens[..took] {
+        let _ = screen.window.set_cursor_grab(CursorGrabMode::None);
+    }
+    match host.pointer_in {
+        Some(id) => Hold::Confined(confine(host, id).then_some(id)),
+        None => Hold::Confined(None),
+    }
+}
+
+/// Confines the host's pointer to window `id`; false (logged) when the host cannot.
+fn confine(host: &Host, id: WindowId) -> bool {
+    let Some(screen) = host.windows.get(id) else {
+        return false;
+    };
+    match screen.window.set_cursor_grab(CursorGrabMode::Confined) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "the host can neither lock nor confine the pointer ({e}): it may wander while input is away"
+            );
+            false
+        }
     }
 }
 
@@ -886,12 +963,12 @@ impl<T> Table<T> {
             .map(|(_, name, value)| (name.as_str(), value))
     }
 
-    fn get_named(&self, name: &str) -> Option<&T> {
-        self.rows.iter().find(|r| r.1 == name).map(|r| &r.2)
+    fn get(&self, id: WindowId) -> Option<&T> {
+        self.rows.iter().find(|r| r.0 == id).map(|r| &r.2)
     }
 
-    fn first_id(&self) -> Option<WindowId> {
-        self.rows.first().map(|r| r.0)
+    fn ids(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.rows.iter().map(|r| r.0)
     }
 
     fn remove_named(&mut self, name: &str) -> Option<T> {
@@ -949,9 +1026,9 @@ mod tests {
         t.insert(a, "winit".into(), 'a');
         t.insert(b, "winit-2".into(), 'b');
         assert_eq!(t.name_of(b), Some("winit-2"));
-        assert_eq!(t.get_named("winit-2"), Some(&'b'));
-        assert_eq!(t.get_named("winit-3"), None);
-        assert_eq!(t.first_id(), Some(a), "in opening order");
+        assert_eq!(t.get(b), Some(&'b'));
+        assert_eq!(t.get(WindowId::from(3)), None);
+        assert_eq!(t.ids().collect::<Vec<_>>(), [a, b], "in opening order");
         assert_eq!(
             t.name_of(WindowId::from(3)),
             None,
