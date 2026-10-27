@@ -28,11 +28,12 @@ use snow::{HandshakeState, TransportState};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::NAME;
+use crate::crossing::{Entry, RawKey};
 use crate::ipc::{Request, Response};
 use crate::session::{Renames, Role, Screen};
 
 /// The link protocol's version: both ends must speak the same one (the primary refuses a satellite's other one).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// The largest frame, its length prefix aside: Noise's largest message.
 pub const MAX_FRAME: usize = 65535;
@@ -156,7 +157,10 @@ impl Secret {
 /// What crosses the link, each in one frame. Hello first (satellite), then Welcome or Refused (primary); then
 /// either end sends its others as things happen. A message to the wrong end, or a first one other than these,
 /// closes the link (`Closed::Protocol`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Input (milestone 5) goes from the primary to the satellite holding the session's focus marker: a Keymap when it
+/// changed, a Handoff, then Key, Motion, Button and Axis, until a Release. Keycodes never show in Debug.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "kebab-case")]
 pub enum Message {
     /// Satellite, first and once: its version (`PROTOCOL_VERSION`), name, screens and workspace numbers, as for
@@ -204,6 +208,57 @@ pub enum Message {
     Pong {
         nonce: u64,
     },
+    /// Primary: the keymap input is typed with from now on, as xkb keymap text (`KEYMAP_FORMAT_TEXT_V1`), so the
+    /// user's layout follows them. Sent before a Handoff when it changed.
+    Keymap {
+        xkb: String,
+    },
+    /// Primary: input comes here now. `mods`: the modifier keys held, to press. `pointer`: where the pointer
+    /// enters; none: its cursor stays where it is.
+    Handoff {
+        mods: Vec<RawKey>,
+        pointer: Option<Entry>,
+    },
+    /// Primary: a key went down or up; `time` in milliseconds, the sender's clock.
+    Key {
+        keycode: RawKey,
+        pressed: bool,
+        time: u32,
+    },
+    /// Primary: relative pointer motion, in logical pixels.
+    Motion {
+        dx: f64,
+        dy: f64,
+    },
+    /// Primary: a pointer button (its evdev code) went down or up.
+    Button {
+        code: u32,
+        pressed: bool,
+    },
+    /// Primary: scroll, horizontal and vertical: the amounts, and wheel steps in 120ths of a notch (0: none).
+    Axis {
+        source: ScrollSource,
+        h: f64,
+        v: f64,
+        v120_h: i32,
+        v120_v: i32,
+    },
+    /// Primary: input leaves; release everything down.
+    Release,
+    /// Satellite: its pointer crossed back over the left edge of its first screen, at height `y` (a fraction).
+    InputBack {
+        y: f64,
+    },
+}
+
+/// What a scroll came from, as Wayland's `wl_pointer.axis_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+    WheelTilt,
 }
 
 impl Message {
@@ -219,6 +274,14 @@ impl Message {
             Self::CommandAnswer { .. } => "command-answer",
             Self::Ping { .. } => "ping",
             Self::Pong { .. } => "pong",
+            Self::Keymap { .. } => "keymap",
+            Self::Handoff { .. } => "handoff",
+            Self::Key { .. } => "key",
+            Self::Motion { .. } => "motion",
+            Self::Button { .. } => "button",
+            Self::Axis { .. } => "axis",
+            Self::Release => "release",
+            Self::InputBack { .. } => "input-back",
         }
     }
 }
@@ -567,8 +630,10 @@ impl Link {
         };
         let fits = match (self.role, msg) {
             (Role::Primary, M::Hello { .. }) | (Role::Satellite, M::Welcome { .. }) => first,
-            (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. })
+            (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputBack { .. })
             | (Role::Satellite, M::Renames { .. } | M::Command { .. })
+            | (Role::Satellite, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
+            | (Role::Satellite, M::Button { .. } | M::Axis { .. } | M::Release)
             | (_, M::Ping { .. } | M::Pong { .. }) => !first,
             _ => false,
         };
@@ -603,6 +668,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::crossing::Edge;
 
     const MARKER: &str = "plaintext-marker-5b1e";
 
@@ -937,6 +1003,117 @@ mod tests {
                 sat.closed()
             );
         }
+    }
+
+    /// Every input message, as the primary sends them.
+    fn input() -> Vec<Message> {
+        vec![
+            Message::Keymap {
+                xkb: "xkb_keymap { };".into(),
+            },
+            Message::Handoff {
+                mods: vec![RawKey(133), RawKey(50)],
+                pointer: Some(Entry {
+                    edge: Edge::Left,
+                    y: 0.375,
+                }),
+            },
+            Message::Handoff {
+                mods: vec![],
+                pointer: None,
+            },
+            Message::Key {
+                keycode: RawKey(38),
+                pressed: true,
+                time: 7,
+            },
+            Message::Motion { dx: -3.5, dy: 0.25 },
+            Message::Button {
+                code: 272,
+                pressed: false,
+            },
+            Message::Axis {
+                source: ScrollSource::WheelTilt,
+                h: 15.0,
+                v: -7.5,
+                v120_h: 120,
+                v120_v: -60,
+            },
+            Message::Release,
+        ]
+    }
+
+    #[test]
+    fn input_goes_to_a_satellite_and_comes_back_from_it() {
+        let (mut sat, mut pri) = joined();
+        let welcome = Message::Welcome {
+            renames: vec![],
+            foreign: BTreeSet::new(),
+        };
+        pri.send(&welcome).expect("sent");
+        let mut wire = Vec::new();
+        input().iter().for_each(|m| pri.send(m).expect("sent"));
+        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut sat)[1..], input());
+        sat.send(&Message::InputBack { y: 0.5 }).expect("sent");
+        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut pri), [Message::InputBack { y: 0.5 }]);
+        assert!(sat.is_open() && pri.is_open());
+        assert!(!contains(&wire, b"xkb_keymap"), "nothing in clear");
+
+        // Input never goes the other way, nor InputBack to a satellite.
+        for wrong in input() {
+            let (mut sat, mut pri) = joined();
+            sat.send(&wrong).expect("queued");
+            pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+            assert!(
+                matches!(pri.closed(), Some(Closed::Protocol(_))),
+                "{wrong:?}: {:?}",
+                pri.closed()
+            );
+        }
+        let (mut sat, mut pri) = joined();
+        pri.send(&welcome).expect("sent");
+        pri.send(&Message::InputBack { y: 0.5 }).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sat), [welcome]);
+        let Some(Closed::Protocol(why)) = sat.closed() else {
+            panic!("{:?}", sat.closed());
+        };
+        assert_eq!(why, "a input-back to a satellite");
+        // Nor before the Welcome.
+        let (mut sat, mut pri) = joined();
+        pri.send(&Message::Release).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert!(matches!(sat.closed(), Some(Closed::Protocol(_))));
+    }
+
+    #[test]
+    fn a_key_never_shows_its_keycode() {
+        let key = Message::Key {
+            keycode: RawKey(38),
+            pressed: true,
+            time: 7,
+        };
+        let shown = format!("{key:?} {key:#?}");
+        assert!(!shown.contains("38"), "{shown}");
+        assert!(shown.contains("RawKey(..)"), "{shown}");
+        // On the wire it is the number.
+        assert_eq!(
+            serde_json::to_string(&key).expect("json"),
+            r#"{"msg":"key","keycode":38,"pressed":true,"time":7}"#
+        );
+    }
+
+    #[test]
+    fn a_keymap_of_several_layouts_fits_one_frame() {
+        use smithay::input::keyboard::xkb;
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
+        let keymap = xkb::Keymap::new_from_names(&context, "", "", "us,de,ru", "", None, flags).expect("a keymap");
+        let xkb = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let (_, mut pri) = joined();
+        pri.send(&Message::Keymap { xkb }).expect("fits");
     }
 
     #[test]
