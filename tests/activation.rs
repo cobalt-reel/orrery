@@ -200,3 +200,22 @@ fn a_launch_token_moves_a_window_to_the_launch_as_a_new_tab_once() {
     drop(client);
     assert!(orrery.stop().success());
 }
+
+#[test]
+fn at_most_64_client_tokens_are_kept() {
+    let (orrery, mut client) = start();
+    let (a, _) = two_slots(&orrery, &mut client);
+    let serial = client.state.enter_serial;
+    let tokens: Vec<String> = (0..65).map(|_| client.activation_token(serial)).collect();
+    // The 65th was answered but not kept: it only marks.
+    client.activate(a, &tokens[64]);
+    let state = orrery.state();
+    assert_eq!(focused_slot(&state), Some(3));
+    assert_eq!(attention(&state)[0], [true]);
+    // The first is still good.
+    client.activate(a, &tokens[0]);
+    assert!(client.wait_for(|s| s.windows[a].activated()));
+    assert_eq!(focused_slot(&orrery.state()), Some(0));
+    drop(client);
+    assert!(orrery.stop().success());
+}

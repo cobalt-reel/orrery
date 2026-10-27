@@ -95,11 +95,10 @@ A slot holding more than one window (in any tab, at any depth), or a marked one 
 top-right corner. A click focuses the slot under the pointer.
 
 A window asking to be seen (xdg-activation) is never raised, and takes focus only with input behind it: when it
-is what its slot shows and its token came from input to the focused program (a token carrying the serial of a key
-press or click since that program got the keyboard, used within 5 s, once), its slot is focused. Otherwise it is
-marked for attention: its slot shows the badge in the `attention` colour (its tab's strip segment too) until the
-window is seen: brought on top (a `cycle-tab`, a close above it) if it was beneath, focused if it was already
-shown. The mark does not come back. One exception: each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`,
+is what its slot shows and its token came from input to the focused program (a token carrying a serial given since
+that program got the keyboard, used within 5 s, once), its slot is focused. Otherwise it is marked for attention:
+its slot shows the badge in the `attention` colour (its tab's strip segment too) until the window is seen:
+brought on top (a `cycle-tab`, a close above it) if it was beneath, focused if it was already shown. The mark does not come back. One exception: each spawn hands its program a token (`XDG_ACTIVATION_TOKEN`,
 `DESKTOP_STARTUP_ID`), and a window asking with the token of a spawn under 5 s old that no window has taken yet
 moves to where the spawn was made, as a new tab there (a single-instance program opening its existing window from
 a new launch, say).

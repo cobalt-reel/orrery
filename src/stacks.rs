@@ -477,14 +477,15 @@ impl Stacks {
     }
 
     /// Marks `w` as asking for attention. Any placed window but the focused one can be: that one is already seen,
-    /// and one not placed has no slot to show it.
+    /// and one not placed has no slot to show it. A window already marked keeps its first mark (and what clears it).
     pub fn mark(&mut self, w: WinId) {
         let Some(p) = self.placements().find(|p| p.win == w) else {
             return;
         };
         if !p.focused {
-            self.attention
-                .insert(w, if p.on_top { Mark::Unfocused } else { Mark::Waiting });
+            (self.attention)
+                .entry(w)
+                .or_insert(if p.on_top { Mark::Unfocused } else { Mark::Waiting });
         }
     }
 
@@ -1539,6 +1540,14 @@ mod tests {
         assert!(!s.is_marked(3));
         s.focus_slot(Dir::Right);
         assert!(!s.is_marked(3), "it does not come back");
+        // Marked again while covered: the first mark stands, so showing it again (unfocused) keeps it.
+        s.focus_slot(Dir::Right);
+        s.mark(3);
+        assert!(s.open_on(6, 3));
+        s.mark(3);
+        s.close(6);
+        assert!(s.is_marked(3), "still the mark of a shown window");
+        assert_invariants(&s);
         // Any way of focusing it clears it.
         s.mark(3);
         assert!(s.focus_window(3) && !s.is_marked(3));

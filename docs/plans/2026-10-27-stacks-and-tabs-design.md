@@ -45,7 +45,7 @@ xdg-activation (new). A request names a surface (a popup's or subsurface's count
 - a client's own token (`get_activation_token`) that orrery kept, for a window that is the top of its slot's
   current tab: that slot is focused. A client token is kept only when it carries a serial of orrery's seat no
   older than the keyboard's latest enter and its client has keyboard focus (input to the focused client), for 5 s
-  and one use;
+  and one use, 64 at most at once;
 - anything else (an unknown, old, spent or unbacked token, or a window beneath its slot's top) never focuses and
   never raises: the window is marked **attention** (unless it is the focused window), and its slot shows the badge
   in the new `attention` colour. A window marked while beneath loses the mark when it becomes the top of its slot's

@@ -33,6 +33,9 @@ use smithay::{
 
 use super::{ClientState, Orrery};
 
+/// At most this many client tokens are kept at once (5 s each): a client asking in a loop cannot grow the pool.
+const KEPT_TOKENS: usize = 64;
+
 impl CompositorHandler for Orrery {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -233,11 +236,12 @@ impl XdgActivationHandler for Orrery {
 
     // A client's own token (xdg_activation_v1.get_activation_token, to pass focus to another of its windows or to
     // a program it starts) is never a launch's. It is kept, and can then focus a shown window once, only when it
-    // comes from input to the focused client (`Orrery::input_backed`); any other is answered but not kept, so
-    // activating with it only marks. Old ones are dropped here and on each activation.
+    // comes from input to the focused client (`Orrery::input_backed`) and fewer than `KEPT_TOKENS` are kept; any
+    // other is answered but not kept, so activating with it only marks. Old ones are dropped here and on each
+    // activation.
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         self.forget_old_tokens(std::time::Instant::now());
-        self.input_backed(&data)
+        self.xdg_activation_state.tokens().count() < KEPT_TOKENS && self.input_backed(&data)
     }
 
     // Unreached: orrery dispatches xdg_activation_v1 itself (below). Routed the same way should that change.
