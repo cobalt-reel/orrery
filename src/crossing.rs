@@ -2,8 +2,8 @@
 //! the machine holding the session's focus marker.
 //!
 //! Pure. Keyboard and pointer go to one place, here (`Place::Local`) or another machine. Every key and button is
-//! kept from press to release on the side it went to, so a handoff releases exactly what the side input leaves has
-//! down and presses on the side it goes to only the modifier keys still held: no key is ever down on two machines,
+//! kept from press to release on the machine it went to. A handoff releases everything down on the machine input
+//! leaves, and presses on the one it goes to only the modifier keys still held: no key is ever down on two machines,
 //! no stuck keys, no missing Super. A release whose press stayed behind goes nowhere. Keycodes never show in Debug
 //! (`RawKey`): keystrokes are never logged.
 //!
@@ -60,7 +60,7 @@ impl Entry {
             Edge::Right => f64::from(width.saturating_sub(1)),
         };
         let bottom = f64::from(height.saturating_sub(1));
-        (x, (self.y * f64::from(height)).clamp(0.0, bottom))
+        (x, (unit(self.y) * f64::from(height)).min(bottom))
     }
 }
 
@@ -128,7 +128,8 @@ impl Crossing {
 
     /// A key of this machine's keyboard went down or up (`modifier`: Shift, Ctrl, Alt, Super and the like): where it
     /// goes. None for a press of a key already down (receivers repeat keys themselves) or a release whose press
-    /// stayed behind at a handoff.
+    /// stayed behind at a handoff. Lock keys (Caps, Num, Scroll) are never modifiers here: lock and latch state is
+    /// not carried, each machine keeps its own.
     pub fn key(&mut self, key: RawKey, pressed: bool, modifier: bool) -> Option<Place> {
         let went = match pressed {
             true => self.keys.insert(key, modifier).is_none(),
@@ -152,7 +153,7 @@ impl Crossing {
         self.go(to, entry, true)
     }
 
-    /// The pointer crossed an edge onto machine `to` (`exit`, `back_from`): a handoff entering at `entry`. None while
+    /// The pointer crossed an edge onto machine `to` (`exit`, `landing`): a handoff entering at `entry`. None while
     /// a button is down, so a drag stays on its machine.
     pub fn cross(&mut self, to: &str, entry: Entry) -> Option<Handoff> {
         if !self.buttons.is_empty() {
@@ -215,14 +216,12 @@ pub struct RowScreen {
     pub height: u32,
 }
 
-/// Where the pointer goes past the edge of its machine's screens.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Exit {
-    /// Past the right edge of its machine's last screen: onto the next machine's first.
-    Next(Landing),
-    /// Past the left edge of its machine's first screen: back, at height `y` (a fraction). A satellite sends it as
-    /// `Message::InputBack`; the primary finds where it lands with `back_from`.
-    Back { y: f64 },
+/// The pointer left its machine's screens: past `edge` (the left of its first, the right of its last) at height `y`
+/// (a fraction). A satellite sends it as `Message::InputExit`; the primary finds where it lands with `landing`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exit {
+    pub edge: Edge,
+    pub y: f64,
 }
 
 /// The pointer onto another machine: its name, the screen it enters (by its index in the row) and where.
@@ -233,45 +232,51 @@ pub struct Landing {
     pub entry: Entry,
 }
 
-/// The pointer on `row[at]` pushed to `(x, y)` there (that screen's coordinates; past it when pushed out): where
-/// it goes if that leaves its machine. Moves between a machine's own screens are its own business: None.
+/// The pointer on `row[at]` pushed to `(x, y)` there (that screen's coordinates; past it when pushed out): the
+/// exit, if that leaves its machine. Moves between a machine's own screens are its own business: None.
 #[must_use]
 pub fn exit(row: &[RowScreen], at: usize, x: f64, y: f64) -> Option<Exit> {
     let here = row.get(at)?;
-    let y = fraction(y, here.height);
-    if x >= f64::from(here.width) {
-        let next = row.get(at + 1).filter(|s| s.machine != here.machine)?;
-        let entry = Entry { edge: Edge::Left, y };
-        return Some(Exit::Next(Landing {
-            machine: next.machine.clone(),
-            screen: at + 1,
-            entry,
-        }));
-    }
+    let last = row.get(at + 1).is_none_or(|s| s.machine != here.machine);
     let first = at == 0 || row[at - 1].machine != here.machine;
-    (x < 0.0 && first).then_some(Exit::Back { y })
+    let edge = match () {
+        () if x >= f64::from(here.width) && last => Edge::Right,
+        () if x < 0.0 && first => Edge::Left,
+        () => return None,
+    };
+    let y = fraction(y, here.height);
+    Some(Exit { edge, y })
 }
 
-/// The pointer came back from machine `machine` at height `y` (a fraction): onto the right edge of the previous
-/// machine's last screen. None for the first machine, or one not in the row.
+/// Machine `machine`'s pointer left past `edge` at height `y` (a fraction): onto the machine beside it there,
+/// entering at the facing edge. None past the row's ends, or for a machine not in it.
 #[must_use]
-pub fn back_from(row: &[RowScreen], machine: &str, y: f64) -> Option<Landing> {
-    let first = row.iter().position(|s| s.machine == machine)?;
-    let before = first.checked_sub(1)?;
+pub fn landing(row: &[RowScreen], machine: &str, edge: Edge, y: f64) -> Option<Landing> {
+    let (screen, entering) = match edge {
+        Edge::Left => (
+            row.iter().position(|s| s.machine == machine)?.checked_sub(1)?,
+            Edge::Right,
+        ),
+        Edge::Right => (row.iter().rposition(|s| s.machine == machine)? + 1, Edge::Left),
+    };
     Some(Landing {
-        machine: row[before].machine.clone(),
-        screen: before,
+        machine: row.get(screen)?.machine.clone(),
+        screen,
         entry: Entry {
-            edge: Edge::Right,
-            y: y.clamp(0.0, 1.0),
+            edge: entering,
+            y: unit(y),
         },
     })
 }
 
 /// `y` as a fraction of `height`, inside 0..=1; 0 for a screen of no height.
 fn fraction(y: f64, height: u32) -> f64 {
-    let f = y / f64::from(height);
-    if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 }
+    if height == 0 { 0.0 } else { unit(y / f64::from(height)) }
+}
+
+/// `f` inside 0..=1; 0 when it is not a number.
+fn unit(f: f64) -> f64 {
+    if f.is_nan() { 0.0 } else { f.clamp(0.0, 1.0) }
 }
 
 /// Input on its way to one machine, in order. Motion merges into motion queued last, so a link that stalls sends one
@@ -288,7 +293,7 @@ impl Outbox {
             Message::Motion { dx, dy } if !(dx.is_finite() && dy.is_finite()) => {}
             Message::Axis { h, v, .. } if !(h.is_finite() && v.is_finite()) => {}
             Message::Motion { dx, dy } => match self.queue.back_mut() {
-                Some(Message::Motion { dx: x, dy: y }) => {
+                Some(Message::Motion { dx: x, dy: y }) if (*x + dx).is_finite() && (*y + dy).is_finite() => {
                     *x += dx;
                     *y += dy;
                 }
@@ -413,6 +418,23 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_key_is_not_a_modifier_and_its_lock_stays_on_each_machine() {
+        const CAPS: RawKey = RawKey(66);
+        let mut c = Crossing::new("p");
+        c.key(CAPS, true, false);
+        c.key(SHIFT, true, true);
+        let h = c.handoff("a", None).expect("moves");
+        assert_eq!((h.release_keys, h.held), (vec![SHIFT, CAPS], vec![SHIFT]));
+        assert_eq!(c.key(CAPS, false, false), None, "released here at the handoff");
+        // Pressed there, it goes there; held at a handoff home, it is released there and not pressed here.
+        assert_eq!(c.key(CAPS, true, false), Some(remote("a")));
+        let h = c.reclaim().expect("comes home");
+        assert_eq!((h.release, h.held), (Some("a".into()), vec![SHIFT]));
+        assert_eq!(c.key(CAPS, false, false), None);
+        assert_eq!(c.key(CAPS, true, false), Some(Place::Local));
+    }
+
+    #[test]
     fn reclaim_brings_input_home_with_the_modifiers_held() {
         let mut c = Crossing::new("p");
         c.handoff("a", None);
@@ -496,18 +518,18 @@ mod tests {
     }
 
     #[test]
-    fn the_pointer_crosses_at_a_machines_outer_edges_with_its_height_scaled() {
+    fn the_pointer_leaves_at_a_machines_outer_edges_with_its_height_scaled() {
         let row = row();
-        // Inside, or between a machine's own screens: not a crossing.
+        let out = |edge, y| Some(Exit { edge, y });
+        // Inside, or between a machine's own screens: not an exit.
         assert_eq!(exit(&row, 1, 100.0, 540.0), None);
         assert_eq!(exit(&row, 0, 1925.0, 540.0), None, "onto p2: p's own business");
         assert_eq!(exit(&row, 1, -3.0, 540.0), None, "back onto p1");
-        // Past p's last screen: a's first, at the same height scaled to it.
-        let Some(Exit::Next(landing)) = exit(&row, 1, 1925.0, 540.0) else {
-            panic!("crosses");
-        };
+        // Past p's last screen: onto a's first, at the same height scaled to it.
+        assert_eq!(exit(&row, 1, 1925.0, 540.0), out(Edge::Right, 0.5));
+        let onto = landing(&row, "p", Edge::Right, 0.5).expect("lands");
         assert_eq!(
-            landing,
+            onto,
             Landing {
                 machine: "a".into(),
                 screen: 2,
@@ -517,72 +539,73 @@ mod tests {
                 },
             }
         );
-        assert_eq!(landing.entry.point(2560, 1440), (0.0, 720.0));
-        // Past the left of a machine's first screen: back.
-        assert_eq!(exit(&row, 2, -1.0, 360.0), Some(Exit::Back { y: 0.25 }));
-        assert_eq!(
-            exit(&row, 0, -1.0, 270.0),
-            Some(Exit::Back { y: 0.25 }),
-            "the caller's to ignore"
-        );
-        // Past the last machine: nowhere.
-        assert_eq!(exit(&row, 3, 1280.0, 10.0), None);
+        assert_eq!(onto.entry.point(2560, 1440), (0.0, 720.0));
+        // Past the left of a machine's first screen.
+        assert_eq!(exit(&row, 2, -1.0, 360.0), out(Edge::Left, 0.25));
+        assert_eq!(exit(&row, 0, -1.0, 270.0), out(Edge::Left, 0.25));
+        assert_eq!(landing(&row, "p", Edge::Left, 0.25), None, "nothing before the primary");
+        // Past the last machine: an exit to nowhere.
+        assert_eq!(exit(&row, 3, 1280.0, 10.0), out(Edge::Right, 10.0 / 1024.0));
+        assert_eq!(landing(&row, "b", Edge::Right, 0.5), None);
+        // A satellite knows only its own screens: both its outer edges are exits, which it reports (InputExit).
+        let own = [screen("a", "a1", 2560, 1440)];
+        assert_eq!(exit(&own, 0, 2560.0, 360.0), out(Edge::Right, 0.25));
+        assert_eq!(exit(&own, 0, -0.5, 360.0), out(Edge::Left, 0.25));
         // Pushed out at a corner: the height is kept inside the screen.
-        let Some(Exit::Next(corner)) = exit(&row, 2, 2600.0, 1500.0) else {
-            panic!("crosses");
-        };
-        assert_eq!((corner.machine.as_str(), corner.entry.y), ("b", 1.0));
+        assert_eq!(exit(&row, 2, 2600.0, 1500.0), out(Edge::Right, 1.0));
+        let corner = landing(&row, "a", Edge::Right, 1.0).expect("lands");
         assert_eq!(corner.entry.point(1280, 1024), (0.0, 1023.0));
-        let Some(Exit::Back { y }) = exit(&row, 2, -5.0, -40.0) else {
-            panic!("back");
-        };
-        assert_eq!(y, 0.0);
+        assert_eq!(exit(&row, 2, -5.0, -40.0), out(Edge::Left, 0.0));
     }
 
     #[test]
-    fn coming_back_lands_on_the_right_edge_of_the_machine_before() {
+    fn an_exit_lands_on_the_machine_beside_it_both_ways() {
         let row = row();
-        let landing = back_from(&row, "a", 0.25).expect("lands");
+        let at = |machine: &str, edge, y| landing(&row, machine, edge, y).map(|l| (l.machine, l.screen, l.entry));
+        let entry = |edge, y| Entry { edge, y };
+        // p -> a -> b and back, by edge.
+        assert_eq!(at("a", Edge::Right, 0.5), Some(("b".into(), 3, entry(Edge::Left, 0.5))));
         assert_eq!(
-            landing,
-            Landing {
-                machine: "p".into(),
-                screen: 1,
-                entry: Entry {
-                    edge: Edge::Right,
-                    y: 0.25
-                },
-            }
+            at("b", Edge::Left, 0.75),
+            Some(("a".into(), 2, entry(Edge::Right, 0.75)))
         );
-        assert_eq!(landing.entry.point(1920, 1080), (1919.0, 270.0));
-        assert_eq!(
-            back_from(&row, "b", 0.5).map(|l| (l.machine, l.screen)),
-            Some(("a".into(), 2))
-        );
-        assert_eq!(back_from(&row, "p", 0.5), None, "nothing before the primary");
-        assert_eq!(back_from(&row, "x", 0.5), None);
+        let back = landing(&row, "a", Edge::Left, 0.25).expect("lands");
+        assert_eq!((back.machine.as_str(), back.screen), ("p", 1), "p's last screen");
+        assert_eq!(back.entry, entry(Edge::Right, 0.25));
+        assert_eq!(back.entry.point(1920, 1080), (1919.0, 270.0));
+        assert_eq!(landing(&row, "x", Edge::Left, 0.5), None, "not in the row");
         // A machine with no screens is not in the row: the pointer passes it by.
         let mut row = row;
         row.remove(2);
-        let Some(Exit::Next(l)) = exit(&row, 1, 1920.0, 0.0) else {
-            panic!("crosses");
-        };
-        assert_eq!(l.machine, "b");
-        assert_eq!(back_from(&row, "b", 0.0).map(|l| l.machine), Some("p".into()));
-        // A screen of no height (not yet sized) enters at the top, never at a height that is not a number.
+        assert_eq!(
+            landing(&row, "p", Edge::Right, 0.0).map(|l| l.machine),
+            Some("b".into())
+        );
+        assert_eq!(landing(&row, "b", Edge::Left, 0.0).map(|l| l.machine), Some("p".into()));
+        // Heights out of range or not a number never come out: a screen of no height (not yet sized) enters at the
+        // top, a height reported out of range is kept inside.
         let flat = [screen("p", "p1", 1920, 0), screen("a", "a1", 10, 10)];
         assert_eq!(
-            exit(&flat, 0, 1920.0, 5.0).map(|e| matches!(e, Exit::Next(l) if l.entry.y == 0.0)),
-            Some(true)
+            exit(&flat, 0, 1920.0, 5.0),
+            Some(Exit {
+                edge: Edge::Right,
+                y: 0.0
+            })
         );
         assert_eq!(
-            Entry {
+            exit(&flat, 0, 1920.0, f64::NAN),
+            Some(Exit {
                 edge: Edge::Right,
-                y: 0.5
-            }
-            .point(0, 0),
-            (0.0, 0.0)
+                y: 0.0
+            })
         );
+        assert_eq!(entry(Edge::Right, 0.5).point(0, 0), (0.0, 0.0));
+        assert_eq!(entry(Edge::Left, f64::NAN).point(100, 100), (0.0, 0.0));
+        assert_eq!(entry(Edge::Left, 7.0).point(100, 100), (0.0, 99.0));
+        for y in [f64::NAN, f64::INFINITY, -3.0, 9.0] {
+            let l = landing(&flat, "p", Edge::Right, y).expect("lands");
+            assert!((0.0..=1.0).contains(&l.entry.y), "{y}: {}", l.entry.y);
+        }
     }
 
     fn motion(dx: f64, dy: f64) -> Message {
@@ -658,6 +681,14 @@ mod tests {
         assert_eq!(
             std::iter::from_fn(|| o.pop()).collect::<Vec<_>>(),
             [motion(1.0, 1.0), axis(15.0)]
+        );
+        // A sum that would not be finite is not made: the step waits as its own.
+        o.push(motion(f64::MAX, 1.0));
+        o.push(motion(f64::MAX, 1.0));
+        o.push(motion(-1.0, 1.0));
+        assert_eq!(
+            std::iter::from_fn(|| o.pop()).collect::<Vec<_>>(),
+            [motion(f64::MAX, 1.0), motion(f64::MAX - 1.0, 2.0)]
         );
     }
 
@@ -767,18 +798,30 @@ mod tests {
                 }
                 _ => {
                     let lost = MACHINES[1 + rng.below(2) as usize];
-                    // That machine releases what it has down on its own drop.
-                    let seat = seats.get_mut(lost).expect("a machine");
-                    seat.keys.clear();
-                    seat.buttons.clear();
-                    if let Some(h) = c.link_lost(lost) {
+                    let there = c.place() == &remote(lost);
+                    let h = c.link_lost(lost);
+                    assert_eq!(h.is_some(), there, "step {step}");
+                    if let Some(h) = h {
+                        assert_eq!(h.release, None, "step {step}: no link to send it on");
                         apply(&mut seats, h);
+                        // That machine releases what it has down on its own drop; the handoff released nothing.
+                        let seat = seats.get_mut(lost).expect("a machine");
+                        seat.keys.clear();
+                        seat.buttons.clear();
                     }
                     assert_ne!(c.place(), &remote(lost));
                 }
             }
-            // No key down on two machines; nothing down that the user does not hold; every modifier held is down
-            // where input is.
+            // Nothing down on any machine but the one input is at; nothing down that the user does not hold; every
+            // modifier held is down where input is.
+            for (m, seat) in &seats {
+                if *m != name(c.place()) {
+                    assert!(
+                        seat.keys.is_empty() && seat.buttons.is_empty(),
+                        "step {step}: left down on {m}"
+                    );
+                }
+            }
             for k in (8..16).map(RawKey) {
                 let n = seats.values().filter(|s| s.keys.contains(&k)).count();
                 assert!(n <= 1, "step {step}: a key down on {n} machines");

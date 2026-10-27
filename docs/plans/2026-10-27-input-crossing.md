@@ -27,7 +27,8 @@ its normal input path; the primary's backends hold the pointer while it is away.
   and buttons queue in order, never merged). Unit tests for each.
 - Link messages (bump PROTOCOL_VERSION): Keymap {xkb string}, Handoff {mods, pointer entry (edge, y fraction) or
   none}, Key {keycode, pressed, time}, Motion {dx, dy}, Button {code, pressed}, Axis {source, h, v, v120_h, v120_v},
-  Release (input leaves the receiver), and InputBack {pointer y fraction} from a satellite whose pointer crossed back.
+  Release (input leaves the receiver), and InputExit {edge, pointer y fraction} from a satellite whose pointer left
+  its screens.
   Direction rules in `misplaced()`; round-trip tests; no Debug output that prints keycodes in logs (redact Key).
 
 Commit `crossing: where input goes`.
@@ -37,7 +38,8 @@ Commit `crossing: where input goes`.
 - Feed received Key/Motion/Button/Axis into the same input path as local input (binds included), with the received
   keymap applied to the seat at handoff (`set_keymap_from_string`), modifiers set from Handoff, everything released
   on Release or link drop. Pointer: enter at the given edge and height, move by relative motion clamped to its
-  screens, cross back at the left edge of its first screen (send InputBack).
+  screens; past the left edge of its first screen or the right edge of its last, send InputExit (the primary hands
+  the pointer to the machine beside that edge).
 - A test-only `inject` request (keys, motion, buttons) usable on any orrery started with `--debug-inject` (refused
   otherwise), for the e2e tests.
 - e2e (`tests/crossing.rs`): headless primary + satellite; marker to the satellite; keys injected on the primary
@@ -65,3 +67,14 @@ Commit `crossing: the sending side`.
 ### Task 4: as built
 
 Full suite, clippy, fmt, cleanliness scan, README vs design, "As built". Then the live one-machine test by hand.
+
+## Notes for Task 3
+
+- Match `reclaim` (the escape key) before `Crossing::key`, and never record the escape key there: its release then
+  goes nowhere.
+- Filter winit's key-repeat events before `Crossing::key`: receivers repeat keys themselves.
+- On a machine's link loss, clear its `Outbox` along with `Crossing::link_lost`.
+- Keymap and Handoff go through the same `Outbox` as keys, so nothing overtakes them (nor a Release what came
+  before it).
+- A Handoff that fails to send (a keymap too large for a frame included) is a link loss (`link_lost`), never half a
+  handoff.

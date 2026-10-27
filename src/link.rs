@@ -28,7 +28,7 @@ use snow::{HandshakeState, TransportState};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::NAME;
-use crate::crossing::{Entry, RawKey};
+use crate::crossing::{Edge, Entry, RawKey};
 use crate::ipc::{Request, Response};
 use crate::session::{Renames, Role, Screen};
 
@@ -211,7 +211,7 @@ pub enum Message {
     /// Primary: the keymap input is typed with from now on, as xkb keymap text (`KEYMAP_FORMAT_TEXT_V1`), so the
     /// user's layout follows them. Sent before a Handoff when it changed.
     Keymap {
-        xkb: String,
+        xkb: Xkb,
     },
     /// Primary: input comes here now. `mods`: the modifier keys held, to press. `pointer`: where the pointer
     /// enters; none: its cursor stays where it is.
@@ -245,10 +245,23 @@ pub enum Message {
     },
     /// Primary: input leaves; release everything down.
     Release,
-    /// Satellite: its pointer crossed back over the left edge of its first screen, at height `y` (a fraction).
-    InputBack {
+    /// Satellite: its pointer left its screens past `edge` (the left of its first, the right of its last) at height
+    /// `y` (a fraction); the primary hands it to the machine beside it there (`crossing::landing`).
+    InputExit {
+        edge: Edge,
         y: f64,
     },
+}
+
+/// A keymap as xkb text. Debug shows only its length: it is long.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Xkb(pub String);
+
+impl fmt::Debug for Xkb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Xkb({} bytes)", self.0.len())
+    }
 }
 
 /// What a scroll came from, as Wayland's `wl_pointer.axis_source`.
@@ -281,7 +294,7 @@ impl Message {
             Self::Button { .. } => "button",
             Self::Axis { .. } => "axis",
             Self::Release => "release",
-            Self::InputBack { .. } => "input-back",
+            Self::InputExit { .. } => "input-exit",
         }
     }
 }
@@ -630,7 +643,7 @@ impl Link {
         };
         let fits = match (self.role, msg) {
             (Role::Primary, M::Hello { .. }) | (Role::Satellite, M::Welcome { .. }) => first,
-            (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputBack { .. })
+            (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputExit { .. })
             | (Role::Satellite, M::Renames { .. } | M::Command { .. })
             | (Role::Satellite, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
             | (Role::Satellite, M::Button { .. } | M::Axis { .. } | M::Release)
@@ -668,7 +681,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::crossing::Edge;
 
     const MARKER: &str = "plaintext-marker-5b1e";
 
@@ -1009,7 +1021,7 @@ mod tests {
     fn input() -> Vec<Message> {
         vec![
             Message::Keymap {
-                xkb: "xkb_keymap { };".into(),
+                xkb: Xkb("xkb_keymap { };".into()),
             },
             Message::Handoff {
                 mods: vec![RawKey(133), RawKey(50)],
@@ -1055,13 +1067,23 @@ mod tests {
         input().iter().for_each(|m| pri.send(m).expect("sent"));
         pump(&mut sat, &mut pri, &mut wire, usize::MAX);
         assert_eq!(drain(&mut sat)[1..], input());
-        sat.send(&Message::InputBack { y: 0.5 }).expect("sent");
+        let exits = [
+            Message::InputExit {
+                edge: Edge::Left,
+                y: 0.5,
+            },
+            Message::InputExit {
+                edge: Edge::Right,
+                y: 0.0,
+            },
+        ];
+        exits.iter().for_each(|m| sat.send(m).expect("sent"));
         pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut pri), [Message::InputBack { y: 0.5 }]);
+        assert_eq!(drain(&mut pri), exits);
         assert!(sat.is_open() && pri.is_open());
         assert!(!contains(&wire, b"xkb_keymap"), "nothing in clear");
 
-        // Input never goes the other way, nor InputBack to a satellite.
+        // Input never goes the other way, nor InputExit to a satellite.
         for wrong in input() {
             let (mut sat, mut pri) = joined();
             sat.send(&wrong).expect("queued");
@@ -1074,13 +1096,13 @@ mod tests {
         }
         let (mut sat, mut pri) = joined();
         pri.send(&welcome).expect("sent");
-        pri.send(&Message::InputBack { y: 0.5 }).expect("sent");
+        pri.send(&exits[0]).expect("sent");
         pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
         assert_eq!(drain(&mut sat), [welcome]);
         let Some(Closed::Protocol(why)) = sat.closed() else {
             panic!("{:?}", sat.closed());
         };
-        assert_eq!(why, "a input-back to a satellite");
+        assert_eq!(why, "a input-exit to a satellite");
         // Nor before the Welcome.
         let (mut sat, mut pri) = joined();
         pri.send(&Message::Release).expect("sent");
@@ -1113,7 +1135,19 @@ mod tests {
         let keymap = xkb::Keymap::new_from_names(&context, "", "", "us,de,ru", "", None, flags).expect("a keymap");
         let xkb = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
         let (_, mut pri) = joined();
-        pri.send(&Message::Keymap { xkb }).expect("fits");
+        let len = xkb.len();
+        let msg = Message::Keymap { xkb: Xkb(xkb) };
+        assert_eq!(
+            format!("{msg:?}"),
+            format!("Keymap {{ xkb: Xkb({len} bytes) }}"),
+            "only its length"
+        );
+        assert!(
+            serde_json::to_string(&msg)
+                .expect("json")
+                .starts_with(r#"{"msg":"keymap","xkb":"xkb_keymap"#)
+        );
+        pri.send(&msg).expect("fits");
     }
 
     #[test]

@@ -24,11 +24,14 @@ Fills in section 4 of `2026-10-26-orrery-design.md`. Agreed 2026-10-27.
 ## Pointer
 
 - Screens sit in a row, left to right, in session monitor order (the primary's, then each satellite's in join order).
-  Pushing the pointer past the right edge of a machine's last screen crosses to the next machine's first; the left
-  edge of a machine's first screen crosses back.
+  Pushing the pointer past the right edge of a machine's last screen crosses to the next machine's first; past the
+  left edge of a machine's first screen, to the previous machine's last. With three or more machines the pointer
+  walks the whole row both ways.
 - Crossing out: the sender hides its cursor and holds the pointer (nested: the host's pointer lock; headless: nothing
   to hold) and sends relative motion, buttons and high-resolution scroll. The receiver moves its own cursor, entering
-  at the same height (scaled to its screen), and an edge leading back hands the pointer back.
+  at the same height (scaled to its screen). A satellite knows only its own screens: when its pointer leaves them it
+  tells the primary which edge and at what height (InputExit), and the primary hands the pointer to the machine
+  beside that edge (itself included). Leaving past either end of the row goes nowhere.
 - Motion is coalesced: if the link stalls, pending movement merges into one step and is never replayed late. Keys and
   buttons are never merged or dropped.
 
