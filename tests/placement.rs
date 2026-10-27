@@ -87,6 +87,24 @@ fn a_window_soon_after_a_launch_opens_as_a_tab_where_the_launch_was_made() {
 }
 
 #[test]
+fn a_window_mapped_again_takes_no_launch() {
+    let (orrery, mut client) = start();
+    let [a, b] = [client.create_window("a", "A"), client.create_window("b", "B")];
+    assert!(client.wait_for(|s| s.windows[b].mapped() && !s.windows[a].mapped()));
+    orrery.msg_ok(&["spawn", "true"]);
+    // An old window coming back is no launch's window: it stacks, the launch keeps waiting.
+    client.unmap(b);
+    client.remap(b);
+    assert!(client.wait_for(|s| s.windows[b].mapped()));
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"])]);
+    let c = client.create_window("c", "C");
+    assert!(client.wait_for(|s| s.windows[c].mapped()));
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"]), strs(&["c"])]);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
 fn a_launched_programs_window_finds_its_launch_by_pid() {
     let (orrery, mut client) = start();
     // The older launch, in slot 0: the fallback would hand it the helper's window.

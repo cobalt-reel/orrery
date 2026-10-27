@@ -231,6 +231,8 @@ pub struct Orrery {
     /// Windows that have committed a buffer and so are in the stacks. The rest wait, configured to the slot they
     /// would open into, without hiding anything or taking focus.
     opened: HashSet<WinId>,
+    /// Windows that have opened at least once: one mapped again (after a null buffer) is no launch's window.
+    opened_before: HashSet<WinId>,
     /// A real pointer has moved over orrery. Until then (always, headless) the pointer has no position, so no
     /// surface gets pointer focus from arrange.
     pub pointer_seen: bool,
@@ -321,6 +323,7 @@ impl Orrery {
             windows: HashMap::new(),
             surfaces: HashMap::new(),
             opened: HashSet::new(),
+            opened_before: HashSet::new(),
             pointer_seen: false,
             pointer_target: None,
             held: input::Held::default(),
@@ -401,20 +404,27 @@ impl Orrery {
     }
 
     /// Puts a window into the stacks as `placement::decide` says, from its parent (a placed one), its client's
-    /// pid chain and the launches.
+    /// pid chain and the launches. A window mapped again sees no launches: only its parent or `stacking` count.
     fn place(&mut self, id: WinId, toplevel: &ToplevelSurface) {
         let now = Instant::now();
         let parent = toplevel.parent().and_then(|s| self.id_of_surface(&s));
         let parent_placed = parent.is_some_and(|p| self.stacks.where_is(p).is_some());
-        // /proc is read only when a launch could match.
+        let first_time = self.opened_before.insert(id);
         self.launches.expire(now);
-        let chain = match self.client_pid(toplevel.wl_surface()) {
-            Some(pid) if self.launches.waiting() => {
-                placement::pid_chain(pid, |p| std::fs::read_to_string(format!("/proc/{p}/stat")).ok())
-            }
-            _ => Vec::new(),
-        };
-        match placement::decide(parent, parent_placed, &chain, &mut self.launches, now, self.stacking) {
+        // The client and /proc are asked only when a launch could match.
+        let pid = (first_time && self.launches.waiting())
+            .then(|| self.client_pid(toplevel.wl_surface()))
+            .flatten();
+        let chain = pid.map_or_else(Vec::new, |pid| {
+            placement::pid_chain(pid, |p| {
+                // The name in it may be any bytes; lossy keeps the fields after it readable.
+                let stat = std::fs::read(format!("/proc/{p}/stat")).ok()?;
+                Some(String::from_utf8_lossy(&stat).into_owned())
+            })
+        });
+        let mut none = Launches::default();
+        let launches = if first_time { &mut self.launches } else { &mut none };
+        match placement::decide(parent, parent_placed, &chain, launches, now, self.stacking) {
             Landing::OnParent(p) => {
                 // decide checked the parent is placed, so this cannot miss; stacked if it ever does.
                 if !self.stacks.open_on(id, p) {
@@ -446,6 +456,7 @@ impl Orrery {
         }
         self.surfaces.retain(|_, &mut w| w != id);
         self.opened.remove(&id);
+        self.opened_before.remove(&id);
         self.stacks.close(id);
     }
 

@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(decide(Some(7), true, &[40], &mut l, t0, true), Landing::OnParent(7));
         assert_eq!(decide(Some(7), true, &[40], &mut l, t0, false), Landing::OnParent(7));
         assert!(!l.all()[0].claimed, "the launch still waits for its own window");
-        // A parent that is not placed (waiting, pending) is no parent: the next rule applies.
+        // A parent that is not placed (not mapped yet, or pending with no monitor) is no parent: the next rule applies.
         assert_eq!(decide(Some(7), false, &[40], &mut l, t0, true), tab(2));
         assert_eq!(decide(Some(7), false, &[], &mut l, t0, true), Landing::Stacked);
     }
