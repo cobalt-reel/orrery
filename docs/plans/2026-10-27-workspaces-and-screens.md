@@ -80,9 +80,12 @@ Commit `msg and binds: workspaces`.
 
 ### Task 3: several headless screens + `orrery run` joins a running orrery
 
-- Headless: `open-screen` adds an output named after the screen number the core will give it (the lowest free:
-  the first stays as today, then `headless-<k>`), same size as `--size`, placed after the previous one in global
-  space; `close-screen <name>` (msg, headless only, for tests) removes it.
+- Headless: `open-screen` adds an output named after the screen number the core will give it
+  (`Stacks::next_screen_number`, the lowest free: the first stays as today, then `headless-<k>`), same size as
+  `--size`, placed after the previous one in global space (opening order, not number order);
+  `close-screen <name>` (msg, headless only, for tests) removes it.
+- Never pair the compositor's output list with `stacks.monitors()` by index: monitors are in number order, outputs
+  in opening order, and the two part as soon as a lower number is reused. Look monitors up by name.
 - `orrery run`: when the control socket answers, send `open-screen`, print the answer, exit 0 (non-zero if it
   refused); otherwise start as today. Unit/e2e test with headless (`orrery run --backend headless` twice on the
   same socket → one process, two monitors).
@@ -103,10 +106,12 @@ Commit `screens: several per orrery, run joins a running one`.
   window's `RedrawRequested` with `pre_present_notify`, swap interval 0, frame age after idle frames, the 16 ms
   timer requesting redraws for every window).
 - Windows: the first opens at start; `open-screen` opens another, named after its screen number (the lowest
-  free: `winit` for 1, `winit-<k>` else; app id and title as today so host rules match); `CloseRequested` on a window removes its screen (`remove_monitor`, destroy the output
-  global) and quits only when it was the last; `Resized` per window; input per window: pointer positions are
-  window-local, so add the window's output offset in global space; `Focus(false)` per window as today, and a
-  `Focus(true)` focuses that window's monitor.
+  free, `Stacks::next_screen_number`: `winit` for 1, `winit-<k>` else; app id and title as today so host rules
+  match; x offset after the previous window in opening order; match windows, outputs and monitors by name, never
+  by index into `stacks.monitors()`); `CloseRequested` on a window removes its screen (`remove_monitor`, destroy
+  the output global) and quits only when it was the last; `Resized` per window; input per window: pointer
+  positions are window-local, so add the window's output offset in global space; `Focus(false)` per window as
+  today, and a `Focus(true)` focuses that window's monitor.
 - No automated test can reach a real host: keep pure helpers (naming, offsets, which-window-for-event) unit-tested,
   and add a manual checklist to the README (two windows on two host monitors, resize, close one, Super+N across).
 

@@ -13,8 +13,9 @@ Fills in section 1 of `2026-10-26-orrery-design.md` for one machine (no link yet
   screen 1 of 3 leaves 2 and 3, and the next screen opened is 1 again. Output names follow the number: screen 1
   is `winit` (so existing `monitor "winit"` rules keep working), screen k is `winit-<k>`. Headless (tests) does
   the same with its own names and the `--size` of the first screen.
-- Screens sit side by side in orrery's global space in opening order (x offsets), which only matters for
-  Smithay's bookkeeping: nested, the pointer moves between screens through the host.
+- Screens sit side by side in orrery's global space in opening order (x offsets), not in number order: a screen 1
+  reopened after 2 and 3 sits right of them. This only matters for Smithay's bookkeeping: nested, the pointer
+  moves between screens through the host.
 
 ## Workspaces
 
@@ -28,9 +29,9 @@ Fills in section 1 of `2026-10-26-orrery-design.md` for one machine (no link yet
     (the `monitor` rule, else the first layout). A layout switch changes only the shown workspace.
 - **When screens come and go:** a new screen numbered k takes workspace k (moving it there intact if it existed
   elsewhere, shown; the screen it left shows its lowest remaining workspace, at worst its own locked one); a
-  removed screen's workspaces move intact (tabs, layouts, focused slot) to the focused remaining screen, hidden:
-  that screen keeps showing what it shows. No other screen's content ever moves. With no screen left, windows
-  wait for one, as today.
+  removed screen's workspaces move intact (tabs, layouts, focused slot) to the focused remaining screen (the first
+  remaining one when the focused screen is the one removed), hidden: that screen keeps showing what it shows. No
+  other screen's content ever moves. With no screen left, windows wait for one, as today.
 - **Reload:** a layout redefined by name changes every workspace using it, hidden ones too, and every screen's
   default layout.
 - **`move-to-workspace N`** carries the focused stack to workspace N (created on the focused screen if needed) as

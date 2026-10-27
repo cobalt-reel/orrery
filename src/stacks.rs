@@ -337,15 +337,22 @@ impl Stacks {
         Self::default()
     }
 
+    /// The number the next screen added takes: the lowest free one, None when all are taken. Backends name an
+    /// output after it before adding it.
+    #[must_use]
+    pub fn next_screen_number(&self) -> Option<u8> {
+        (1..=WORKSPACES).find(|&k| self.monitors.iter().all(|m| m.number != k))
+    }
+
     /// Adds an output as the screen numbered the lowest number free, k, which locks workspace k and shows it:
     /// moved here intact if it lived on another monitor (which, if it showed it, then shows its lowest remaining
     /// one), else made from `default_layout`. Nothing else moves. Pending windows move into it, as one tab of its
     /// first slot. Layouts must be valid (`Layout::validate`); one with no slots, a name already present or a
     /// monitor past `WORKSPACES` is ignored.
     pub fn add_monitor(&mut self, name: &str, area: Rect, default_layout: Layout) {
-        let free = (1..=WORKSPACES).find(|&k| self.monitors.iter().all(|m| m.number != k));
         // Zero slots would break "one slot per layout slot" even in release; anything else invalid is a caller
         // bug.
+        let free = self.next_screen_number();
         let Some(number) = free.filter(|_| !default_layout.slots.is_empty()) else {
             return;
         };
@@ -2111,10 +2118,12 @@ mod tests {
         s.open_stacked(3);
         s.focus_monitor("b");
         s.open_stacked(2);
+        assert_eq!(s.next_screen_number(), Some(4));
         s.remove_monitor("winit");
         assert_invariants(&s);
         // b keeps 2 and c keeps 3; winit's 1 and 4 go to b, hidden and intact.
         assert_eq!(numbers(&s), [2, 3]);
+        assert_eq!(s.next_screen_number(), Some(1));
         assert_eq!(workspaces(&s), [(1, 0), (2, 0), (3, 1), (4, 0)]);
         assert_eq!(shown_numbers(&s), [2, 3]);
         assert_eq!((ws_tabs(&s, 1, 0), ws_tabs(&s, 4, 0)), (vec![vec![1]], vec![vec![4]]));
@@ -2328,10 +2337,12 @@ mod tests {
     #[test]
     fn monitors_past_the_last_workspace_are_ignored() {
         let mut s = Stacks::new();
+        assert_eq!(s.next_screen_number(), Some(1));
         for i in 0..12 {
             s.add_monitor(&format!("m{i}"), UHD, single());
         }
         assert_invariants(&s);
+        assert_eq!(s.next_screen_number(), None);
         assert_eq!(s.monitors.len(), usize::from(WORKSPACES));
         assert_eq!(s.workspaces.len(), usize::from(WORKSPACES));
     }
@@ -2463,11 +2474,40 @@ mod tests {
                             then.iter().all(|(w, home)| Some(*w) == k || now[w] == *home),
                             "seed {seed} step {step}: add_monitor moved another's workspace"
                         );
+                        // Only the screen workspace k left may show something else; focus stays on its screen.
+                        let left = (before.workspaces.iter())
+                            .find(|w| Some(w.number) == k)
+                            .map(|w| before.monitors[w.monitor].name.clone());
+                        let kept = |x: &Stacks| -> Vec<(String, u8)> {
+                            (x.monitors.iter())
+                                .filter(|mon| mon.name != m && Some(&mon.name) != left.as_ref())
+                                .map(|mon| (mon.name.clone(), mon.shown))
+                                .collect()
+                        };
+                        assert_eq!(
+                            kept(&s),
+                            kept(&before),
+                            "seed {seed} step {step}: add_monitor changed a view"
+                        );
+                        assert_eq!(
+                            s.monitors[s.focused_monitor].name, before.monitors[before.focused_monitor].name,
+                            "seed {seed} step {step}: add_monitor moved focus"
+                        );
                     }
                 }
                 11 => {
                     let m = name(&mut rng, &s);
                     s.remove_monitor(&m);
+                    // The others keep showing what they showed.
+                    let mut views = shown_numbers(&before);
+                    if let Some(i) = before.index_of(&m) {
+                        views.remove(i);
+                    }
+                    assert_eq!(
+                        shown_numbers(&s),
+                        views,
+                        "seed {seed} step {step}: remove_monitor changed a view"
+                    );
                     // Its workspaces go intact to the focused screen; nothing else moves.
                     if let Some(focused) = s.monitors.get(s.focused_monitor) {
                         assert_eq!(
