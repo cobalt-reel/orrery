@@ -533,6 +533,19 @@ impl Stacks {
         self.foreign.clear();
     }
 
+    /// What the session says, applied in the one safe order: the old foreign numbers go, then `renames` (from a
+    /// join or a report) are made with `renumber_workspace`, then `foreign` is set. Returns the renames that failed
+    /// (a workspace made here meanwhile on the target, or the source gone): the caller reports again, and the
+    /// session heals the collision then.
+    pub fn apply_session(&mut self, renames: &[(u8, u8)], foreign: impl IntoIterator<Item = u8>) -> Vec<(u8, u8)> {
+        self.clear_foreign();
+        let failed = (renames.iter().copied())
+            .filter(|&(from, to)| !self.renumber_workspace(from, to))
+            .collect();
+        self.set_foreign(foreign);
+        failed
+    }
+
     #[must_use]
     pub fn foreign(&self) -> &BTreeSet<u8> {
         &self.foreign
@@ -2577,6 +2590,30 @@ mod tests {
         assert_eq!(s, before);
     }
 
+    #[test]
+    fn apply_session_renames_then_sets_what_is_owned_elsewhere() {
+        // Screen 1 shows 1; 3 hidden holds [1]. Stale foreign numbers from before.
+        let mut s = wall_monitor();
+        s.workspace(3);
+        s.open_stacked(1);
+        s.workspace(1);
+        s.set_foreign([4, 5]);
+        // 4 was foreign: the old set goes first, so renaming onto it works.
+        assert_eq!(s.apply_session(&[(1, 4), (3, 5)], [1, 2, 3]), []);
+        assert_invariants(&s);
+        assert_eq!(numbers(&s), [4]);
+        assert_eq!(workspaces(&s), [(4, 0), (5, 0)]);
+        assert_eq!(s.foreign(), &BTreeSet::from([1, 2, 3]));
+        // A rename onto a number made here meanwhile, or from one gone: returned, nothing renamed.
+        s.set_foreign([]);
+        s.workspace(6);
+        s.open_stacked(2);
+        assert_eq!(s.apply_session(&[(5, 6), (8, 9)], [5, 7]), [(5, 6), (8, 9)]);
+        assert_eq!(workspaces(&s), [(4, 0), (5, 0), (6, 0)]);
+        assert_eq!(s.foreign(), &BTreeSet::from([7]), "here wins");
+        assert_invariants(&s);
+    }
+
     /// xorshift64: enough randomness for a reproducible walk, no dependency.
     struct Rng(u64);
 
@@ -2614,19 +2651,29 @@ mod tests {
             .collect()
     }
 
-    /// One seeded walk of 1,000 operations; returns the most windows open at once, the steps ending with a mark,
-    /// those ending with a window in a hidden workspace and those ending with numbers owned elsewhere.
-    fn walk(seed: u64) -> (usize, usize, usize, usize) {
+    /// What one walk visited, to check it went everywhere.
+    #[derive(Default)]
+    struct Visits {
+        /// The most windows open at once.
+        most: usize,
+        /// Steps ending with a mark, with a window in a hidden workspace, with numbers owned elsewhere.
+        marked: usize,
+        hidden: usize,
+        foreign: usize,
+        /// `Remote` outcomes, successful renumbers.
+        remote: usize,
+        renumbered: usize,
+    }
+
+    /// One seeded walk of 1,000 operations.
+    fn walk(seed: u64) -> Visits {
         let layouts = [layout("wall"), layout("halves"), single()];
         let mut rng = Rng(seed);
         let mut s = wall_monitor();
         let mut live: BTreeSet<WinId> = BTreeSet::new();
         let mut next_id: WinId = 1;
         let mut next_monitor = 0;
-        let mut most = 0;
-        let mut marked_steps = 0;
-        let mut hidden_steps = 0;
-        let mut foreign_steps = 0;
+        let mut v = Visits::default();
         for step in 0..1000 {
             let pick = |rng: &mut Rng, live: &BTreeSet<WinId>| -> WinId {
                 // Mostly a live id; sometimes one that never existed.
@@ -2779,6 +2826,7 @@ mod tests {
                 20 | 21 => {
                     let n = number(&mut rng);
                     let outcome = s.workspace(n);
+                    v.remote += usize::from(matches!(outcome, Outcome::Remote(_)));
                     if before.foreign.contains(&n) {
                         assert_eq!(outcome, Outcome::Remote(n), "seed {seed} step {step}: workspace {n}");
                         assert_eq!(s, before, "seed {seed} step {step}: remote workspace {n} acted here");
@@ -2799,6 +2847,7 @@ mod tests {
                 22 => {
                     let n = number(&mut rng);
                     let outcome = s.move_to_workspace(n);
+                    v.remote += usize::from(matches!(outcome, Outcome::Remote(_)));
                     if before.foreign.contains(&n) {
                         assert_eq!(outcome, Outcome::Remote(n), "seed {seed} step {step}: move {n}");
                         assert_eq!(s, before, "seed {seed} step {step}: remote move {n} acted here");
@@ -2825,7 +2874,15 @@ mod tests {
                 }
                 25 => s.clear_foreign(),
                 26 => {
-                    let (from, to) = (number(&mut rng), number(&mut rng));
+                    // Mostly onto a free number, so renumbers happen; sometimes anything, so refusals do.
+                    let from = number(&mut rng);
+                    let free: Vec<u8> = (1..=WORKSPACES)
+                        .filter(|k| s.index_of_workspace(*k).is_none() && !s.foreign.contains(k))
+                        .collect();
+                    let to = match free.len() as u64 {
+                        n if n > 0 && rng.below(4) > 0 => free[rng.below(n) as usize],
+                        _ => number(&mut rng),
+                    };
                     let fits = before.index_of_workspace(from).is_some()
                         && (1..=WORKSPACES).contains(&to)
                         && before.index_of_workspace(to).is_none()
@@ -2835,6 +2892,7 @@ mod tests {
                         fits,
                         "seed {seed} step {step}: renumber {from} to {to}"
                     );
+                    v.renumbered += usize::from(fits);
                     if fits {
                         // Everything as it was under the new number: tabs, homes, views, focus.
                         let renamed = |k: u8| if k == from { to } else { k };
@@ -2883,36 +2941,37 @@ mod tests {
             }
             assert_invariants(&s);
             assert_eq!(ids(&s), live, "seed {seed} step {step}");
-            most = most.max(live.len());
-            marked_steps += usize::from(!s.attention.is_empty());
-            hidden_steps += usize::from(s.placements().any(|p| !p.shown));
-            foreign_steps += usize::from(!s.foreign.is_empty());
+            v.most = v.most.max(live.len());
+            v.marked += usize::from(!s.attention.is_empty());
+            v.hidden += usize::from(s.placements().any(|p| !p.shown));
+            v.foreign += usize::from(!s.foreign.is_empty());
         }
-        (most, marked_steps, hidden_steps, foreign_steps)
+        v
     }
 
     #[test]
     fn random_walks_lose_nothing() {
         let mut seed: u64 = 0x51c3_9a07_d2e4;
+        let (mut remote, mut renumbered) = (0, 0);
         for _ in 0..32 {
-            let (most, marked_steps, hidden_steps, foreign_steps) = walk(seed);
+            let v = walk(seed);
+            assert!(v.marked > 50, "seed {seed}: marks held on {} steps only", v.marked);
+            assert!(v.hidden > 50, "seed {seed}: windows hidden on {} steps only", v.hidden);
             assert!(
-                marked_steps > 50,
-                "seed {seed}: marks held on {marked_steps} steps only"
+                v.foreign > 50,
+                "seed {seed}: numbers owned elsewhere on {} steps only",
+                v.foreign
             );
             assert!(
-                hidden_steps > 50,
-                "seed {seed}: windows hidden on {hidden_steps} steps only"
+                (4..=40).contains(&v.most),
+                "seed {seed}: at most {} open, the walk is unbalanced",
+                v.most
             );
-            assert!(
-                foreign_steps > 50,
-                "seed {seed}: numbers owned elsewhere on {foreign_steps} steps only"
-            );
-            assert!(
-                (4..=40).contains(&most),
-                "seed {seed}: at most {most} open, the walk is unbalanced"
-            );
+            remote += v.remote;
+            renumbered += v.renumbered;
             seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1) | 1;
         }
+        assert!(remote > 100, "{remote} remote outcomes in all");
+        assert!(renumbered > 40, "{renumbered} renumbers in all");
     }
 }
