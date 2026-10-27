@@ -275,9 +275,8 @@ impl Orrery {
 
     /// The host window lost keyboard focus: no release will arrive for what is down now. Input away comes back (the
     /// other machine lets go of everything, nothing is pressed here); every pressed key is released through the usual
-    /// path (a swallowed key
-    /// stays swallowed, others reach the client), so neither the seat's modifier state nor a client is left with
-    /// Alt held; then held binds and keys are forgotten.
+    /// path (a swallowed key stays swallowed, others reach the client), so neither the seat's modifier state nor a
+    /// client is left with Alt held; then held binds and keys are forgotten.
     pub fn keyboard_focus_lost(&mut self) {
         // Forgotten first: input coming home presses none of them here only to release them at once.
         if let Some(crossing) = self.crossing() {

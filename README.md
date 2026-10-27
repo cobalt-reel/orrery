@@ -491,6 +491,8 @@ draws the pointer itself: the cursor its client under it asked for, else a small
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
 - Nested, one output per window, scale 1; no layer-shell, no Xwayland, no touch input.
 - Nested, `open-screen` holds orrery until the host has configured the new window (milliseconds).
+- Input crossing: a keyboard layout switched while input is on a satellite (a group toggle key, say) switches only
+  there; the primary comes home on the layout it was on, and the next handoff sends that one.
 
 ## First nested session: checklist
 
