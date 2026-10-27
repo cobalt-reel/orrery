@@ -587,10 +587,10 @@ impl Orrery {
 
     /// Reads the config file again. A good one replaces the config (binds, colours, layouts: each monitor takes
     /// its layout's new definition by name, or after a fallback start its monitor rule; `stacking` as
-    /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets `config_error`, which shows as the red
-    /// bar until a good config loads. A file gone while running (an editor between delete and write, say) keeps
-    /// the running config: the built-in one stands in only at startup. That is an error answer for `reload` but
-    /// not a `config_error`.
+    /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets
+    /// `config_error`, which shows as the red bar until a good config loads. A file gone while running (an editor
+    /// between delete and write, say) keeps the running config: the built-in one stands in only at startup. That
+    /// is an error answer for `reload` but not a `config_error`.
     pub fn reload(&mut self) -> Result<(), String> {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());

@@ -18,7 +18,9 @@ enum Command {
     Run(RunArgs),
     #[command(
         about = format!("Send one request to a running {NAME}"),
-        subcommand_negates_reqs = true
+        subcommand_negates_reqs = true,
+        disable_help_subcommand = true,
+        override_usage = msg_usage()
     )]
     Msg {
         #[arg(long, help = socket_help())]
@@ -64,6 +66,12 @@ struct RunArgs {
 // The default paths in `--help`, from `NAME` (doc comments cannot hold it).
 fn socket_help() -> String {
     format!("The control socket. Default: `$XDG_RUNTIME_DIR/{NAME}.sock`")
+}
+
+/// `spawn` is the only subcommand; clap's own second form (`msg <COMMAND>`) would hide `--socket`.
+fn msg_usage() -> String {
+    let socket = "[--socket <SOCKET>]";
+    format!("{NAME} msg {socket} <REQUEST>...\n       {NAME} msg {socket} spawn <PROGRAM> [ARGS]...")
 }
 
 fn config_default() -> String {
@@ -251,5 +259,21 @@ mod tests {
             panic!("msg parses as words");
         };
         assert_eq!(request, ["layout", "spawn", "x"]);
+        // `help` is no subcommand (an unknown request, answered as such), and a program's --help is its own.
+        let Some(Command::Msg {
+            request, spawn: None, ..
+        }) = Cli::parse_from([NAME, "msg", "help"]).command
+        else {
+            panic!("msg help parses as words");
+        };
+        assert_eq!(request, ["help"]);
+        let Some(Command::Msg {
+            spawn: Some(MsgSpawn::Spawn { argv }),
+            ..
+        }) = Cli::parse_from([NAME, "msg", "spawn", "kitty", "--help"]).command
+        else {
+            panic!("msg spawn parses");
+        };
+        assert_eq!(argv, ["kitty", "--help"]);
     }
 }

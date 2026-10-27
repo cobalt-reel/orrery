@@ -204,12 +204,17 @@ impl Orrery {
         }
     }
 
-    /// A bind's action. Failures are logged: a key has nowhere to answer.
+    /// A bind's action. Failures are logged: a key has nowhere to answer. A program that would not start is a
+    /// warning; a request with nothing to act on (no window to close, say) is not.
     pub fn run_action(&mut self, action: Action) {
         if let Some(request) = action_request(&action) {
             let response = self.handle_request(request);
             if let Some(e) = response.error {
-                tracing::info!("{action:?}: {e}");
+                if matches!(action, Action::Spawn(_)) {
+                    tracing::warn!("{action:?}: {e}");
+                } else {
+                    tracing::info!("{action:?}: {e}");
+                }
             }
         }
     }
