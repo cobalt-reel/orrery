@@ -162,28 +162,23 @@ pub fn config_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
 /// layout) names, as if orrery had started with this config. Stacks follow `set_layout`'s rules.
 pub fn apply_monitor_rules(stacks: &mut Stacks, config: &Config) {
     let names: Vec<String> = stacks.monitors().iter().map(|m| m.name().to_owned()).collect();
-    for name in names {
-        let current = stacks
-            .monitors()
-            .iter()
-            .find(|m| m.name() == name)
-            .map(|m| m.layout().clone());
-        if let Some(layout) = layout_for_output(config, &name)
+    for (mi, name) in names.iter().enumerate() {
+        let current = stacks.shown(mi).map(|w| w.layout().clone());
+        if let Some(layout) = layout_for_output(config, name)
             && current.as_ref() != Some(&layout)
         {
-            stacks.set_layout(&name, layout);
+            stacks.set_layout(name, layout);
         }
     }
 }
 
-/// After a reload, each monitor takes the new definition of its layout, by name. A monitor whose layout the new
-/// config no longer has keeps the one it shows (not an error); those are returned as (monitor, layout).
+/// After a reload, each monitor's shown workspace takes the new definition of its layout, by name. A monitor whose
+/// layout the new config no longer has keeps the one it shows (not an error); those are returned as (monitor,
+/// layout).
 pub fn reapply_layouts(stacks: &mut Stacks, config: &Config) -> Vec<(String, String)> {
     let mut kept = Vec::new();
-    let current: Vec<(String, Layout)> = stacks
-        .monitors()
-        .iter()
-        .map(|m| (m.name().to_owned(), m.layout().clone()))
+    let current: Vec<(String, Layout)> = (stacks.monitors().iter().enumerate())
+        .filter_map(|(mi, m)| Some((m.name().to_owned(), stacks.shown(mi)?.layout().clone())))
         .collect();
     for (monitor, layout) in current {
         match config.layouts.iter().find(|l| l.name == layout.name) {
@@ -440,7 +435,7 @@ impl Orrery {
                     self.stacks.open_stacked(id);
                 }
             }
-            Landing::NewTab { monitor, slot } => self.stacks.open_tab(id, Some(&monitor), Some(slot)),
+            Landing::NewTab { workspace, slot } => self.stacks.open_tab(id, Some(workspace), Some(slot)),
             Landing::Stacked => self.stacks.open_stacked(id),
             Landing::Tab => self.stacks.open_tab(id, None, None),
         }
@@ -465,9 +460,9 @@ impl Orrery {
         let target = placed
             .then(|| self.launches.claim_token(token, now))
             .flatten()
-            .map(|l| (l.monitor.clone(), l.slot));
-        if let Some((monitor, slot)) = target {
-            self.stacks.move_window_to_tab(id, &monitor, slot);
+            .map(|l| (l.workspace, l.slot));
+        if let Some((workspace, slot)) = target {
+            self.stacks.move_window_to_tab(id, workspace, slot);
         } else {
             let backed = (self.xdg_activation_state).remove_token(&XdgActivationToken::from(token.to_owned()));
             if !(backed && self.stacks.focus_window(id)) {
@@ -558,12 +553,12 @@ impl Orrery {
             .or_else(|| self.stacks.focused_rect())
     }
 
-    /// Makes Wayland match the stacks, in one pass over `placements()`: the top of a slot's current tab is mapped
-    /// at the slot's rectangle; every other window is unmapped but stays alive. Both are configured to the slot's
-    /// size (so showing one later needs no round trip), tiled on every edge, activated only when focused. Waiting
-    /// windows (no buffer yet) are unmapped and configured to where they would open (the focused slot). Opened
-    /// windows in no slot (pending without a monitor) are unmapped and keep their size; they are neither drawn
-    /// nor focused. Keyboard and pointer focus then follow.
+    /// Makes Wayland match the stacks, in one pass over `placements()`: the top of a slot's current tab in a shown
+    /// workspace is mapped at the slot's rectangle; every other window (hidden workspaces' too) is unmapped but
+    /// stays alive. Both are configured to the slot's size (so showing one later needs no round trip), tiled on
+    /// every edge, activated only when focused. Waiting windows (no buffer yet) are unmapped and configured to where
+    /// they would open (the focused slot). Opened windows in no slot (pending without a monitor) are unmapped and
+    /// keep their size; they are neither drawn nor focused. Keyboard and pointer focus then follow.
     pub fn arrange(&mut self) {
         let mut placed = HashSet::with_capacity(self.windows.len());
         for p in self.stacks.placements() {
@@ -572,7 +567,7 @@ impl Orrery {
             };
             placed.insert(p.win);
             configure(window, p.rect, p.focused);
-            if p.on_top {
+            if p.shown && p.on_top {
                 let at = (p.rect.x, p.rect.y).into();
                 if self.space.element_location(window) != Some(at) {
                     self.space.map_element(window.clone(), at, false);
@@ -1030,7 +1025,7 @@ mod tests {
 
         // Unchanged layouts: nothing moves, nothing kept.
         assert!(reapply_layouts(&mut s, &c).is_empty());
-        assert_eq!(s.monitors()[0].layout(), &wall);
+        assert_eq!(s.shown(0).unwrap().layout(), &wall);
 
         // wall redefined, halves gone.
         let mut wide = wall.clone();
@@ -1044,8 +1039,8 @@ mod tests {
             ..c
         };
         assert_eq!(reapply_layouts(&mut s, &new), [("b".to_owned(), "halves".to_owned())]);
-        assert_eq!(s.monitors()[0].layout(), &wide);
-        assert_eq!(s.monitors()[1].layout(), &halves);
+        assert_eq!(s.shown(0).unwrap().layout(), &wide);
+        assert_eq!(s.shown(1).unwrap().layout(), &halves);
         assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
     }
 
@@ -1094,8 +1089,8 @@ mod tests {
         s.add_monitor("other", area, halves.clone());
         s.open_stacked(1);
         apply_monitor_rules(&mut s, &c);
-        assert_eq!(s.monitors()[0].layout().name, "wall", "the winit rule");
-        assert_eq!(s.monitors()[1].layout().name, "wall", "no rule: the first layout");
+        assert_eq!(s.shown(0).unwrap().layout().name, "wall", "the winit rule");
+        assert_eq!(s.shown(1).unwrap().layout().name, "wall", "no rule: the first layout");
         assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
     }
 }

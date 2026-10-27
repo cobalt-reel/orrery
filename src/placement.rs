@@ -20,8 +20,8 @@ pub struct Launch {
     pub pid: u32,
     /// The xdg-activation token handed to the program.
     pub token: String,
-    /// The monitor (by name) and slot focused when it was started.
-    pub monitor: String,
+    /// The workspace (by number) and slot focused when it was started.
+    pub workspace: u8,
     pub slot: usize,
     pub at: Instant,
     /// A window has opened for it; a launch places one window at most.
@@ -99,7 +99,7 @@ pub enum Landing {
     OnParent(WinId),
     /// A new tab in a launch's target, current and focused (`Stacks::open_tab` falls back to the focused slot
     /// when the target is gone).
-    NewTab { monitor: String, slot: usize },
+    NewTab { workspace: u8, slot: usize },
     /// On top of the focused slot's current stack (stacking on).
     Stacked,
     /// A new tab in the focused slot (stacking off).
@@ -127,7 +127,7 @@ pub fn decide(
     };
     match launch {
         Some(l) => Landing::NewTab {
-            monitor: l.monitor.clone(),
+            workspace: l.workspace,
             slot: l.slot,
         },
         None if stacking => Landing::Stacked,
@@ -168,7 +168,7 @@ mod tests {
         Launch {
             pid,
             token: format!("token-{pid}"),
-            monitor: "m".into(),
+            workspace: 1,
             slot,
             at,
             claimed: false,
@@ -176,10 +176,7 @@ mod tests {
     }
 
     fn tab(slot: usize) -> Landing {
-        Landing::NewTab {
-            monitor: "m".into(),
-            slot,
-        }
+        Landing::NewTab { workspace: 1, slot }
     }
 
     fn launches(list: &[Launch]) -> Launches {

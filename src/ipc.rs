@@ -213,8 +213,8 @@ impl Response {
 }
 
 impl StateView {
-    /// The state as `orrery msg state` shows it; `info` gives a window's (app_id, title). Pending windows have
-    /// no slot and are not listed.
+    /// The state as `orrery msg state` shows it; `info` gives a window's (app_id, title). A monitor lists the
+    /// slots of the workspace it shows. Pending windows have no slot and are not listed.
     pub fn new(
         stacks: &Stacks,
         stacking: bool,
@@ -225,20 +225,21 @@ impl StateView {
             .monitors()
             .iter()
             .enumerate()
-            .map(|(mi, mon)| {
+            .filter_map(|(mi, mon)| Some((mi, mon, stacks.shown(mi)?)))
+            .map(|(mi, mon, ws)| {
                 let focused = mi == stacks.focused_monitor();
-                let slots = mon
+                let slots = ws
                     .layout()
                     .slots
                     .iter()
-                    .zip(mon.layout().rects(mon.area()))
-                    .zip(mon.slots())
+                    .zip(ws.layout().rects(mon.area()))
+                    .zip(ws.slots())
                     .enumerate()
                     .map(|(index, ((spec, rect), slot))| SlotView {
                         index,
                         name: spec.name.clone(),
                         rect,
-                        focused: focused && index == mon.focus(),
+                        focused: focused && index == ws.focus(),
                         tabs: slot
                             .tabs()
                             .iter()
@@ -259,7 +260,7 @@ impl StateView {
                     .collect();
                 MonitorView {
                     name: mon.name().to_owned(),
-                    layout: mon.layout().name.clone(),
+                    layout: ws.layout().name.clone(),
                     focused,
                     slots,
                 }
@@ -726,8 +727,8 @@ mod tests {
             monitor: Some("other".into()),
         };
         assert_eq!(req.apply(&mut s, &config), Ok(()));
-        assert_eq!(s.monitors()[1].layout().name, "wall");
-        assert_eq!(s.monitors()[0].layout().name, "wall");
+        assert_eq!(s.shown(1).unwrap().layout().name, "wall");
+        assert_eq!(s.shown(0).unwrap().layout().name, "wall");
         assert_eq!(s.focused_monitor(), 0);
     }
 

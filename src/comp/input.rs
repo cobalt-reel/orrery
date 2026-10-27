@@ -150,15 +150,20 @@ pub fn action_request(action: &Action) -> Option<Request> {
     })
 }
 
-/// The monitor and slot whose rectangle holds the point, empty slots included.
+/// The monitor and slot (of its shown workspace) whose rectangle holds the point, empty slots included.
 #[must_use]
 pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
     let inside = |r: Rect| x >= r.x && y >= r.y && x - r.x < r.w && y - r.y < r.h;
-    stacks.monitors().iter().find_map(|m| {
+    stacks.monitors().iter().enumerate().find_map(|(mi, m)| {
         if !inside(m.area()) {
             return None;
         }
-        let slot = m.layout().rects(m.area()).into_iter().position(inside)?;
+        let slot = stacks
+            .shown(mi)?
+            .layout()
+            .rects(m.area())
+            .into_iter()
+            .position(inside)?;
         Some((m.name().to_owned(), slot))
     })
 }
@@ -167,9 +172,10 @@ pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
 #[must_use]
 pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
     let (name, slot) = slot_at(stacks, x, y)?;
-    let mon = stacks.monitors().iter().find(|m| m.name() == name)?;
-    let top = mon.slots().get(slot)?.top()?;
-    let rect = *mon.layout().rects(mon.area()).get(slot)?;
+    let mi = stacks.monitors().iter().position(|m| m.name() == name)?;
+    let ws = stacks.shown(mi)?;
+    let top = ws.slots().get(slot)?.top()?;
+    let rect = *ws.layout().rects(stacks.monitors()[mi].area()).get(slot)?;
     Some((top, rect))
 }
 
@@ -566,5 +572,25 @@ mod tests {
         }
         assert_eq!(slot_at(&s, 900, 10), None);
         assert_eq!(slot_at(&s, -1, 10), None);
+    }
+
+    #[test]
+    fn top_at_reaches_only_the_shown_workspace() {
+        let c = config::default_config();
+        let wall = c.layouts.iter().find(|l| l.name == "wall").unwrap().clone();
+        let mut s = Stacks::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 900,
+        };
+        s.add_monitor("m", area, wall.clone());
+        s.open_stacked(1);
+        let r = wall.rects(area)[0];
+        assert_eq!(top_at(&s, r.x, r.y), Some((1, r)));
+        s.workspace(2);
+        assert_eq!(top_at(&s, r.x, r.y), None, "1 is hidden");
+        assert_eq!(slot_at(&s, r.x, r.y), Some(("m".into(), 0)), "the slot is still there");
     }
 }

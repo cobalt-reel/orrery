@@ -64,12 +64,15 @@ pub struct Scene {
     pub solids: Vec<Solid>,
 }
 
-/// The scene for the monitor named `monitor` (empty when there is none). `config_error` adds the red bar, in
-/// front of everything.
+/// The scene for the monitor named `monitor`, its shown workspace (empty when there is none). `config_error` adds
+/// the red bar, in front of everything.
 #[must_use]
 pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, config_error: bool) -> Scene {
     let mut out = Scene::default();
     let Some((mi, mon)) = stacks.monitors().iter().enumerate().find(|(_, m)| m.name() == monitor) else {
+        return out;
+    };
+    let Some(ws) = stacks.shown(mi) else {
         return out;
     };
     let area = mon.area();
@@ -78,17 +81,17 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
         y: r.y - area.y,
         ..r
     };
-    let rects = mon.layout().rects(area);
+    let rects = ws.layout().rects(area);
     let mut borders = Vec::new();
     let mut badges = Vec::new();
     let mut strips = Vec::new();
-    for (i, (slot, rect)) in mon.slots().iter().zip(rects).enumerate() {
+    for (i, (slot, rect)) in ws.slots().iter().zip(rects).enumerate() {
         let rect = local(rect);
         if let Some(top) = slot.top() {
             out.windows.push((top, rect));
         }
         // The focused slot is outlined even when empty: it is where the next window opens.
-        if mi == stacks.focused_monitor() && i == mon.focus() {
+        if mi == stacks.focused_monitor() && i == ws.focus() {
             borders.extend(border(rect, colors.focus));
         }
         let tabs: Vec<StripTab> = slot
@@ -466,6 +469,18 @@ mod tests {
                 h: 8
             }]
         );
+    }
+
+    #[test]
+    fn only_the_shown_workspace_is_drawn() {
+        let (mut s, rects, colors) = wall();
+        s.open_stacked(1);
+        s.workspace(2);
+        s.focus_slot(crate::layout::Dir::Right);
+        s.open_stacked(2);
+        let scene = scene(&s, "m", &colors, false, false);
+        assert_eq!(scene.windows, [(2, rects[3])]);
+        assert!(of_color(&scene, colors.focus).iter().all(|e| inside(*e, rects[3])));
     }
 
     #[test]

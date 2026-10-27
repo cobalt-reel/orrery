@@ -79,19 +79,19 @@ impl Orrery {
         }
     }
 
-    /// A launch of `pid` aimed at the focused monitor's focused slot as it is now. Without a monitor there is no
+    /// A launch of `pid` aimed at the focused workspace's focused slot as it is now. Without a monitor there is no
     /// target, and nothing is recorded: the window goes to `pending` either way.
     fn record_launch(&mut self, pid: u32, token: String) {
         let now = Instant::now();
         self.launches.expire(now);
-        let Some(mon) = self.stacks.monitors().get(self.stacks.focused_monitor()) else {
+        let Some(ws) = self.stacks.shown(self.stacks.focused_monitor()) else {
             return;
         };
         self.launches.push(Launch {
             pid,
             token,
-            monitor: mon.name().to_owned(),
-            slot: mon.focus(),
+            workspace: ws.number(),
+            slot: ws.focus(),
             at: now,
             claimed: false,
         });
