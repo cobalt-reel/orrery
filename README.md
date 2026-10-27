@@ -379,20 +379,26 @@ ssh -R 7340:127.0.0.1:7340 side       # on the primary; the satellite's config s
 - **`move-to-workspace N`** to a number on another machine is refused: windows never cross machines.
 - **`orrery msg --to MACHINE <request>`** runs any request on that machine and prints its answer (`--to side
   spawn foot`, `--to side state`); on the primary, through the link (an error after 5 s without an answer); naming
-  the machine itself runs it there; a satellite sends nothing on.
+  the machine itself runs it there; a satellite sends nothing on. An answer must fit one link frame (about 64 KB):
+  a `--to … state` of a machine with very many windows comes back as an error saying so.
 - **Dropping:** a satellite that loses the primary keeps working alone with every workspace number it has, and
   tries again every 1 s, backing off to every 5 s; the primary frees its numbers meanwhile. On the rejoin it keeps
   them where still free. A link silent for 10 s counts as lost.
-- `listen`, `primary` and `name` take effect when orrery starts; a reload reads the secret file again (a secret
-  that cannot be read is the `config_error`, and the one read before stays in use).
+- `listen`, `primary`, `name` and the `secret-file` path take effect when orrery starts. A reload reads the secret
+  file's contents again: a different secret drops every link at once, and satellites get back in once they have
+  it too (rewrite the file on every machine, then reload each); a secret that cannot be read is the
+  `config_error`, and the one read before stays in use.
+- The primary refuses a connection beyond 8 still joining, or beyond 2 from one IP address. A satellite whose
+  name is held by a link silent for 4 s (a machine that froze or lost power) takes its place instead of being
+  refused.
 
 `state.session` shows this machine's place: `machine` (its name), `role` (`primary` or `satellite`), `listen` (the
 primary's address, with the port it picked for 0), `primary` (a satellite's primary, as configured), `foreign` (the
 workspace numbers other machines own), `error` (why a link last failed, until one opens), and `machines`: on the
 primary every machine in the session (itself first, then the satellites in join order), on a satellite itself, each
 as `{ name, role, monitors, workspaces, latency_ms, connected, focused }` (`monitors` as `{ name, number }`;
-`latency_ms` the link's round trip, pinged every 2 s, null for the primary itself; `focused`: the session's focus
-marker is there).
+`latency_ms` the link's round trip, pinged every 2 s, null for the primary itself and while a ping is overdue;
+`focused`: the session's focus marker is there).
 
 ## Limits
 

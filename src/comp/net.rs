@@ -33,8 +33,12 @@ use crate::stacks::Stacks;
 pub const PING: Duration = Duration::from_secs(2);
 /// A link that hears nothing for this long is dropped: the other end went without closing (a cable, a crash).
 pub const SILENCE: Duration = Duration::from_secs(10);
-/// The primary's connections not yet joined, at most: one more is closed at once.
+/// The primary's connections not yet joined, at most, in all and from one IP address: one more is closed at once.
 pub const MAX_OPENING: usize = 8;
+pub const MAX_OPENING_PER_ADDRESS: usize = 2;
+/// A Hello naming a satellite whose link has been silent this long takes its place (it is gone, its link not yet
+/// dropped) instead of being refused as a duplicate.
+pub const STALE: Duration = PING.saturating_mul(2);
 /// A satellite waits this long before trying the primary again, doubling each failure up to `BACKOFF_MAX`.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -108,7 +112,7 @@ struct Conn {
     joined: Option<String>,
     /// The foreign numbers this satellite was last given (primary).
     foreign: BTreeSet<u8>,
-    /// The ping in flight: its nonce and when it went.
+    /// The ping in flight, its nonce and when it went: no other is sent until it is answered, however late.
     ping: Option<(u64, Instant)>,
     latency: Option<Duration>,
     /// When it last sent anything.
@@ -123,6 +127,9 @@ struct Pending {
     /// Where the answer goes; None for a routed `workspace` (a failure is logged).
     reply: Option<Reply>,
     timer: Option<RegistrationToken>,
+    /// A routed `workspace`: if it fails, the satellite is asked to report (`resync`), freeing a number the session
+    /// reserved for it that it never made.
+    resync: bool,
 }
 
 /// This machine's name in a session: the config's `name`, else the hostname, else `NAME`.
@@ -187,6 +194,28 @@ fn send(conn: &mut Conn, msg: &Message) -> Result<(), SendError> {
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The link's round trip for `state`: unknown (None) while a ping is overdue, so a link that stopped answering does
+/// not show its last good time.
+fn latency_ms(conn: &Conn) -> Option<u64> {
+    match conn.ping {
+        Some((_, at)) if at.elapsed() > PING => None,
+        _ => conn.latency.map(millis),
+    }
+}
+
+/// Asks a satellite to report what it has: any `Renames` does (`satellite_got`), and its report replaces what the
+/// session holds for it.
+fn resync(conn: &mut Conn, foreign: BTreeSet<u8>) {
+    conn.foreign.clone_from(&foreign);
+    let _ = send(
+        conn,
+        &Message::Renames {
+            renames: Vec::new(),
+            foreign,
+        },
+    );
 }
 
 impl Pending {
@@ -282,12 +311,19 @@ impl Orrery {
         }
     }
 
-    /// Reads the secret file again (on reload): the new secret is used by connections from now on. The error, for
-    /// `config_error`, when it cannot be read (the old secret stays).
+    /// Reads the secret file again (on reload). A different secret drops every link (opened on the old one): the
+    /// satellites connect again, and get in once they have it too. The error, for `config_error`, when it cannot be
+    /// read (the old secret stays).
     pub fn link_reload(&mut self) -> Option<String> {
         let net = self.net.as_mut()?;
         match Secret::load(&net.secret_file) {
             Ok(s) => {
+                if net.secret.as_ref().is_some_and(|old| *old != s) && !net.conns.is_empty() {
+                    tracing::warn!("the secret changed: dropping every link (they open again on the new one)");
+                    for conn in net.conns.values_mut() {
+                        conn.dropped.get_or_insert_with(|| "the secret changed".into());
+                    }
+                }
                 net.secret = Some(s);
                 None
             }
@@ -389,8 +425,16 @@ impl Orrery {
             tracing::debug!("no secret: closing the connection from {peer}");
             return;
         };
-        if net.conns.values().filter(|c| c.joined.is_none()).count() >= MAX_OPENING {
+        let opening = || net.conns.values().filter(|c| c.joined.is_none());
+        if opening().count() >= MAX_OPENING {
             tracing::warn!("{MAX_OPENING} connections still joining: closing the one from {peer}");
+            return;
+        }
+        if opening().filter(|c| c.peer.ip() == peer.ip()).count() >= MAX_OPENING_PER_ADDRESS {
+            tracing::debug!(
+                "{MAX_OPENING_PER_ADDRESS} connections from {} still joining: closing one",
+                peer.ip()
+            );
             return;
         }
         let link = Link::new(Role::Primary, secret);
@@ -522,6 +566,9 @@ impl Orrery {
 
     /// A satellite's message, on the primary. Its link has checked it may come here now.
     fn primary_got(&mut self, id: u64, msg: Message) {
+        if let Message::Hello { name, .. } = &msg {
+            self.link_take_over(id, name);
+        }
         let handle = self.loop_handle.clone();
         let Some(Net {
             side: Side::Primary(p),
@@ -568,7 +615,8 @@ impl Orrery {
                         *error = None;
                     }
                     Err(why) => {
-                        tracing::warn!("refused {name:?} from {}: {why}", conn.peer);
+                        // Logged once it is dropped (`link_lost`), with repeats quieter.
+                        tracing::debug!("refused {name:?} from {}: {why}", conn.peer);
                         conn.link.refuse(why);
                     }
                 }
@@ -594,12 +642,20 @@ impl Orrery {
                 }
             }
             Message::CommandAnswer { id: command, response } => {
-                if let Some(pending) = p.commands.remove(&command) {
-                    if let Some(t) = &pending.timer {
-                        handle.remove(*t);
-                    }
-                    pending.answer(response);
+                // Only the machine it was sent to answers a command.
+                let ours =
+                    (p.commands.get(&command)).is_some_and(|c| Some(c.machine.as_str()) == conn.joined.as_deref());
+                let Some(pending) = ours.then(|| p.commands.remove(&command)).flatten() else {
+                    tracing::debug!("{}: an answer to no command of its own ({command})", conn.peer);
+                    return;
+                };
+                if let Some(t) = &pending.timer {
+                    handle.remove(*t);
                 }
+                if pending.resync && !response.ok {
+                    resync(conn, p.session.foreign(&pending.machine));
+                }
+                pending.answer(response);
             }
             other => tracing::debug!("unexpected on the primary: {other:?}"),
         }
@@ -718,18 +774,37 @@ impl Orrery {
             .map(|(&id, _)| id)
             .collect();
         for id in done {
-            let Some(conn) = self.net.as_mut().and_then(|n| n.conns.remove(&id)) else {
-                continue;
-            };
-            for t in [conn.io, conn.writer, conn.deadline].into_iter().flatten() {
-                self.loop_handle.remove(t);
-            }
-            let why = match (&conn.dropped, conn.link.closed()) {
-                (Some(why), _) => why.clone(),
-                (None, Some(closed)) => closed.to_string(),
-                (None, None) => "closed".into(),
-            };
-            self.link_lost(conn, why);
+            self.link_drop(id, None);
+        }
+    }
+
+    /// Drops connection `id` now, for `why` (else the reason it was given up on, or its link closed for).
+    fn link_drop(&mut self, id: u64, why: Option<String>) {
+        let Some(conn) = self.net.as_mut().and_then(|n| n.conns.remove(&id)) else {
+            return;
+        };
+        for t in [conn.io, conn.writer, conn.deadline].into_iter().flatten() {
+            self.loop_handle.remove(t);
+        }
+        let why = why.unwrap_or_else(|| match (&conn.dropped, conn.link.closed()) {
+            (Some(why), _) => why.clone(),
+            (None, Some(closed)) => closed.to_string(),
+            (None, None) => "closed".into(),
+        });
+        self.link_lost(conn, why);
+    }
+
+    /// A Hello on connection `id` names `name`, held by another link silent for `STALE`: that machine is gone (its
+    /// link not dropped yet), so that link is dropped now and the newcomer joins in its place.
+    fn link_take_over(&mut self, id: u64, name: &str) {
+        let Some(net) = &self.net else {
+            return;
+        };
+        let stale = (net.conns.iter())
+            .find(|(other, c)| **other != id && c.joined.as_deref() == Some(name) && c.heard.elapsed() > STALE)
+            .map(|(&other, _)| other);
+        if let (Some(stale), Some(peer)) = (stale, net.conns.get(&id).map(|c| c.peer)) {
+            self.link_drop(stale, Some(format!("replaced by a new connection from {peer}")));
         }
     }
 
@@ -756,8 +831,14 @@ impl Orrery {
                     }
                 }
                 None => {
-                    tracing::warn!("a connection from {} did not join: {why}", conn.peer);
-                    net.error = Some(format!("{}: {why}", conn.peer));
+                    // The same failure from the same address again (a satellite retrying) is logged quietly.
+                    let error = format!("{}: {why}", conn.peer.ip());
+                    if net.error.as_ref() == Some(&error) {
+                        tracing::debug!("a connection from {} did not join: {why}", conn.peer);
+                    } else {
+                        tracing::warn!("a connection from {} did not join: {why}", conn.peer);
+                    }
+                    net.error = Some(error);
                 }
             },
             Side::Satellite(s) => {
@@ -867,7 +948,7 @@ impl Orrery {
         for conn in net.conns.values_mut() {
             if now.saturating_duration_since(conn.heard) > SILENCE {
                 conn.dropped = Some(format!("nothing heard for {} s", SILENCE.as_secs()));
-            } else if conn.joined.is_some() {
+            } else if conn.joined.is_some() && conn.ping.is_none() {
                 let nonce = net.next_nonce;
                 net.next_nonce += 1;
                 if send(conn, &Message::Ping { nonce }).is_ok() {
@@ -946,8 +1027,9 @@ impl Orrery {
         }
     }
 
-    /// Sends `request` to satellite `machine`, its answer for `reply` (a failure logged without one). Some(error)
-    /// when it cannot be sent; None when sent: the answer, or an error after `FORWARD_TIMEOUT`, comes later.
+    /// Sends `request` to satellite `machine`, its answer for `reply`; without one it is a routed `workspace`, a
+    /// failure logged and resynced. Some(error) when it cannot be sent; None when sent: the answer, or an error
+    /// after `FORWARD_TIMEOUT`, comes later.
     fn link_command(&mut self, machine: &str, request: Request, reply: Option<Reply>) -> Option<Response> {
         let handle = self.loop_handle.clone();
         let Some(Net {
@@ -968,10 +1050,17 @@ impl Orrery {
         }
         let timer = handle.insert_source(Timer::from_duration(FORWARD_TIMEOUT), move |_, _, state| {
             if let Some(Net {
-                side: Side::Primary(p), ..
+                side: Side::Primary(p),
+                conns,
+                ..
             }) = &mut state.net
                 && let Some(pending) = p.commands.remove(&id)
             {
+                if pending.resync
+                    && let Some(conn) = conns.values_mut().find(|c| c.joined.as_ref() == Some(&pending.machine))
+                {
+                    resync(conn, p.session.foreign(&pending.machine));
+                }
                 let response = Response::error(format!(
                     "no answer from {} within {} s",
                     pending.machine,
@@ -983,6 +1072,7 @@ impl Orrery {
         });
         let pending = Pending {
             machine: machine.to_owned(),
+            resync: reply.is_none(),
             reply,
             timer: timer.ok(),
         };
@@ -1067,8 +1157,7 @@ impl Orrery {
                 let latency = |name: &str| {
                     (net.conns.values())
                         .find(|c| c.joined.as_deref() == Some(name))
-                        .and_then(|c| c.latency)
-                        .map(millis)
+                        .and_then(latency_ms)
                 };
                 let machines = (p.session.machines().iter())
                     .map(|m| MachineView {
@@ -1091,7 +1180,7 @@ impl Orrery {
                     role: Role::Satellite,
                     monitors,
                     workspaces: workspaces.into_iter().collect(),
-                    latency_ms: conn.and_then(|c| c.latency).map(millis),
+                    latency_ms: conn.and_then(latency_ms),
                     connected: conn.is_some(),
                     focused: false,
                 };

@@ -68,6 +68,15 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// Whether two secrets are the same key (a reload compares them); in time independent of where they differ.
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).fold(0, |diff, (a, b)| diff | (a ^ b)) == 0
+    }
+}
+
+impl Eq for Secret {}
+
 impl Drop for Secret {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -1131,6 +1140,8 @@ mod tests {
         let s = Secret::load(&path).expect("owner only");
         assert_eq!(s.0, secret(&contents).0, "the newline is not part of it");
         assert_ne!(s.0, secret(&format!("{contents}!")).0);
+        // Compared as keys: what a reload checks.
+        assert!(s == secret(&contents) && s != secret(&format!("{contents}!")));
         assert_eq!(format!("{s:?}"), "Secret(..)");
         chmod(0o400);
         Secret::load(&path).expect("read-only is fine");

@@ -849,8 +849,10 @@ impl Orrery {
     /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets
     /// `config_error`, which shows as the red bar until a good config loads. A file gone while running (an editor
     /// between delete and write, say) keeps the running config: the built-in one stands in only at startup. That
-    /// is an error answer for `reload` but not a `config_error`. In a session the secret file is read again too (a
-    /// failure is the `config_error`); `listen`, `primary` and `name` take effect on the next start.
+    /// is an error answer for `reload` but not a `config_error`. In a session the secret file is read again too: a
+    /// different secret drops every link (they open again on it), and one that cannot be read is the
+    /// `config_error` and this answer's error, the config being applied all the same. `listen`, `primary` (the
+    /// `secret-file` path too) and `name` take effect on the next start.
     pub fn reload(&mut self) -> Result<(), String> {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());
@@ -871,7 +873,10 @@ impl Orrery {
                 }
                 self.stacking = stacking_after_reload(self.stacking, &self.config, &config);
                 if (&self.config.link, &self.config.name) != (&config.link, &config.name) {
-                    tracing::warn!("`listen`, `primary` and `name` changed: they take effect when {NAME} starts again");
+                    tracing::warn!(
+                        "`listen`, `primary`, their `secret-file` path or `name` changed: they take effect when {NAME} \
+                         starts again (the secret file's contents are read again now)"
+                    );
                 }
                 self.config = config;
                 self.config_error = self.link_reload();
