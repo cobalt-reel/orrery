@@ -453,8 +453,20 @@ fn write_later(
 
 /// `orrery msg`: one request to the orrery at `path`, its answer back.
 pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
-    let mut stream = UnixStream::connect(path)
+    let stream = UnixStream::connect(path)
         .with_context(|| format!("cannot reach {NAME} at {} (is it running?)", path.display()))?;
+    exchange(stream, request)
+}
+
+/// `orrery run` where an orrery already answers at `path`: its answer to `open-screen`. None when nothing answers
+/// there (no socket, or a stale one nobody listens on), so this one starts.
+pub fn join(path: &Path) -> Option<anyhow::Result<Response>> {
+    let stream = UnixStream::connect(path).ok()?;
+    Some(exchange(stream, &Request::OpenScreen))
+}
+
+/// One request on a connected stream, its answer back.
+fn exchange(mut stream: UnixStream, request: &Request) -> anyhow::Result<Response> {
     stream
         .set_read_timeout(Some(CLIENT_TIMEOUT))
         .context("socket timeout")?;

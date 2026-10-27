@@ -1,6 +1,6 @@
 //! The control socket end to end, headless only: every request over `orrery msg` (and raw lines it would never
-//! send), errors included, and the socket's life: private, one orrery per socket, stale ones replaced, removed
-//! on a clean exit.
+//! send), errors included, and the socket's life: private, one orrery per socket (a second `run` joins it, see
+//! `screens.rs`), stale ones replaced, removed on a clean exit.
 
 mod support;
 
@@ -204,7 +204,7 @@ fn move_to_workspace_carries_the_stack_and_an_empty_workspace_goes_when_left() {
 }
 
 #[test]
-fn workspace_numbers_are_checked_and_open_screen_is_refused_for_now() {
+fn workspace_numbers_are_checked() {
     let (orrery, client) = start();
     for words in [
         &["workspace", "0"][..],
@@ -219,11 +219,6 @@ fn workspace_numbers_are_checked_and_open_screen_is_refused_for_now() {
     }
     let answer = orrery.raw(b"{\"cmd\":\"workspace\",\"number\":11}\n");
     assert!(answer.contains("bad request") && answer.contains("1 to 10"), "{answer}");
-    let err = orrery.msg_err(&["open-screen"]);
-    assert!(
-        err["error"].as_str().is_some_and(|e| e.contains("cannot open screens")),
-        "{err}"
-    );
     assert_eq!(workspaces(&orrery.state()), [(1, true, vec![])]);
     assert_eq!(orrery.state()["monitors"].as_array().map(Vec::len), Some(1));
     drop(client);
@@ -551,32 +546,19 @@ fn msg_refuses_bad_words_locally_and_reports_a_missing_orrery() {
 }
 
 #[test]
-fn a_second_orrery_refuses_a_live_socket() {
-    let (orrery, client) = start();
-    let runtime = tempfile::tempdir().expect("temp runtime dir");
-    let mut second = Command::new(support::BIN)
-        .args(["run", "--backend", "headless", "--socket"])
-        .arg(orrery.control_socket())
-        .arg("--config")
-        .arg(orrery.config_dir.path().join("config.kdl"))
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env_remove("WAYLAND_DISPLAY")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn a second orrery");
-    let status = wait_or_kill(&mut second, "the second orrery kept running");
-    assert!(!status.success());
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut second.stderr.take().expect("stderr"), &mut stderr).expect("stderr");
+fn a_second_orrery_refuses_while_the_lock_is_held() {
+    // A orrery still starting holds the lock but does not answer yet: refused, not joined.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = socket_path_in(dir.path());
+    let lock = std::fs::File::create(dir.path().join(format!("{NAME}.sock.lock"))).expect("lock file");
+    // Safety: a valid fd for the life of `lock`.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) },
+        0
+    );
+    let stderr = refused_with(&path);
     assert!(stderr.contains("already running"), "{stderr}");
-    // It refused before opening a Wayland socket, and the first one still answers.
-    let leftovers: Vec<_> = std::fs::read_dir(runtime.path()).expect("runtime dir").collect();
-    assert!(leftovers.is_empty(), "{leftovers:?}");
-    orrery.msg_ok(&["state"]);
-    drop(client);
-    assert!(orrery.stop().success());
+    assert!(!path.exists());
 }
 
 #[test]

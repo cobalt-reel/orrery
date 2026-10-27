@@ -4,7 +4,7 @@
 
 pub mod client;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -175,6 +175,33 @@ impl Compositor {
             .env_remove("WAYLAND_DISPLAY")
             .output()
             .expect("run orrery msg")
+    }
+
+    /// A second `orrery run --backend headless` on this orrery's control socket, with a runtime dir of its own
+    /// (returned, to see what it left there): its exit status, stdout and stderr.
+    pub fn run_again(&self) -> (ExitStatus, String, String, TempDir) {
+        let runtime = tempfile::tempdir().expect("temp runtime dir");
+        let mut child = Command::new(BIN)
+            .args(["run", "--backend", "headless", "--socket"])
+            .arg(self.control_socket())
+            .arg("--config")
+            .arg(self.config_path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", runtime.path())
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .env_remove("DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn a second orrery");
+        let status = wait_or_kill(&mut child, "the second orrery kept running");
+        // It has exited, and says little: nothing is lost to a full pipe.
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        (child.stdout.take().expect("stdout").read_to_string(&mut stdout)).expect("read its stdout");
+        (child.stderr.take().expect("stderr").read_to_string(&mut stderr)).expect("read its stderr");
+        (status, stdout, stderr, runtime)
     }
 
     /// `msg`, which must succeed, its stdout as JSON.

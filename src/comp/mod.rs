@@ -26,9 +26,9 @@ use smithay::output::Output;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, GlobalId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
@@ -221,6 +221,31 @@ pub fn stacking_after_reload(running: bool, old: &Config, new: &Config) -> bool 
     }
 }
 
+/// The output name of screen `number` on a backend whose outputs are called `base`: `base` for screen 1 (so monitor
+/// rules written for one screen keep working), `base-k` for screen k.
+#[must_use]
+pub fn screen_name(base: &str, number: u8) -> String {
+    if number == 1 {
+        base.to_owned()
+    } else {
+        format!("{base}-{number}")
+    }
+}
+
+/// How long a removed output's global stays disabled (announced as gone) before it is destroyed, so a client
+/// binding it meanwhile gets no protocol error.
+const GLOBAL_GRACE: Duration = Duration::from_secs(10);
+
+/// A backend's own way to open and close screens past the one it starts with, set by the backend at init. None
+/// on `Orrery` means the backend cannot (`open-screen` and `close-screen` are answered with an error).
+pub trait Screens {
+    /// Opens screen `number` (the lowest free, `Stacks::next_screen_number`), its output named with `screen_name`,
+    /// and adds it with `Orrery::add_output` at `Orrery::next_screen_x`.
+    fn open(&mut self, state: &mut Orrery, number: u8) -> Result<(), String>;
+    /// Closes the screen whose output is `name`, taking it away with `Orrery::remove_output`.
+    fn close(&mut self, state: &mut Orrery, name: &str) -> Result<(), String>;
+}
+
 /// The layout an output starts with: its monitor rule, else the first layout.
 pub fn layout_for_output(config: &Config, output: &str) -> Option<Layout> {
     let by_rule = config
@@ -236,6 +261,7 @@ pub struct Orrery {
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
     pub loop_signal: LoopSignal,
+    loop_handle: LoopHandle<'static, Orrery>,
 
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -275,7 +301,12 @@ pub struct Orrery {
     config_stamp: Option<(SystemTime, u64)>,
     /// The running config is the built-in stand-in for a missing or broken file (see `Loaded::fallback`).
     config_is_fallback: bool,
+    /// In opening order, which is not the monitors' (number) order: look monitors up by name, never by index.
     pub outputs: Vec<Output>,
+    /// Each output's global, by output name, to take away with it.
+    output_globals: HashMap<String, GlobalId>,
+    /// The backend's screens beyond the first; None when it cannot open any.
+    pub screens: Option<Box<dyn Screens>>,
     /// How long frames take to draw (backends with a renderer record them).
     frames: frames::FrameStats,
 
@@ -335,6 +366,7 @@ impl Orrery {
             socket_name,
             display_handle: dh,
             loop_signal: event_loop.get_signal(),
+            loop_handle: event_loop.handle(),
             space: Space::default(),
             popups: PopupManager::default(),
             windows: HashMap::new(),
@@ -356,6 +388,8 @@ impl Orrery {
             config_stamp,
             config_is_fallback,
             outputs: Vec::new(),
+            output_globals: HashMap::new(),
+            screens: None,
             frames: frames::FrameStats::new(Instant::now()),
             compositor_state,
             xdg_shell_state,
@@ -369,14 +403,69 @@ impl Orrery {
         })
     }
 
-    /// Puts an output in the space at `area` and gives it a monitor in the stacks.
+    /// Announces an output to clients, puts it in the space at `area` and gives it a monitor in the stacks (the
+    /// screen numbered `Stacks::next_screen_number`).
     pub fn add_output(&mut self, output: Output, area: Rect) {
+        let global = output.create_global::<Orrery>(&self.display_handle);
+        self.output_globals.insert(output.name(), global);
         self.space.map_output(&output, (area.x, area.y));
         if let Some(layout) = layout_for_output(&self.config, &output.name()) {
             self.stacks.add_monitor(&output.name(), area, layout);
         }
         self.outputs.push(output);
         self.arrange();
+    }
+
+    /// Takes an output away: its global goes (disabled now, destroyed after `GLOBAL_GRACE`), and its monitor's
+    /// workspaces move as `Stacks::remove_monitor` says. False when there is no such output.
+    pub fn remove_output(&mut self, name: &str) -> bool {
+        let Some(i) = self.outputs.iter().position(|o| o.name() == name) else {
+            return false;
+        };
+        let output = self.outputs.remove(i);
+        self.space.unmap_output(&output);
+        if let Some(global) = self.output_globals.remove(name) {
+            self.display_handle.disable_global::<Orrery>(global.clone());
+            let dh = self.display_handle.clone();
+            let id = global.clone();
+            let later = (self.loop_handle).insert_source(Timer::from_duration(GLOBAL_GRACE), move |_, _, _| {
+                dh.remove_global::<Orrery>(id.clone());
+                TimeoutAction::Drop
+            });
+            if later.is_err() {
+                self.display_handle.remove_global::<Orrery>(global);
+            }
+        }
+        self.stacks.remove_monitor(name);
+        self.arrange();
+        true
+    }
+
+    /// The x where the next screen goes in global space: right of the rightmost output, so screens sit in
+    /// opening order, whatever their numbers.
+    pub fn next_screen_x(&self) -> i32 {
+        (self.outputs.iter())
+            .filter_map(|o| self.space.output_geometry(o))
+            .map(|g| g.loc.x + g.size.w)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Runs one of the backend's screen operations, `what` naming it in the error when the backend has none.
+    fn with_screens(
+        &mut self,
+        what: &str,
+        op: impl FnOnce(&mut dyn Screens, &mut Self) -> Result<(), String>,
+    ) -> Response {
+        let Some(mut screens) = self.screens.take() else {
+            return Response::error(format!("this backend cannot {what} screens"));
+        };
+        let done = op(screens.as_mut(), self);
+        self.screens = Some(screens);
+        match done {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::error(e),
+        }
     }
 
     /// An output changed size: the monitor's slots follow.
@@ -714,8 +803,13 @@ impl Orrery {
                 Ok(()) => Response::ok(),
                 Err(e) => Response::error(e),
             },
-            // Each backend opens its own kind of screen; none does yet.
-            Request::OpenScreen => Response::error("this backend cannot open screens"),
+            // Each backend opens its own kind of screen.
+            Request::OpenScreen => self.with_screens("open", |screens, state| {
+                let number = (state.stacks.next_screen_number())
+                    .ok_or_else(|| format!("every screen number (1 to {}) is taken", crate::stacks::WORKSPACES))?;
+                screens.open(state, number)
+            }),
+            Request::CloseScreen { name } => self.with_screens("close", |screens, state| screens.close(state, &name)),
             pure => match pure.apply(&mut self.stacks, &self.config) {
                 Ok(()) => {
                     self.arrange();
@@ -888,8 +982,9 @@ fn listen(display: Display<Orrery>, event_loop: &mut EventLoop<'static, Orrery>)
 pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     let config_path = opts.config.clone().or_else(default_config_path);
 
-    // First, before any socket of ours exists: a second orrery must refuse without side effects. Dropped (and
-    // so removed) when run returns.
+    // First, before any socket of ours exists: a second orrery must refuse without side effects (one answering
+    // there was joined instead, see `ipc_server::join`; this is one still starting). Dropped (and so removed)
+    // when run returns.
     let Some(control_path) = opts.socket.clone().or_else(ipc_server::default_socket_path) else {
         bail!("no control socket path: pass --socket or set XDG_RUNTIME_DIR");
     };
@@ -959,6 +1054,13 @@ mod tests {
         assert_eq!(ipc_server::socket_path_in(dir), dir.join(format!("{NAME}.sock")));
         let base = Path::new("/home/someone/.config");
         assert_eq!(config_path_in(base), base.join(NAME).join("config.kdl"));
+    }
+
+    #[test]
+    fn screens_are_named_after_their_number_the_first_as_the_backend() {
+        assert_eq!(screen_name("headless", 1), "headless");
+        assert_eq!(screen_name("headless", 2), "headless-2");
+        assert_eq!(screen_name("winit", 10), "winit-10");
     }
 
     #[test]

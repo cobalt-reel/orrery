@@ -61,7 +61,6 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
             model: "winit".into(),
         },
     );
-    let _global = output.create_global::<Orrery>(&state.display_handle);
     // GL draws bottom-up; winit's surface wants it flipped (as in Smithay's smallvil).
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);

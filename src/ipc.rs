@@ -51,6 +51,11 @@ pub enum Request {
     },
     /// One more screen, where the backend can open one.
     OpenScreen,
+    /// Takes the screen whose output is `name` away (headless only, for tests); its workspaces move to the focused
+    /// remaining screen, hidden.
+    CloseScreen {
+        name: String,
+    },
 }
 
 /// How a `Request` is read: serde ignores unknown fields on internally tagged unit variants, so here they are
@@ -75,6 +80,7 @@ enum Wire {
     Workspace { number: i64 },
     MoveToWorkspace { number: i64 },
     OpenScreen {},
+    CloseScreen { name: String },
 }
 
 impl TryFrom<Wire> for Request {
@@ -103,6 +109,7 @@ impl TryFrom<Wire> for Request {
                 number: workspace(number, "move-to-workspace")?,
             },
             Wire::OpenScreen {} => Request::OpenScreen,
+            Wire::CloseScreen { name } => Request::CloseScreen { name },
         })
     }
 }
@@ -342,8 +349,8 @@ impl StateView {
 
 impl Request {
     /// Runs a pure request against the stacks, layout names resolved in `config`. On error nothing changed.
-    /// `state`, `reload`, `quit`, `toggle-stacking` and `spawn` are the compositor's to answer, and so is
-    /// `close`: closing asks the client to go, and its window leaves the stacks only when it is destroyed.
+    /// `state`, `reload`, `quit`, `toggle-stacking`, `spawn` and the screens' are the compositor's to answer, and so
+    /// is `close`: closing asks the client to go, and its window leaves the stacks only when it is destroyed.
     pub fn apply(&self, stacks: &mut Stacks, config: &Config) -> Result<(), String> {
         match self {
             Request::FocusSlot { dir } => stacks.focus_slot(*dir),
@@ -383,7 +390,8 @@ impl Request {
             | Request::Quit
             | Request::ToggleStacking
             | Request::Spawn { .. }
-            | Request::OpenScreen => {
+            | Request::OpenScreen
+            | Request::CloseScreen { .. } => {
                 return Err(format!("{} is answered by the compositor", self.verb()));
             }
         }
@@ -407,12 +415,13 @@ impl Request {
             Request::Workspace { .. } => "workspace",
             Request::MoveToWorkspace { .. } => "move-to-workspace",
             Request::OpenScreen => "open-screen",
+            Request::CloseScreen { .. } => "close-screen",
         }
     }
 }
 
-/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `workspace 3`, `spawn PROGRAM
-/// [ARGS...]`) or a single JSON request.
+/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `workspace 3`, `close-screen OUTPUT`,
+/// `spawn PROGRAM [ARGS...]`) or a single JSON request.
 pub fn parse_words(words: &[String]) -> Result<Request, String> {
     if let [one] = words
         && one.trim_start().starts_with('{')
@@ -448,6 +457,12 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
         "split" => none(Request::Split),
         "toggle-stacking" => none(Request::ToggleStacking),
         "open-screen" => none(Request::OpenScreen),
+        "close-screen" => match args.as_slice() {
+            [name] => Ok(Request::CloseScreen {
+                name: (*name).to_owned(),
+            }),
+            _ => Err("`close-screen` takes one output name".into()),
+        },
         "workspace" => Ok(Request::Workspace { number: number(&args)? }),
         "move-to-workspace" => Ok(Request::MoveToWorkspace { number: number(&args)? }),
         "spawn" => Ok(Request::Spawn {
@@ -508,10 +523,11 @@ mod tests {
             Request::Workspace { number } => (12, Wire::Workspace { number: number.into() }),
             Request::MoveToWorkspace { number } => (13, Wire::MoveToWorkspace { number: number.into() }),
             Request::OpenScreen => (14, Wire::OpenScreen {}),
+            Request::CloseScreen { name } => (15, Wire::CloseScreen { name }),
         }
     }
 
-    const VARIANTS: usize = 15;
+    const VARIANTS: usize = 16;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -554,6 +570,9 @@ mod tests {
             Request::Workspace { number: 10 },
             Request::MoveToWorkspace { number: 3 },
             Request::OpenScreen,
+            Request::CloseScreen {
+                name: "headless-2".into(),
+            },
         ]
     }
 
@@ -605,6 +624,12 @@ mod tests {
             r#"{"cmd":"move-to-workspace","number":10}"#
         );
         assert_eq!(json(&Request::OpenScreen), r#"{"cmd":"open-screen"}"#);
+        assert_eq!(
+            json(&Request::CloseScreen {
+                name: "headless-2".into()
+            }),
+            r#"{"cmd":"close-screen","name":"headless-2"}"#
+        );
     }
 
     #[test]
@@ -641,6 +666,8 @@ mod tests {
             r#"{"cmd":"move-to-workspace","number":0}"#,
             r#"{"cmd":"move-to-workspace","number":11}"#,
             r#"{"cmd":"open-screen","name":"x"}"#,
+            r#"{"cmd":"close-screen"}"#,
+            r#"{"cmd":"close-screen","name":2}"#,
             r#"{"dir":"left"}"#,
             r#"[]"#,
         ] {
@@ -772,6 +799,12 @@ mod tests {
             ("workspace 10", Request::Workspace { number: 10 }),
             ("move-to-workspace 4", Request::MoveToWorkspace { number: 4 }),
             ("open-screen", Request::OpenScreen),
+            (
+                "close-screen headless-2",
+                Request::CloseScreen {
+                    name: "headless-2".into(),
+                },
+            ),
         ];
         for (text, want) in cases {
             assert_eq!(parse_words(&words(text)), Ok(want), "{text}");
@@ -815,6 +848,8 @@ mod tests {
             ("move-to-workspace", "1 to 10"),
             ("move-to-workspace 300", "1 to 10"),
             ("open-screen now", "no arguments"),
+            ("close-screen", "output name"),
+            ("close-screen a b", "output name"),
         ];
         for (text, word) in cases {
             let err = parse_words(&words(text)).expect_err(text);
@@ -941,6 +976,7 @@ mod tests {
                 argv: vec!["true".into()],
             },
             Request::OpenScreen,
+            Request::CloseScreen { name: "other".into() },
         ] {
             let (mut s, config) = setup();
             let err = req.apply(&mut s, &config).expect_err("not pure");

@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use orrery_wm::comp::{self, Backend, RunOptions, ipc_server};
+use orrery_wm::ipc::Response;
 use orrery_wm::{NAME, config, ipc};
 
 #[derive(Parser)]
@@ -86,6 +87,12 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| Cli::parse_from([NAME, "run"]).command.expect("`run` parses"));
     match command {
         Command::Run(args) => {
+            // An orrery already answering on the control socket opens one more screen instead.
+            if let Some(path) = args.socket.clone().or_else(ipc_server::default_socket_path)
+                && let Some(answer) = ipc_server::join(&path)
+            {
+                return print_answer("run", answer);
+            }
             // Logs go to stderr: stdout carries the WAYLAND_DISPLAY line for scripts.
             tracing_subscriber::fmt().with_writer(std::io::stderr).init();
             let opts = RunOptions {
@@ -148,8 +155,7 @@ fn check(path: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// `orrery msg`: the answer as JSON on stdout (pretty when it carries the state), the error also on stderr;
-/// exit 0 only when orrery said ok.
+/// `orrery msg`: one request, its answer as `print_answer` shows it.
 fn msg(socket: Option<PathBuf>, words: &[String]) -> ExitCode {
     let request = match ipc::parse_words(words) {
         Ok(r) => r,
@@ -162,10 +168,16 @@ fn msg(socket: Option<PathBuf>, words: &[String]) -> ExitCode {
         eprintln!("{NAME} msg: no control socket: pass --socket or set XDG_RUNTIME_DIR");
         return ExitCode::FAILURE;
     };
-    let response = match ipc_server::send(&path, &request) {
+    print_answer("msg", ipc_server::send(&path, &request))
+}
+
+/// A running orrery's answer: as JSON on stdout (pretty when it carries the state), the error also on stderr; exit
+/// 0 only when it said ok. `verb` names the command when no answer came.
+fn print_answer(verb: &str, answer: anyhow::Result<Response>) -> ExitCode {
+    let response = match answer {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{NAME} msg: {e:#}");
+            eprintln!("{NAME} {verb}: {e:#}");
             return ExitCode::FAILURE;
         }
     };
