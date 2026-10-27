@@ -24,6 +24,7 @@ use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken}
 use super::{Orrery, ipc_server};
 use crate::NAME;
 use crate::config::{self, Config, LinkConfig, MAX_NAME};
+use crate::crossing::Edge;
 use crate::ipc::{MachineView, Request, Response, SessionView};
 use crate::link::{Link, Message, OPEN_DEADLINE, PROTOCOL_VERSION, Secret, SendError};
 use crate::session::{Role, Route, Screen, Session};
@@ -657,6 +658,19 @@ impl Orrery {
                 }
                 pending.answer(response);
             }
+            Message::InputExit { edge, y } => {
+                let Some(name) = &conn.joined else {
+                    return;
+                };
+                let edge = match edge {
+                    Edge::Left => "left",
+                    Edge::Right => "right",
+                };
+                tracing::info!(
+                    "{name}'s pointer left its screens past the {edge} edge, {:.0} % down",
+                    y * 100.0
+                );
+            }
             other => tracing::debug!("unexpected on the primary: {other:?}"),
         }
     }
@@ -703,6 +717,20 @@ impl Orrery {
                 {
                     let response = Response::error(format!("the answer is {len} bytes: too large for the link"));
                     let _ = send(conn, &Message::CommandAnswer { id: command, response });
+                }
+            }
+            msg if msg.is_input() => {
+                let answer = self.remote_input(msg);
+                let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) else {
+                    return;
+                };
+                match answer {
+                    Ok(Some(answer)) => {
+                        let _ = send(conn, &answer);
+                    }
+                    Ok(None) => {}
+                    // Dropped by the tick, which releases what the primary's input has down here.
+                    Err(why) => conn.link.protocol_error(why),
                 }
             }
             other => tracing::debug!("unexpected on a satellite: {other:?}"),
@@ -846,6 +874,8 @@ impl Orrery {
                     tracing::warn!("lost the primary at {}: {why}", s.primary);
                     s.backoff = BACKOFF_FIRST;
                     self.stacks.clear_foreign();
+                    // Nothing more comes from the primary's keyboard and pointer: what they have down goes up.
+                    self.remote_release();
                     self.arrange();
                 }
                 self.link_retry(why);
@@ -1103,6 +1133,26 @@ impl Orrery {
             )));
         }
         self.link_command(machine, request, Some(reply))
+    }
+
+    /// `inject-remote` (a testing aid; the caller checked `--debug-inject`): `message`, an input message, sent as it
+    /// is to satellite `machine`, as forwarding would.
+    pub(super) fn inject_remote(&mut self, machine: &str, message: &Message) -> Response {
+        let Some(Net {
+            side: Side::Primary(_),
+            conns,
+            ..
+        }) = &mut self.net
+        else {
+            return Response::error("`inject-remote` sends from the primary: this is no primary");
+        };
+        let Some(conn) = conns.values_mut().find(|c| c.joined.as_deref() == Some(machine)) else {
+            return Response::error(format!("no machine named {machine:?} in the session"));
+        };
+        match send(conn, message) {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::error(format!("cannot send to {machine}: {e}")),
+        }
     }
 
     /// `workspace n` in a session: shown here, or by the machine that has it (the session's focus marker moves to

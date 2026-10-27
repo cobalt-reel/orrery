@@ -3,6 +3,7 @@
 #![allow(dead_code)] // each test binary uses a different part of this
 
 pub mod client;
+pub mod session;
 
 use std::io::{BufRead, BufReader, Read as _};
 use std::os::unix::net::UnixStream;
@@ -65,8 +66,17 @@ impl Compositor {
         Self::start_in(tempfile::tempdir().expect("temp runtime dir"), config, size)
     }
 
+    /// `start` with more `run` options (`--debug-inject`, say).
+    pub fn start_with(config: &str, size: (i32, i32), args: &[&str]) -> Self {
+        Self::launch(tempfile::tempdir().expect("temp runtime dir"), config, size, args)
+    }
+
     /// The same, in a runtime dir the test has prepared (a stale control socket, say).
     pub fn start_in(runtime: TempDir, config: &str, size: (i32, i32)) -> Self {
+        Self::launch(runtime, config, size, &[])
+    }
+
+    fn launch(runtime: TempDir, config: &str, size: (i32, i32), args: &[&str]) -> Self {
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let config_path = config_dir.path().join("config.kdl");
         std::fs::write(&config_path, config).expect("write the temp config");
@@ -80,6 +90,7 @@ impl Compositor {
             .arg(&config_path)
             .arg("--socket")
             .arg(socket_path_in(runtime.path()))
+            .args(args)
             // Never the user's session: our own runtime dir, and no display to inherit.
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", config_dir.path())

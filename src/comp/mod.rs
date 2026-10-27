@@ -9,6 +9,7 @@ mod handlers;
 mod input;
 pub mod ipc_server;
 pub mod net;
+mod remote;
 mod render;
 mod spawn;
 
@@ -66,6 +67,8 @@ pub struct RunOptions {
     pub size: (i32, i32),
     /// The control socket. None: `$XDG_RUNTIME_DIR/orrery.sock`.
     pub socket: Option<PathBuf>,
+    /// Answer `inject` and `inject-remote` (a testing aid).
+    pub debug_inject: bool,
 }
 
 /// `WxH`, both positive.
@@ -312,6 +315,10 @@ pub struct Orrery {
     frames: frames::FrameStats,
     /// This machine in a session of linked orrerys; None alone.
     net: Option<net::Net>,
+    /// What the primary's input has down here (a satellite holding the focus marker).
+    remote: remote::Remote,
+    /// `inject` and `inject-remote` are answered (`--debug-inject`, a testing aid).
+    debug_inject: bool,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -395,6 +402,8 @@ impl Orrery {
             screens: None,
             frames: frames::FrameStats::new(Instant::now()),
             net: None,
+            remote: remote::Remote::default(),
+            debug_inject: false,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -732,7 +741,7 @@ impl Orrery {
             return;
         }
         self.pointer_target = under.clone();
-        let time = u32::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let time = self.clock();
         pointer.motion(
             self,
             under,
@@ -829,6 +838,11 @@ impl Orrery {
                 screens.open(state, number)
             }),
             Request::CloseScreen { name } => self.with_screens("close", |screens, state| screens.close(state, &name)),
+            Request::Inject { .. } | Request::InjectRemote { .. } if !self.debug_inject => Response::error(format!(
+                "`inject` and `inject-remote` are testing aids: start {NAME} with --debug-inject to use them"
+            )),
+            Request::Inject { input } => self.inject(*input),
+            Request::InjectRemote { machine, message } => self.inject_remote(&machine, &message),
             pure => self.apply(pure),
         }
     }
@@ -1043,6 +1057,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot watch signals: {e}"))?;
 
     let mut state = Orrery::new(&mut event_loop, display, config_path)?;
+    state.debug_inject = opts.debug_inject;
 
     event_loop
         .handle()

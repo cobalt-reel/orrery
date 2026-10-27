@@ -3,12 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Cycle, parse_dir, workspace_number};
+use crate::crossing::RawKey;
 use crate::layout::{Dir, Rect};
+use crate::link::{Message, ScrollSource};
 use crate::session::{Role, Screen};
 use crate::stacks::{Stacks, WORKSPACES, WinId, Workspace};
 
 /// Read through `Wire`: every variant needs a twin there (a test fails to compile until it has one).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case", try_from = "Wire")]
 pub enum Request {
     State,
@@ -63,6 +65,17 @@ pub enum Request {
         machine: String,
         request: Box<Request>,
     },
+    /// A testing aid, answered only by an orrery started with `--debug-inject`: `input` (a link message: key, motion,
+    /// button or axis) as if from this machine's own devices.
+    Inject {
+        input: Box<Message>,
+    },
+    /// A testing aid, answered only by a primary started with `--debug-inject`: `message` (an input message: keymap,
+    /// handoff, key, motion, button, axis or release) sent as it is to satellite `machine`, as forwarding would.
+    InjectRemote {
+        machine: String,
+        message: Box<Message>,
+    },
 }
 
 /// How a `Request` is read: serde ignores unknown fields on internally tagged unit variants, so here they are
@@ -90,6 +103,8 @@ enum Wire {
     OpenScreen {},
     CloseScreen { name: String },
     To { machine: String, request: Box<Request> },
+    Inject { input: Box<Message> },
+    InjectRemote { machine: String, message: Box<Message> },
 }
 
 impl TryFrom<Wire> for Request {
@@ -128,7 +143,30 @@ impl TryFrom<Wire> for Request {
                 }
                 Request::To { machine, request }
             }
+            Wire::Inject { input } => Request::Inject {
+                input: injected(input)?,
+            },
+            Wire::InjectRemote { machine, message } => {
+                if machine.is_empty() {
+                    return Err("`inject-remote` takes a machine name".into());
+                }
+                if !message.is_input() {
+                    return Err(
+                        "`inject-remote` takes an input message: keymap, handoff, key, motion, button, axis or release"
+                            .into(),
+                    );
+                }
+                Request::InjectRemote { machine, message }
+            }
         })
+    }
+}
+
+/// An `inject` request's input: a key, motion, button or axis, as from a device.
+fn injected(input: Box<Message>) -> Result<Box<Message>, String> {
+    match *input {
+        Message::Key { .. } | Message::Motion { .. } | Message::Button { .. } | Message::Axis { .. } => Ok(input),
+        _ => Err("`inject` takes a key, motion, button or axis".into()),
     }
 }
 
@@ -455,7 +493,9 @@ impl Request {
             | Request::Spawn { .. }
             | Request::OpenScreen
             | Request::CloseScreen { .. }
-            | Request::To { .. } => {
+            | Request::To { .. }
+            | Request::Inject { .. }
+            | Request::InjectRemote { .. } => {
                 return Err(format!("{} is answered by the compositor", self.verb()));
             }
         }
@@ -481,12 +521,14 @@ impl Request {
             Request::OpenScreen => "open-screen",
             Request::CloseScreen { .. } => "close-screen",
             Request::To { .. } => "to",
+            Request::Inject { .. } => "inject",
+            Request::InjectRemote { .. } => "inject-remote",
         }
     }
 }
 
 /// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `workspace 3`, `close-screen OUTPUT`,
-/// `spawn PROGRAM [ARGS...]`) or a single JSON request.
+/// `spawn PROGRAM [ARGS...]`, `inject key 38 down`, `inject-remote MACHINE release`) or a single JSON request.
 pub fn parse_words(words: &[String]) -> Result<Request, String> {
     if let [one] = words
         && one.trim_start().starts_with('{')
@@ -552,7 +594,76 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
             }),
             _ => Err("`layout` takes a layout name and optionally a monitor".into()),
         },
+        "inject" => Ok(Request::Inject {
+            input: injected(Box::new(input_words(&args)?))?,
+        }),
+        "inject-remote" => {
+            let Some((machine, args)) = args.split_first() else {
+                return Err("`inject-remote` takes a machine name and an input message".into());
+            };
+            Ok(Request::InjectRemote {
+                machine: (*machine).to_owned(),
+                message: Box::new(input_words(args)?),
+            })
+        }
         other => Err(format!("unknown request `{other}`")),
+    }
+}
+
+/// An input message in words: `key CODE down|up` (an xkb keycode: evdev's plus 8), `motion DX DY`, `button CODE
+/// down|up` (evdev's), `axis H V` (continuous scroll), `handoff [KEYCODE...]` (the modifier keys held, the pointer
+/// staying where it is) or `release`. A keymap or a pointer entry takes JSON.
+fn input_words(args: &[&str]) -> Result<Message, String> {
+    let pressed = |s: &str| match s {
+        "down" => Ok(true),
+        "up" => Ok(false),
+        _ => Err(format!("a key or button goes down or up, not {s:?}")),
+    };
+    let pair = |what: &str, a: &str, b: &str| match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(a), Ok(b)) if a.is_finite() && b.is_finite() => Ok((a, b)),
+        _ => Err(format!("`{what}` takes two numbers")),
+    };
+    match args {
+        ["key", code, state] => Ok(Message::Key {
+            keycode: RawKey(
+                code.parse()
+                    .map_err(|_| format!("a key is its keycode, not {code:?}"))?,
+            ),
+            pressed: pressed(state)?,
+            time: 0,
+        }),
+        ["button", code, state] => Ok(Message::Button {
+            code: code
+                .parse()
+                .map_err(|_| format!("a button is its code, not {code:?}"))?,
+            pressed: pressed(state)?,
+        }),
+        ["motion", dx, dy] => pair("motion", dx, dy).map(|(dx, dy)| Message::Motion { dx, dy }),
+        ["axis", h, v] => pair("axis", h, v).map(|(h, v)| Message::Axis {
+            source: ScrollSource::Continuous,
+            h,
+            v,
+            v120_h: 0,
+            v120_v: 0,
+        }),
+        ["release"] => Ok(Message::Release),
+        ["handoff", mods @ ..] => Ok(Message::Handoff {
+            mods: (mods.iter())
+                .map(|m| {
+                    m.parse()
+                        .map(RawKey)
+                        .map_err(|_| format!("a held key is its keycode, not {m:?}"))
+                })
+                .collect::<Result<_, _>>()?,
+            pointer: None,
+        }),
+        ["key" | "button", ..] => Err("`key` and `button` take a code and down or up".into()),
+        ["motion" | "axis", ..] => Err("`motion` and `axis` take two numbers".into()),
+        _ => Err(concat!(
+            "an input message: key CODE down|up, motion DX DY, button CODE down|up, axis H V, ",
+            "handoff [KEYCODE...] or release"
+        )
+        .into()),
     }
 }
 
@@ -560,6 +671,8 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
 mod tests {
     use super::*;
     use crate::config::default_config;
+    use crate::crossing::{Edge, Entry, RawKey};
+    use crate::link::{ScrollSource, Xkb};
 
     fn layout(name: &str) -> crate::layout::Layout {
         default_config()
@@ -590,10 +703,12 @@ mod tests {
             Request::OpenScreen => (14, Wire::OpenScreen {}),
             Request::CloseScreen { name } => (15, Wire::CloseScreen { name }),
             Request::To { machine, request } => (16, Wire::To { machine, request }),
+            Request::Inject { input } => (17, Wire::Inject { input }),
+            Request::InjectRemote { machine, message } => (18, Wire::InjectRemote { machine, message }),
         }
     }
 
-    const VARIANTS: usize = 17;
+    const VARIANTS: usize = 19;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -643,7 +758,60 @@ mod tests {
                 machine: "desk".into(),
                 request: Box::new(Request::Workspace { number: 2 }),
             },
+            inject(key(38, true)),
+            inject(Message::Motion { dx: -3.5, dy: 2.0 }),
+            inject(Message::Button {
+                code: 272,
+                pressed: false,
+            }),
+            inject(axis(0.0, 15.0)),
+            remote("side", Message::Release),
+            remote(
+                "side",
+                Message::Handoff {
+                    mods: vec![RawKey(133)],
+                    pointer: Some(Entry {
+                        edge: Edge::Left,
+                        y: 0.5,
+                    }),
+                },
+            ),
+            remote(
+                "side",
+                Message::Keymap {
+                    xkb: Xkb("xkb_keymap { };".into()),
+                },
+            ),
         ]
+    }
+
+    fn inject(input: Message) -> Request {
+        Request::Inject { input: Box::new(input) }
+    }
+
+    fn remote(machine: &str, message: Message) -> Request {
+        Request::InjectRemote {
+            machine: machine.into(),
+            message: Box::new(message),
+        }
+    }
+
+    fn key(code: u32, pressed: bool) -> Message {
+        Message::Key {
+            keycode: RawKey(code),
+            pressed,
+            time: 0,
+        }
+    }
+
+    fn axis(h: f64, v: f64) -> Message {
+        Message::Axis {
+            source: ScrollSource::Continuous,
+            h,
+            v,
+            v120_h: 0,
+            v120_v: 0,
+        }
     }
 
     #[test]
@@ -707,6 +875,14 @@ mod tests {
             }),
             r#"{"cmd":"close-screen","name":"headless-2"}"#
         );
+        assert_eq!(
+            json(&inject(key(38, true))),
+            r#"{"cmd":"inject","input":{"msg":"key","keycode":38,"pressed":true,"time":0}}"#
+        );
+        assert_eq!(
+            json(&remote("side", Message::Release)),
+            r#"{"cmd":"inject-remote","machine":"side","message":{"msg":"release"}}"#
+        );
     }
 
     #[test]
@@ -762,6 +938,14 @@ mod tests {
             r#"{"cmd":"to","machine":"","request":{"cmd":"state"}}"#,
             r#"{"cmd":"to","machine":"desk","request":{"cmd":"bogus"}}"#,
             r#"{"cmd":"to","machine":"a","request":{"cmd":"to","machine":"b","request":{"cmd":"state"}}}"#,
+            r#"{"cmd":"inject"}"#,
+            r#"{"cmd":"inject","input":{"msg":"release"}}"#,
+            r#"{"cmd":"inject","input":{"msg":"ping","nonce":1}}"#,
+            r#"{"cmd":"inject","input":{"msg":"key","keycode":38,"pressed":true}}"#,
+            r#"{"cmd":"inject-remote","message":{"msg":"release"}}"#,
+            r#"{"cmd":"inject-remote","machine":"","message":{"msg":"release"}}"#,
+            r#"{"cmd":"inject-remote","machine":"side","message":{"msg":"input-exit","edge":"left","y":0.5}}"#,
+            r#"{"cmd":"inject-remote","machine":"side","message":{"msg":"command","id":1,"request":{"cmd":"quit"}}}"#,
             r#"{"dir":"left"}"#,
             r#"[]"#,
         ] {
@@ -930,6 +1114,39 @@ mod tests {
                     name: "headless-2".into(),
                 },
             ),
+            ("inject key 38 down", inject(key(38, true))),
+            ("inject key 38 up", inject(key(38, false))),
+            ("inject motion -10 2.5", inject(Message::Motion { dx: -10.0, dy: 2.5 })),
+            (
+                "inject button 272 down",
+                inject(Message::Button {
+                    code: 272,
+                    pressed: true,
+                }),
+            ),
+            ("inject axis 0 15", inject(axis(0.0, 15.0))),
+            ("inject-remote side key 50 up", remote("side", key(50, false))),
+            ("inject-remote side release", remote("side", Message::Release)),
+            (
+                "inject-remote side handoff 133 50",
+                remote(
+                    "side",
+                    Message::Handoff {
+                        mods: vec![RawKey(133), RawKey(50)],
+                        pointer: None,
+                    },
+                ),
+            ),
+            (
+                "inject-remote side handoff",
+                remote(
+                    "side",
+                    Message::Handoff {
+                        mods: vec![],
+                        pointer: None,
+                    },
+                ),
+            ),
         ];
         for (text, want) in cases {
             assert_eq!(parse_words(&words(text)), Ok(want), "{text}");
@@ -975,6 +1192,21 @@ mod tests {
             ("open-screen now", "no arguments"),
             ("close-screen", "output name"),
             ("close-screen a b", "output name"),
+            ("inject", "key"),
+            ("inject key", "key"),
+            ("inject key a down", "key"),
+            ("inject key 38 sideways", "down"),
+            ("inject motion 1", "motion"),
+            ("inject motion 1 x", "motion"),
+            ("inject motion inf 0", "motion"),
+            ("inject axis 1", "axis"),
+            ("inject button 272", "button"),
+            ("inject release", "key"),
+            ("inject handoff", "key"),
+            ("inject-remote", "machine"),
+            ("inject-remote side", "release"),
+            ("inject-remote side handoff x", "keycode"),
+            ("inject-remote side explode", "release"),
         ];
         for (text, word) in cases {
             let err = parse_words(&words(text)).expect_err(text);

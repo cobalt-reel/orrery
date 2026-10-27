@@ -32,7 +32,7 @@ enum Command {
         #[arg(long, value_name = "MACHINE")]
         to: Option<String>,
         /// Words (`focus-slot left`) or a single JSON request.
-        #[arg(required = true)]
+        #[arg(required = true, allow_negative_numbers = true)]
         request: Vec<String>,
         #[command(subcommand)]
         spawn: Option<MsgSpawn>,
@@ -68,6 +68,10 @@ struct RunArgs {
     size: (i32, i32),
     #[arg(long, help = socket_help())]
     socket: Option<PathBuf>,
+    /// A testing aid, off by default: answer `inject` (input as if from this machine's own devices) and
+    /// `inject-remote` (input messages sent to a satellite as they are).
+    #[arg(long)]
+    debug_inject: bool,
 }
 
 // The default paths in `--help`, from `NAME` (doc comments cannot hold it).
@@ -110,6 +114,7 @@ fn main() -> ExitCode {
                 config: args.config,
                 size: args.size,
                 socket: args.socket,
+                debug_inject: args.debug_inject,
             };
             match comp::run(opts) {
                 Ok(()) => ExitCode::SUCCESS,

@@ -1,76 +1,18 @@
-//! Linked orrerys: a headless primary and headless satellites on loopback, each with its own temp runtime dir,
-//! config and secret file. Waits poll `state` and are bounded (`support::TIMEOUT`).
+//! Linked orrerys: a headless primary and headless satellites on loopback (`support::session`).
 
 mod support;
 
 use std::io::{ErrorKind, Read as _};
 use std::net::TcpStream;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use orrery_wm::config;
 use serde_json::Value;
-use support::{Compositor, TIMEOUT};
-use tempfile::TempDir;
-
-const SIZE: (i32, i32) = (640, 480);
-
-/// A fresh secret for one test: 24 random bytes as hex.
-fn random_secret() -> String {
-    let mut bytes = [0u8; 24];
-    (std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes))).expect("random bytes");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// A secret file (0600) in a temp dir of its own.
-fn secret_file(contents: &str) -> (TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("secret");
-    write_secret(&path, contents);
-    (dir, path)
-}
-
-fn write_secret(path: &Path, contents: &str) {
-    std::fs::write(path, format!("{contents}\n")).expect("write the secret");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
-}
-
-/// The primary named `name`, listening on loopback `port` (0: any).
-fn primary(name: &str, port: u16, secret: &Path) -> Compositor {
-    let link = format!("listen \"127.0.0.1:{port}\" secret-file=\"{}\"", secret.display());
-    Compositor::start(&format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT), SIZE)
-}
-
-/// A satellite named `name` of the primary on loopback `port`.
-fn satellite(name: &str, port: u16, secret: &Path) -> Compositor {
-    let link = format!("primary \"127.0.0.1:{port}\" secret-file=\"{}\"", secret.display());
-    Compositor::start(&format!("{}\nname \"{name}\"\n{link}\n", config::DEFAULT), SIZE)
-}
-
-/// The port the primary listens on.
-fn port(primary: &Compositor) -> u16 {
-    let listen = primary.state()["session"]["listen"].as_str().map(str::to_owned);
-    let listen = listen.expect("the primary says where it listens");
-    listen
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .expect("ADDR:PORT")
-}
-
-/// Polls `done` until it holds, up to TIMEOUT; panics with `what` (and the last state seen) after that.
-fn wait(what: &str, o: &Compositor, done: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let state = o.state();
-        if done(&state) {
-            return state;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}: {state:#}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+use support::Compositor;
+use support::session::{
+    SIZE, connected, joined, port, primary, random_secret, satellite, secret_file, wait, wait_log, write_secret,
+};
 
 /// The session's machines as (name, role, screen numbers, workspace numbers).
 fn machines(state: &Value) -> Vec<(String, String, Vec<u64>, Vec<u64>)> {
@@ -119,14 +61,6 @@ fn screen(state: &Value) -> (u64, u64) {
         m["number"].as_u64().expect("number"),
         m["workspace"].as_u64().expect("workspace"),
     )
-}
-
-fn joined(state: &Value) -> bool {
-    state["session"]["machines"].as_array().is_some_and(|m| m.len() == 2)
-}
-
-fn connected(state: &Value) -> bool {
-    state["session"]["machines"][0]["connected"] == true
 }
 
 fn error(response: &Value) -> String {
@@ -210,11 +144,7 @@ fn a_wrong_secret_never_joins() {
     let (_b, other) = secret_file(&two);
     let p = primary("desk", 0, &secret);
     let s = satellite("side", port(&p), &other);
-    let deadline = Instant::now() + TIMEOUT;
-    while !p.log().contains("handshake failed") {
-        assert!(Instant::now() < deadline, "no handshake failure logged:\n{}", p.log());
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_log(&p, "handshake failed");
     // The satellite tries again (after 1 s, then 2 s): the same failure is logged once, and stays in `state`.
     std::thread::sleep(Duration::from_millis(3500));
     assert_eq!(p.log().matches("handshake failed").count(), 1, "{}", p.log());

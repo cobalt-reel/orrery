@@ -238,88 +238,124 @@ impl Orrery {
     /// seat's modifier state nor a client is left with Alt held, then forget held binds.
     pub fn keyboard_focus_lost(&mut self) {
         if let Some(keyboard) = self.seat.get_keyboard() {
-            let time = u32::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u32::MAX);
-            for code in keyboard.pressed_keys() {
-                let serial = SERIAL_COUNTER.next_serial();
-                keyboard.input::<Option<Action>, _>(self, code, KeyState::Released, serial, time, |orrery, _, _| {
-                    orrery.held.release(code)
-                });
+            self.release_keys(keyboard.pressed_keys());
+        }
+        // Released too: the primary's release of one of them now goes nowhere.
+        self.remote.forget_keys();
+        self.held.clear();
+    }
+
+    /// Releases `keys` through the usual path: a swallowed key stays swallowed, others reach the client.
+    pub fn release_keys(&mut self, keys: impl IntoIterator<Item = Keycode>) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let time = self.clock();
+        for code in keys {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.input::<Option<Action>, _>(self, code, KeyState::Released, serial, time, |orrery, _, _| {
+                orrery.held.release(code)
+            });
+        }
+    }
+
+    /// Milliseconds since start: the time of input this machine makes up (releases, input from the link).
+    #[must_use]
+    pub fn clock(&self) -> u32 {
+        u32::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u32::MAX)
+    }
+
+    /// A key went down or up, on this machine's keyboard or the primary's: a press matching a bind runs its action
+    /// (see `Held`), anything else goes to the focused client.
+    pub fn key_input(&mut self, code: Keycode, key_state: KeyState, time: u32) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let action = keyboard
+            .input::<Option<Action>, _>(self, code, key_state, serial, time, |orrery, mods, key| {
+                orrery.filter_key(key_state, mods, key.raw_code(), key.raw_latin_sym_or_raw_current_sym())
+            })
+            .flatten();
+        // Run outside the filter: actions re-focus the keyboard, which must not happen mid-input.
+        if let Some(action) = action {
+            self.run_action(action);
+        }
+    }
+
+    /// The pointer to `pos` (global): the surface under it there gets the motion.
+    pub fn pointer_to(&mut self, pos: Point<f64, Logical>, time: u32) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let under = self.surface_under(pos);
+        self.pointer_seen = true;
+        self.pointer_target = under.clone();
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// A pointer button went down or up: a press first focuses the slot under the pointer (empty or not), through
+    /// the stacks; then it goes to the surface under the pointer.
+    pub fn button_input(&mut self, button: u32, state: ButtonState, time: u32) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        if state == ButtonState::Pressed && !pointer.is_grabbed() {
+            let at = pointer.current_location();
+            if let Some((monitor, slot)) = slot_at(&self.stacks, at.x as i32, at.y as i32) {
+                self.stacks.focus_at(&monitor, slot);
+                self.arrange();
             }
         }
-        self.held.clear();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Scroll, to the surface under the pointer.
+    pub fn axis_input(&mut self, frame: AxisFrame) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        pointer.axis(self, frame);
+        pointer.frame(self);
     }
 
     /// One input event from the window showing `output`; pointer positions are local to that window.
     pub fn process_input_event<I: InputBackend>(&mut self, output: &str, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event } => {
-                let Some(keyboard) = self.seat.get_keyboard() else {
-                    return;
-                };
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = Event::time_msec(&event);
-                let key_state = event.state();
-                let action = keyboard
-                    .input::<Option<Action>, _>(self, event.key_code(), key_state, serial, time, |orrery, mods, key| {
-                        orrery.filter_key(key_state, mods, key.raw_code(), key.raw_latin_sym_or_raw_current_sym())
-                    })
-                    .flatten();
-                // Run outside the filter: actions re-focus the keyboard, which must not happen mid-input.
-                if let Some(action) = action {
-                    self.run_action(action);
-                }
+                self.key_input(event.key_code(), event.state(), Event::time_msec(&event));
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let output = self.outputs.iter().find(|o| o.name() == output);
                 let Some(output_geo) = output.and_then(|o| self.space.output_geometry(o)) else {
                     return;
                 };
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
                 let pos = on_output(event.position_transformed(output_geo.size), output_geo.loc);
-                let under = self.surface_under(pos);
-                self.pointer_seen = true;
-                self.pointer_target = under.clone();
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                self.pointer_to(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
-                let serial = SERIAL_COUNTER.next_serial();
-                if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                    // A click focuses the slot under the pointer (empty or not), through the stacks.
-                    let at = pointer.current_location();
-                    if let Some((monitor, slot)) = slot_at(&self.stacks, at.x as i32, at.y as i32) {
-                        self.stacks.focus_at(&monitor, slot);
-                        self.arrange();
-                    }
-                }
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                self.button_input(event.button_code(), event.state(), event.time_msec());
             }
             InputEvent::PointerAxis { event } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
                 let source = event.source();
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -337,8 +373,7 @@ impl Orrery {
                         frame = frame.stop(axis);
                     }
                 }
-                pointer.axis(self, frame);
-                pointer.frame(self);
+                self.axis_input(frame);
             }
             _ => {}
         }

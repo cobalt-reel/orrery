@@ -5,7 +5,7 @@ use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
@@ -73,6 +73,17 @@ pub struct State {
     /// The window with keyboard focus, and the serial of the latest wl_keyboard.enter (kept after a leave).
     pub keyboard_focus: Option<usize>,
     pub enter_serial: Option<u32>,
+    /// wl_keyboard.key events in order: (evdev keycode, pressed).
+    pub keys: Vec<(u32, bool)>,
+    /// The latest wl_keyboard.modifiers' depressed mask.
+    pub mods_depressed: u32,
+    /// Each wl_keyboard.keymap's size, in order.
+    pub keymaps: Vec<u32>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// The window under the pointer (wl_pointer.enter, until its leave).
+    pub pointer_focus: Option<usize>,
+    /// wl_pointer.button events in order: (button, pressed).
+    pub buttons: Vec<(u32, bool)>,
     outputs: Vec<wl_output::WlOutput>,
     pub globals: Vec<String>,
     pub windows: Vec<Win>,
@@ -109,8 +120,10 @@ impl Client {
         // Bind events (wl_output's) arrive on the second trip.
         queue.roundtrip(&mut state).expect("bind roundtrip");
         assert!(state.compositor.is_some() && state.shm.is_some() && state.wm_base.is_some());
-        // A keyboard, so the client learns its focus and the enter serials activation tokens can carry.
+        // A keyboard, so the client learns its focus and the enter serials activation tokens can carry, and keys;
+        // a pointer, for buttons.
         state.keyboard = state.seat.as_ref().map(|seat| seat.get_keyboard(&queue.handle(), ()));
+        state.pointer = state.seat.as_ref().map(|seat| seat.get_pointer(&queue.handle(), ()));
         queue.roundtrip(&mut state).expect("keyboard roundtrip");
         Self {
             _conn: conn,
@@ -596,6 +609,35 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.keyboard_focus = surface.data::<usize>().copied();
             }
             wl_keyboard::Event::Leave { .. } => state.keyboard_focus = None,
+            wl_keyboard::Event::Key { key, state: k, .. } => {
+                state
+                    .keys
+                    .push((key, k == WEnum::Value(wl_keyboard::KeyState::Pressed)));
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, .. } => state.mods_depressed = mods_depressed,
+            wl_keyboard::Event::Keymap { size, .. } => state.keymaps.push(size),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter { surface, .. } => state.pointer_focus = surface.data::<usize>().copied(),
+            wl_pointer::Event::Leave { .. } => state.pointer_focus = None,
+            wl_pointer::Event::Button { button, state: b, .. } => {
+                state
+                    .buttons
+                    .push((button, b == WEnum::Value(wl_pointer::ButtonState::Pressed)));
+            }
             _ => {}
         }
     }

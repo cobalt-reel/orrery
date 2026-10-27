@@ -78,3 +78,11 @@ Full suite, clippy, fmt, cleanliness scan, README vs design, "As built". Then th
   before it).
 - A Handoff that fails to send (a keymap too large for a frame included) is a link loss (`link_lost`), never half a
   handoff.
+- The primary only logs an InputExit so far (`primary_got`): hand it on with `landing` and `Crossing::cross`.
+- A satellite that sent an InputExit holds its pointer still (motion still in flight is dropped there) until its
+  next Handoff. An exit that lands nowhere (past the row's end) must send that satellite a Handoff again (its held
+  modifiers: keys already down there are not pressed twice), or its pointer stays stuck at the edge.
+- `inject` calls the input path directly (`key_input`, `pointer_to`, `button_input`, `axis_input`; `comp/remote.rs`):
+  send it through forwarding as device input goes, so the forwarding tests can drive the primary with it.
+- A bind typed while input is on a satellite runs there: `workspace N` for another machine's number is refused there
+  ("switch to it from the primary"); no message carries a session bind to the primary yet.

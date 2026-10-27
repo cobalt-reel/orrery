@@ -8,13 +8,15 @@
 //! (`RawKey`): keystrokes are never logged.
 //!
 //! The pointer crosses at the edges of a row of screens (`RowScreen`); motion on its way to a machine is coalesced
-//! while the link cannot take more (`Outbox`).
+//! while the link cannot take more (`Outbox`). On a machine, relative motion moves its pointer over its own screens
+//! and out at their outer edges (`step`), and the pointer comes in at one (`enter`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::layout::Rect;
 use crate::link::Message;
 
 /// A key by its raw keycode (xkb's: evdev's plus 8). Debug never shows which: keystrokes are never logged.
@@ -267,6 +269,78 @@ pub fn landing(row: &[RowScreen], machine: &str, edge: Edge, y: f64) -> Option<L
             y: unit(y),
         },
     })
+}
+
+/// Where relative motion takes this machine's pointer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Step {
+    /// To this point, on its screens.
+    To(f64, f64),
+    /// Out past an outer edge: the pointer goes to it, at `at`, and leaves.
+    Exit { out: Exit, at: (f64, f64) },
+}
+
+/// The pointer at `(x, y)` moved by `(dx, dy)` over this machine's `screens` (global rectangles, in any order): to a
+/// point on them (past their top or bottom, or into a gap, it slides along the edge of the screen under it), or out
+/// past the left of the leftmost or the right of the rightmost (`exit` over them, left to right). None without
+/// screens.
+#[must_use]
+pub fn step(screens: &[Rect], (x, y): (f64, f64), (dx, dy): (f64, f64)) -> Option<Step> {
+    let row = left_to_right(screens);
+    let (first, last) = (row.first()?, row.last()?);
+    let (nx, ny) = (x + dx, y + dy);
+    if !(nx.is_finite() && ny.is_finite()) {
+        return Some(Step::To(x, y));
+    }
+    let column = |r: &Rect, px: f64| px >= f64::from(r.x) && px < f64::from(r.x + r.w);
+    let inside = |r: &Rect, px: f64, py: f64| column(r, px) && py >= f64::from(r.y) && py < f64::from(r.y + r.h);
+    // The screen the motion ends over: the outer one past either end, else the one under it, else the one in its
+    // column, else (a gap) the one it left.
+    let at = match () {
+        () if nx < f64::from(first.x) => 0,
+        () if nx >= f64::from(last.x + last.w) => row.len() - 1,
+        () => (row.iter().position(|r| inside(r, nx, ny)))
+            .or_else(|| row.iter().position(|r| column(r, nx)))
+            .or_else(|| row.iter().position(|r| inside(r, x, y)))
+            .unwrap_or(0),
+    };
+    let r = row[at];
+    // One machine's screens, as `exit` reads a row.
+    let named: Vec<RowScreen> = (row.iter().enumerate())
+        .map(|(i, r)| RowScreen {
+            machine: String::new(),
+            screen: i.to_string(),
+            width: u32::try_from(r.w).unwrap_or(0),
+            height: u32::try_from(r.h).unwrap_or(0),
+        })
+        .collect();
+    let clamp = |v: f64, from: i32, len: i32| v.clamp(f64::from(from), f64::from(from + len - 1));
+    let kept = (clamp(nx, r.x, r.w), clamp(ny, r.y, r.h));
+    Some(match exit(&named, at, nx - f64::from(r.x), ny - f64::from(r.y)) {
+        Some(out) => Step::Exit { out, at: kept },
+        None if inside(&r, nx, ny) => Step::To(nx, ny),
+        None => Step::To(kept.0, kept.1),
+    })
+}
+
+/// Where the pointer enters this machine's `screens` (global rectangles, in any order) at `entry`: on the leftmost
+/// at the left edge, the rightmost at the right. None without screens.
+#[must_use]
+pub fn enter(screens: &[Rect], entry: Entry) -> Option<(f64, f64)> {
+    let row = left_to_right(screens);
+    let r = match entry.edge {
+        Edge::Left => row.first()?,
+        Edge::Right => row.last()?,
+    };
+    let (x, y) = entry.point(u32::try_from(r.w).unwrap_or(0), u32::try_from(r.h).unwrap_or(0));
+    Some((f64::from(r.x) + x, f64::from(r.y) + y))
+}
+
+/// `screens` that have an area, left to right.
+fn left_to_right(screens: &[Rect]) -> Vec<Rect> {
+    let mut row: Vec<Rect> = screens.iter().copied().filter(|r| r.w > 0 && r.h > 0).collect();
+    row.sort_by_key(|r| (r.x, r.y));
+    row
 }
 
 /// `y` as a fraction of `height`, inside 0..=1; 0 for a screen of no height.
@@ -606,6 +680,78 @@ mod tests {
             let l = landing(&flat, "p", Edge::Right, y).expect("lands");
             assert!((0.0..=1.0).contains(&l.entry.y), "{y}: {}", l.entry.y);
         }
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn relative_motion_stays_on_this_machines_screens_or_leaves_at_its_outer_edges() {
+        let one = [rect(0, 0, 640, 480)];
+        assert_eq!(step(&one, (10.0, 10.0), (5.0, 5.0)), Some(Step::To(15.0, 15.0)));
+        // Past the top or the bottom: it slides along the edge.
+        assert_eq!(step(&one, (10.0, 10.0), (0.0, 1000.0)), Some(Step::To(10.0, 479.0)));
+        assert_eq!(step(&one, (10.0, 10.0), (3.0, -50.0)), Some(Step::To(13.0, 0.0)));
+        // Past the left or the right: to the edge and out there, at its height (a fraction).
+        let out = |edge, y, at| {
+            Some(Step::Exit {
+                out: Exit { edge, y },
+                at,
+            })
+        };
+        assert_eq!(
+            step(&one, (5.0, 120.0), (-20.0, 0.0)),
+            out(Edge::Left, 0.25, (0.0, 120.0))
+        );
+        assert_eq!(
+            step(&one, (630.0, 240.0), (10.0, 0.0)),
+            out(Edge::Right, 0.5, (639.0, 240.0))
+        );
+        assert_eq!(step(&one, (630.0, 240.0), (9.5, 0.0)), Some(Step::To(639.5, 240.0)));
+        // Two screens, the second taller, given in any order: across to it, and back onto the shorter one at its
+        // bottom; out only past the outer edges, wherever the motion started.
+        let two = [rect(640, 0, 800, 600), rect(0, 0, 640, 480)];
+        assert_eq!(step(&two, (630.0, 100.0), (20.0, 0.0)), Some(Step::To(650.0, 100.0)));
+        assert_eq!(step(&two, (700.0, 550.0), (-100.0, 0.0)), Some(Step::To(600.0, 479.0)));
+        assert_eq!(
+            step(&two, (1430.0, 300.0), (20.0, 0.0)),
+            out(Edge::Right, 0.5, (1439.0, 300.0))
+        );
+        assert_eq!(
+            step(&two, (100.0, 300.0), (5000.0, 0.0)),
+            out(Edge::Right, 0.5, (1439.0, 300.0))
+        );
+        assert_eq!(
+            step(&two, (1000.0, 120.0), (-5000.0, -500.0)),
+            out(Edge::Left, 0.0, (0.0, 0.0))
+        );
+        // Motion that is not a number goes nowhere; no screens, no pointer.
+        assert_eq!(step(&one, (10.0, 10.0), (f64::NAN, 1.0)), Some(Step::To(10.0, 10.0)));
+        assert_eq!(
+            step(&one, (10.0, 10.0), (f64::INFINITY, 1.0)),
+            Some(Step::To(10.0, 10.0))
+        );
+        assert_eq!(step(&[], (0.0, 0.0), (1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn the_pointer_enters_at_the_outer_screen_on_its_side() {
+        let two = [rect(640, 0, 800, 600), rect(0, 0, 640, 480)];
+        let at = |edge, y| enter(&two, Entry { edge, y });
+        assert_eq!(at(Edge::Left, 0.5), Some((0.0, 240.0)));
+        assert_eq!(at(Edge::Right, 0.5), Some((1439.0, 300.0)));
+        assert_eq!(at(Edge::Right, 1.0), Some((1439.0, 599.0)));
+        assert_eq!(
+            enter(
+                &[],
+                Entry {
+                    edge: Edge::Left,
+                    y: 0.5
+                }
+            ),
+            None
+        );
     }
 
     fn motion(dx: f64, dy: f64) -> Message {

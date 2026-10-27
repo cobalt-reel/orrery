@@ -275,6 +275,21 @@ pub enum ScrollSource {
 }
 
 impl Message {
+    /// Input the primary sends a satellite: Keymap, Handoff, Key, Motion, Button, Axis or Release.
+    #[must_use]
+    pub fn is_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Keymap { .. }
+                | Self::Handoff { .. }
+                | Self::Key { .. }
+                | Self::Motion { .. }
+                | Self::Button { .. }
+                | Self::Axis { .. }
+                | Self::Release
+        )
+    }
+
     /// Its tag on the wire.
     fn kind(&self) -> &'static str {
         match self {
@@ -500,6 +515,15 @@ impl Link {
         if self.closed.is_none() {
             self.closed = Some(Closed::WeRefused(reason));
             self.noise = Noise::Gone;
+        }
+    }
+
+    /// This end cannot act on a message it was sent (a keymap that does not compile): closes the link as a protocol
+    /// error, dropping what was received after it. Nothing if closed already.
+    pub fn protocol_error(&mut self, why: impl Into<String>) {
+        if self.closed.is_none() {
+            self.received.clear();
+            self.fail(Closed::Protocol(why.into()));
         }
     }
 
@@ -1108,6 +1132,38 @@ mod tests {
         pri.send(&Message::Release).expect("sent");
         pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
         assert!(matches!(sat.closed(), Some(Closed::Protocol(_))));
+    }
+
+    #[test]
+    fn a_message_this_end_cannot_act_on_closes_the_link_and_drops_what_came_after() {
+        let (mut sat, mut pri) = joined();
+        let welcome = Message::Welcome {
+            renames: Vec::new(),
+            foreign: BTreeSet::new(),
+        };
+        pri.send(&welcome).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sat), [welcome]);
+        pri.send(&Message::Keymap {
+            xkb: Xkb("nonsense".into()),
+        })
+        .expect("sent");
+        pri.send(&Message::Release).expect("sent");
+        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+        assert!(matches!(sat.recv(), Some(Message::Keymap { .. })));
+        sat.protocol_error("a keymap that does not compile");
+        assert_eq!(
+            sat.closed(),
+            Some(&Closed::Protocol("a keymap that does not compile".into()))
+        );
+        assert_eq!(sat.recv(), None, "the Release after it is dropped");
+        assert!(sat.is_finished());
+        sat.protocol_error("again");
+        assert_eq!(
+            sat.closed(),
+            Some(&Closed::Protocol("a keymap that does not compile".into())),
+            "the first reason stays"
+        );
     }
 
     #[test]

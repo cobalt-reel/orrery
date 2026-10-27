@@ -58,7 +58,8 @@ near 0 % CPU.
 
 Options: `--config PATH` (default `$XDG_CONFIG_HOME/orrery/config.kdl`, else `~/.config/orrery/config.kdl`; no
 file means the built-in config, which is `examples/config.kdl`), `--socket PATH` (the control socket, default
-`$XDG_RUNTIME_DIR/orrery.sock`), and `--backend headless --size WxH` (no screen, for tests).
+`$XDG_RUNTIME_DIR/orrery.sock`), `--backend headless --size WxH` (no screen, for tests), and `--debug-inject` (a
+testing aid, off by default: orrery then answers `inject` and `inject-remote`, below).
 
 A second `orrery run` on the same control socket does not start another orrery: it asks the running one for one
 more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used).
@@ -156,6 +157,10 @@ orrery msg quit
 orrery msg '{"cmd":"layout","name":"wall"}'   # a single argument is taken as a JSON request
 orrery msg --socket /path/to/orrery.sock state
 orrery msg --to side state            # any request, run on that machine of the session (see Linking machines)
+orrery msg inject key 38 down         # testing aid (--debug-inject only): input as if from this machine's devices:
+                                      #   key XKB-KEYCODE down|up, motion DX DY, button CODE down|up, axis H V
+orrery msg inject-remote side release # testing aid (--debug-inject, primary): an input message sent to a satellite
+                                      #   as it is: the same four, handoff [KEYCODE...], release; keymap in JSON
 ```
 
 Errors come back as `{"ok":false,"error":"..."}` (also printed on stderr), e.g. an unknown layout or monitor.

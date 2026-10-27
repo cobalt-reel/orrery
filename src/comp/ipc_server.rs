@@ -250,7 +250,7 @@ struct LineReader {
     scanned: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Line {
     /// Not a whole line yet: read more.
     Partial,
