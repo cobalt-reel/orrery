@@ -129,22 +129,24 @@ pub fn find_bind(binds: &[Bind], mods: Mods, sym: Keysym) -> Option<&Bind> {
     binds.iter().find(|b| matches(b, mods, sym))
 }
 
-/// The control-socket request an action is, so keys and `orrery msg` take one path. Spawn and show-tabs are
-/// keys only.
+/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs is a key only.
 #[must_use]
 pub fn action_request(action: &Action) -> Option<Request> {
     Some(match action {
         Action::FocusSlot(dir) => Request::FocusSlot { dir: *dir },
-        Action::MoveTab(dir) => Request::MoveTab { dir: *dir },
+        Action::Move(dir) => Request::Move { dir: *dir },
         Action::SwapSlot(dir) => Request::SwapSlot { dir: *dir },
         Action::CycleTab(cycle) => Request::CycleTab { cycle: *cycle },
+        Action::Split => Request::Split,
+        Action::ToggleStacking => Request::ToggleStacking,
+        Action::Spawn(argv) => Request::Spawn { argv: argv.clone() },
         Action::Layout(name) => Request::Layout {
             name: name.clone(),
             monitor: None,
         },
         Action::Close => Request::Close,
         Action::Quit => Request::Quit,
-        Action::Spawn(_) | Action::ShowTabs => return None,
+        Action::ShowTabs => return None,
     })
 }
 
@@ -204,10 +206,6 @@ impl Orrery {
 
     /// A bind's action. Failures are logged: a key has nowhere to answer.
     pub fn run_action(&mut self, action: Action) {
-        if let Action::Spawn(argv) = &action {
-            self.spawn(argv);
-            return;
-        }
         if let Some(request) = action_request(&action) {
             let response = self.handle_request(request);
             if let Some(e) = response.error {
@@ -377,7 +375,9 @@ mod tests {
     #[test]
     fn shifted_binds_match_the_unshifted_sym() {
         // The raw sym of Shift+H is h, of Shift+Tab is Tab (its shifted sym, ISO_Left_Tab, must not be needed).
-        assert_eq!(action_for(MOD_SHIFT, k::KEY_h), Some(Action::MoveTab(Dir::Left)));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_h), Some(Action::Move(Dir::Left)));
+        assert_eq!(action_for(MOD, k::KEY_s), Some(Action::Split));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_s), Some(Action::ToggleStacking));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_Tab), Some(Action::CycleTab(Cycle::Prev)));
         assert_eq!(action_for(MOD, k::KEY_Tab), Some(Action::CycleTab(Cycle::Next)));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_e), Some(Action::Quit));
@@ -394,7 +394,7 @@ mod tests {
             "close is Mod+Shift+Q, as Hyprland's killactive"
         );
         assert_eq!(action_for(MOD_CTRL, k::KEY_l), Some(Action::SwapSlot(Dir::Right)));
-        assert_eq!(action_for(MOD_SHIFT, k::KEY_l), Some(Action::MoveTab(Dir::Right)));
+        assert_eq!(action_for(MOD_SHIFT, k::KEY_l), Some(Action::Move(Dir::Right)));
         assert_eq!(fold(sym(k::KEY_Return)), sym(k::KEY_Return));
         assert_eq!(fold(sym(k::KEY_Eacute)), sym(k::KEY_eacute));
         assert_eq!(fold(sym(k::KEY_1)), sym(k::KEY_1));
@@ -527,7 +527,14 @@ mod tests {
             action_request(&Action::SwapSlot(Dir::Up)),
             Some(Request::SwapSlot { dir: Dir::Up })
         );
-        assert_eq!(action_request(&Action::Spawn(vec!["kitty".into()])), None);
+        assert_eq!(
+            action_request(&Action::Spawn(vec!["kitty".into()])),
+            Some(Request::Spawn {
+                argv: vec!["kitty".into()]
+            })
+        );
+        assert_eq!(action_request(&Action::Split), Some(Request::Split));
+        assert_eq!(action_request(&Action::ToggleStacking), Some(Request::ToggleStacking));
         assert_eq!(action_request(&Action::ShowTabs), None);
     }
 

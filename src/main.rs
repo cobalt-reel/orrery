@@ -16,18 +16,34 @@ struct Cli {
 enum Command {
     /// Run the compositor (the default).
     Run(RunArgs),
-    #[command(about = format!("Send one request to a running {NAME}"))]
+    #[command(
+        about = format!("Send one request to a running {NAME}"),
+        subcommand_negates_reqs = true
+    )]
     Msg {
         #[arg(long, help = socket_help())]
         socket: Option<PathBuf>,
         /// Words (`focus-slot left`) or a single JSON request.
         #[arg(required = true)]
         request: Vec<String>,
+        #[command(subcommand)]
+        spawn: Option<MsgSpawn>,
     },
     /// Validate a config file: `ok`, or every problem as `FILE:LINE:COL: message`; exit 0 or 1.
     Check {
         #[arg(long, help = format!("Default: `{}`", config_default()))]
         config: Option<PathBuf>,
+    },
+}
+
+/// `msg spawn` is a subcommand only so that its argv is taken verbatim, flags included; every other request is
+/// words, with `--socket` before or after them.
+#[derive(Subcommand)]
+enum MsgSpawn {
+    /// Launch a program as a `spawn` bind does: every word after `spawn` is its argv (no shell).
+    Spawn {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -78,7 +94,13 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Msg { socket, request } => msg(socket, &request),
+        Command::Msg { socket, request, spawn } => {
+            let words = match spawn {
+                Some(MsgSpawn::Spawn { argv }) => std::iter::once("spawn".to_owned()).chain(argv).collect(),
+                None => request,
+            };
+            msg(socket, &words)
+        }
         Command::Check { config } => check(config),
     }
 }
@@ -174,19 +196,60 @@ mod tests {
 
     #[test]
     fn msg_takes_options_before_or_after_the_words() {
-        let Some(Command::Msg { request, socket }) =
+        let Some(Command::Msg { request, socket, .. }) =
             Cli::parse_from([NAME, "msg", "--socket", "/s", "layout", "wall"]).command
         else {
             panic!("msg parses");
         };
         assert_eq!(request, ["layout", "wall"]);
         assert_eq!(socket, Some(PathBuf::from("/s")));
-        let Some(Command::Msg { request, socket }) =
+        let Some(Command::Msg { request, socket, .. }) =
             Cli::parse_from([NAME, "msg", "focus-slot", "left", "--socket", "/t"]).command
         else {
             panic!("msg parses");
         };
         assert_eq!(request, ["focus-slot", "left"]);
         assert_eq!(socket, Some(PathBuf::from("/t")));
+    }
+
+    #[test]
+    fn msg_spawn_passes_the_programs_own_flags() {
+        let Some(Command::Msg {
+            socket,
+            spawn: Some(MsgSpawn::Spawn { argv }),
+            ..
+        }) = Cli::parse_from([
+            NAME,
+            "msg",
+            "--socket",
+            "/s",
+            "spawn",
+            "kitty",
+            "--single-instance",
+            "--socket",
+            "x",
+        ])
+        .command
+        else {
+            panic!("msg spawn parses");
+        };
+        assert_eq!(
+            argv,
+            ["kitty", "--single-instance", "--socket", "x"],
+            "all of it is argv"
+        );
+        assert_eq!(socket, Some(PathBuf::from("/s")));
+        assert!(
+            Cli::try_parse_from([NAME, "msg", "spawn"]).is_err(),
+            "spawn needs a program"
+        );
+        // Only a first word is the subcommand: a layout may be called spawn.
+        let Some(Command::Msg {
+            request, spawn: None, ..
+        }) = Cli::parse_from([NAME, "msg", "layout", "spawn", "x"]).command
+        else {
+            panic!("msg parses as words");
+        };
+        assert_eq!(request, ["layout", "spawn", "x"]);
     }
 }

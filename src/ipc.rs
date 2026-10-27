@@ -8,13 +8,14 @@ use crate::stacks::{Stacks, WinId};
 
 /// Read through `Wire`: every variant needs a twin there (a test fails to compile until it has one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "cmd", rename_all = "kebab-case", from = "Wire")]
+#[serde(tag = "cmd", rename_all = "kebab-case", try_from = "Wire")]
 pub enum Request {
     State,
     FocusSlot {
         dir: Dir,
     },
-    MoveTab {
+    /// The focused slot's current tab, its whole stack, to the neighbour.
+    Move {
         dir: Dir,
     },
     SwapSlot {
@@ -32,6 +33,13 @@ pub enum Request {
     Close,
     Reload,
     Quit,
+    /// The focused stack's top window becomes a tab of its own.
+    Split,
+    ToggleStacking,
+    /// Launches a program as a `spawn` bind does; never empty, no empty program.
+    Spawn {
+        argv: Vec<String>,
+    },
 }
 
 /// How a `Request` is read: serde ignores unknown fields on internally tagged unit variants, so here they are
@@ -41,7 +49,7 @@ pub enum Request {
 enum Wire {
     State {},
     FocusSlot { dir: Dir },
-    MoveTab { dir: Dir },
+    Move { dir: Dir },
     SwapSlot { dir: Dir },
     CycleTab { cycle: Cycle },
     // A missing Option field reads as None without `#[serde(default)]`.
@@ -49,21 +57,39 @@ enum Wire {
     Close {},
     Reload {},
     Quit {},
+    Split {},
+    ToggleStacking {},
+    Spawn { argv: Vec<String> },
 }
 
-impl From<Wire> for Request {
-    fn from(w: Wire) -> Self {
-        match w {
+impl TryFrom<Wire> for Request {
+    type Error = String;
+
+    fn try_from(w: Wire) -> Result<Self, String> {
+        Ok(match w {
             Wire::State {} => Request::State,
             Wire::FocusSlot { dir } => Request::FocusSlot { dir },
-            Wire::MoveTab { dir } => Request::MoveTab { dir },
+            Wire::Move { dir } => Request::Move { dir },
             Wire::SwapSlot { dir } => Request::SwapSlot { dir },
             Wire::CycleTab { cycle } => Request::CycleTab { cycle },
             Wire::Layout { name, monitor } => Request::Layout { name, monitor },
             Wire::Close {} => Request::Close,
             Wire::Reload {} => Request::Reload,
             Wire::Quit {} => Request::Quit,
-        }
+            Wire::Split {} => Request::Split,
+            Wire::ToggleStacking {} => Request::ToggleStacking,
+            Wire::Spawn { argv } => Request::Spawn {
+                argv: spawn_argv(argv)?,
+            },
+        })
+    }
+}
+
+/// A spawn's argv as a request carries it: a program, which is not empty, then its arguments.
+fn spawn_argv(argv: Vec<String>) -> Result<Vec<String>, String> {
+    match argv.first() {
+        Some(program) if !program.is_empty() => Ok(argv),
+        _ => Err("`spawn` takes a program and its arguments".into()),
     }
 }
 
@@ -79,6 +105,9 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateView {
     pub monitors: Vec<MonitorView>,
+    /// Where a window with nowhere else to go opens: on top of the focused slot's current stack (true), or as a
+    /// new tab there (false). `toggle-stacking` flips it.
+    pub stacking: bool,
     pub config_error: Option<String>,
     /// How long drawing a frame takes (the renderer's backends only; absent before the first frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,12 +152,23 @@ pub struct SlotView {
     pub name: Option<String>,
     pub rect: Rect,
     pub focused: bool,
-    /// Bottom to top, like the stack.
+    /// Left to right.
     pub tabs: Vec<TabView>,
 }
 
+/// One tab: a stack of windows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabView {
+    /// The tab the slot shows.
+    pub current: bool,
+    /// A window of the stack asked for attention.
+    pub attention: bool,
+    /// Bottom to top, like the stack.
+    pub windows: Vec<WindowView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowView {
     pub id: u64,
     pub app_id: Option<String>,
     pub title: Option<String>,
@@ -164,6 +204,7 @@ impl StateView {
     /// no slot and are not listed.
     pub fn new(
         stacks: &Stacks,
+        stacking: bool,
         config_error: Option<String>,
         info: impl Fn(WinId) -> (Option<String>, Option<String>),
     ) -> Self {
@@ -185,14 +226,21 @@ impl StateView {
                         name: spec.name.clone(),
                         rect,
                         focused: focused && index == mon.focus(),
-                        // Every window of the slot, tab by tab, bottom to top.
                         tabs: slot
                             .tabs()
                             .iter()
-                            .flatten()
-                            .map(|&id| {
-                                let (app_id, title) = info(id);
-                                TabView { id, app_id, title }
+                            .enumerate()
+                            .map(|(t, stack)| TabView {
+                                current: t == slot.current(),
+                                // Nothing marks a window yet.
+                                attention: false,
+                                windows: stack
+                                    .iter()
+                                    .map(|&id| {
+                                        let (app_id, title) = info(id);
+                                        WindowView { id, app_id, title }
+                                    })
+                                    .collect(),
                             })
                             .collect(),
                     })
@@ -207,6 +255,7 @@ impl StateView {
             .collect();
         StateView {
             monitors,
+            stacking,
             config_error,
             frames: None,
             last_key: None,
@@ -216,12 +265,13 @@ impl StateView {
 
 impl Request {
     /// Runs a pure request against the stacks, layout names resolved in `config`. On error nothing changed.
-    /// `state`, `reload` and `quit` are the compositor's to answer, and so is `close`: closing asks the client
-    /// to go, and its window leaves the stacks only when it is destroyed.
+    /// `state`, `reload`, `quit`, `toggle-stacking` and `spawn` are the compositor's to answer, and so is
+    /// `close`: closing asks the client to go, and its window leaves the stacks only when it is destroyed.
     pub fn apply(&self, stacks: &mut Stacks, config: &Config) -> Result<(), String> {
         match self {
             Request::FocusSlot { dir } => stacks.focus_slot(*dir),
-            Request::MoveTab { dir } => stacks.move_stack(*dir),
+            Request::Move { dir } => stacks.move_stack(*dir),
+            Request::Split => stacks.split(),
             Request::SwapSlot { dir } => stacks.swap_slot(*dir),
             Request::CycleTab { cycle } => stacks.cycle_tab(*cycle),
             Request::Layout { name, monitor } => {
@@ -241,7 +291,12 @@ impl Request {
                 };
                 stacks.set_layout(&target, layout.clone());
             }
-            Request::State | Request::Close | Request::Reload | Request::Quit => {
+            Request::State
+            | Request::Close
+            | Request::Reload
+            | Request::Quit
+            | Request::ToggleStacking
+            | Request::Spawn { .. } => {
                 return Err(format!("{} is answered by the compositor", self.verb()));
             }
         }
@@ -252,18 +307,22 @@ impl Request {
         match self {
             Request::State => "state",
             Request::FocusSlot { .. } => "focus-slot",
-            Request::MoveTab { .. } => "move-tab",
+            Request::Move { .. } => "move",
             Request::SwapSlot { .. } => "swap-slot",
             Request::CycleTab { .. } => "cycle-tab",
             Request::Layout { .. } => "layout",
             Request::Close => "close",
             Request::Reload => "reload",
             Request::Quit => "quit",
+            Request::Split => "split",
+            Request::ToggleStacking => "toggle-stacking",
+            Request::Spawn { .. } => "spawn",
         }
     }
 }
 
-/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`) or a single JSON request.
+/// `orrery msg` arguments: words (`focus-slot left`, `layout wall [MONITOR]`, `spawn PROGRAM [ARGS...]`) or a
+/// single JSON request.
 pub fn parse_words(words: &[String]) -> Result<Request, String> {
     if let [one] = words
         && one.trim_start().starts_with('{')
@@ -290,8 +349,13 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
         "close" => none(Request::Close),
         "reload" => none(Request::Reload),
         "quit" => none(Request::Quit),
+        "split" => none(Request::Split),
+        "toggle-stacking" => none(Request::ToggleStacking),
+        "spawn" => Ok(Request::Spawn {
+            argv: spawn_argv(args.iter().map(|a| (*a).to_owned()).collect())?,
+        }),
         "focus-slot" => Ok(Request::FocusSlot { dir: dir(&args)? }),
-        "move-tab" => Ok(Request::MoveTab { dir: dir(&args)? }),
+        "move" => Ok(Request::Move { dir: dir(&args)? }),
         "swap-slot" => Ok(Request::SwapSlot { dir: dir(&args)? }),
         "cycle-tab" => match args.as_slice() {
             ["next"] => Ok(Request::CycleTab { cycle: Cycle::Next }),
@@ -332,17 +396,20 @@ mod tests {
         match r.clone() {
             Request::State => (0, Wire::State {}),
             Request::FocusSlot { dir } => (1, Wire::FocusSlot { dir }),
-            Request::MoveTab { dir } => (2, Wire::MoveTab { dir }),
+            Request::Move { dir } => (2, Wire::Move { dir }),
             Request::SwapSlot { dir } => (3, Wire::SwapSlot { dir }),
             Request::CycleTab { cycle } => (4, Wire::CycleTab { cycle }),
             Request::Layout { name, monitor } => (5, Wire::Layout { name, monitor }),
             Request::Close => (6, Wire::Close {}),
             Request::Reload => (7, Wire::Reload {}),
             Request::Quit => (8, Wire::Quit {}),
+            Request::Split => (9, Wire::Split {}),
+            Request::ToggleStacking => (10, Wire::ToggleStacking {}),
+            Request::Spawn { argv } => (11, Wire::Spawn { argv }),
         }
     }
 
-    const VARIANTS: usize = 9;
+    const VARIANTS: usize = 12;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -350,7 +417,7 @@ mod tests {
             .iter()
             .map(|r| {
                 let (i, w) = twin(r);
-                assert_eq!(&Request::from(w), r);
+                assert_eq!(Request::try_from(w).as_ref(), Ok(r));
                 i
             })
             .collect();
@@ -361,7 +428,7 @@ mod tests {
         vec![
             Request::State,
             Request::FocusSlot { dir: Dir::Left },
-            Request::MoveTab { dir: Dir::Right },
+            Request::Move { dir: Dir::Right },
             Request::SwapSlot { dir: Dir::Up },
             Request::CycleTab { cycle: Cycle::Next },
             Request::CycleTab { cycle: Cycle::Prev },
@@ -376,6 +443,11 @@ mod tests {
             Request::Close,
             Request::Reload,
             Request::Quit,
+            Request::Split,
+            Request::ToggleStacking,
+            Request::Spawn {
+                argv: vec!["kitty".into(), "--single-instance".into()],
+            },
         ]
     }
 
@@ -406,6 +478,18 @@ mod tests {
             }),
             r#"{"cmd":"layout","name":"wall"}"#
         );
+        assert_eq!(
+            json(&Request::Move { dir: Dir::Left }),
+            r#"{"cmd":"move","dir":"left"}"#
+        );
+        assert_eq!(json(&Request::Split), r#"{"cmd":"split"}"#);
+        assert_eq!(json(&Request::ToggleStacking), r#"{"cmd":"toggle-stacking"}"#);
+        assert_eq!(
+            json(&Request::Spawn {
+                argv: vec!["foot".into(), "-e".into()]
+            }),
+            r#"{"cmd":"spawn","argv":["foot","-e"]}"#
+        );
     }
 
     #[test]
@@ -417,6 +501,11 @@ mod tests {
             r#"{"cmd":"close","force":true}"#,
             r#"{"cmd":"focus-slot","dir":"left","x":1}"#,
             r#"{"cmd":"layout"}"#,
+            r#"{"cmd":"move-tab","dir":"left"}"#,
+            r#"{"cmd":"split","dir":"left"}"#,
+            r#"{"cmd":"spawn"}"#,
+            r#"{"cmd":"spawn","argv":[]}"#,
+            r#"{"cmd":"spawn","argv":[""]}"#,
             r#"{"dir":"left"}"#,
             r#"[]"#,
         ] {
@@ -441,12 +530,17 @@ mod tests {
                     },
                     focused: true,
                     tabs: vec![TabView {
-                        id: 7,
-                        app_id: Some("kitty".into()),
-                        title: None,
+                        current: true,
+                        attention: false,
+                        windows: vec![WindowView {
+                            id: 7,
+                            app_id: Some("kitty".into()),
+                            title: None,
+                        }],
                     }],
                 }],
             }],
+            stacking: true,
             config_error: None,
             frames: Some(FramesView {
                 count: 10,
@@ -483,7 +577,15 @@ mod tests {
         let cases = [
             ("state", Request::State),
             ("focus-slot left", Request::FocusSlot { dir: Dir::Left }),
-            ("move-tab right", Request::MoveTab { dir: Dir::Right }),
+            ("move right", Request::Move { dir: Dir::Right }),
+            ("split", Request::Split),
+            ("toggle-stacking", Request::ToggleStacking),
+            (
+                "spawn kitty --single-instance",
+                Request::Spawn {
+                    argv: vec!["kitty".into(), "--single-instance".into()],
+                },
+            ),
             ("swap-slot up", Request::SwapSlot { dir: Dir::Up }),
             ("focus-slot down", Request::FocusSlot { dir: Dir::Down }),
             ("cycle-tab next", Request::CycleTab { cycle: Cycle::Next }),
@@ -513,8 +615,8 @@ mod tests {
 
     #[test]
     fn a_single_json_argument_is_parsed_as_json() {
-        let arg = vec![r#"{"cmd":"move-tab","dir":"left"}"#.to_owned()];
-        assert_eq!(parse_words(&arg), Ok(Request::MoveTab { dir: Dir::Left }));
+        let arg = vec![r#"{"cmd":"move","dir":"left"}"#.to_owned()];
+        assert_eq!(parse_words(&arg), Ok(Request::Move { dir: Dir::Left }));
         let bad = vec![r#"{"cmd":"nope"}"#.to_owned()];
         assert!(parse_words(&bad).is_err());
     }
@@ -526,7 +628,12 @@ mod tests {
             ("explode", "unknown"),
             ("focus-slot", "direction"),
             ("focus-slot sideways", "direction"),
-            ("move-tab left right", "direction"),
+            ("move left right", "direction"),
+            ("move", "direction"),
+            ("move-tab left", "unknown"),
+            ("split now", "no arguments"),
+            ("toggle-stacking on", "no arguments"),
+            ("spawn", "program"),
             ("cycle-tab", "next"),
             ("cycle-tab forward", "next"),
             ("layout", "layout"),
@@ -551,22 +658,24 @@ mod tests {
         };
         s.add_monitor("winit", area, layout("wall"));
         s.add_monitor("other", area, layout("halves"));
-        // Three tabs, so cycling has somewhere to go.
+        // Three tabs, so cycling has somewhere to go, the current one two deep, so split has something to split.
         s.open_stacked(1);
         s.open_tab(2, None, None);
         s.open_tab(3, None, None);
+        s.open_stacked(4);
         (s, config)
     }
 
     #[test]
     fn apply_mirrors_the_stacks_methods() {
         type Op = fn(&mut Stacks);
-        let cases: [(Request, Op); 6] = [
+        let cases: [(Request, Op); 7] = [
             (Request::FocusSlot { dir: Dir::Right }, |s| s.focus_slot(Dir::Right)),
-            (Request::MoveTab { dir: Dir::Right }, |s| s.move_stack(Dir::Right)),
+            (Request::Move { dir: Dir::Right }, |s| s.move_stack(Dir::Right)),
             (Request::SwapSlot { dir: Dir::Down }, |s| s.swap_slot(Dir::Down)),
             (Request::CycleTab { cycle: Cycle::Next }, |s| s.cycle_tab(Cycle::Next)),
             (Request::CycleTab { cycle: Cycle::Prev }, |s| s.cycle_tab(Cycle::Prev)),
+            (Request::Split, |s| s.split()),
             (
                 Request::Layout {
                     name: "halves".into(),
@@ -633,7 +742,16 @@ mod tests {
 
     #[test]
     fn compositor_requests_are_not_applied_here() {
-        for req in [Request::State, Request::Close, Request::Reload, Request::Quit] {
+        for req in [
+            Request::State,
+            Request::Close,
+            Request::Reload,
+            Request::Quit,
+            Request::ToggleStacking,
+            Request::Spawn {
+                argv: vec!["true".into()],
+            },
+        ] {
             let (mut s, config) = setup();
             let err = req.apply(&mut s, &config).expect_err("not pure");
             assert!(err.contains("compositor"), "{err}");
@@ -653,11 +771,13 @@ mod tests {
         s.add_monitor("winit", uhd, layout("wall"));
         s.open_stacked(1);
         s.open_stacked(2);
+        s.open_tab(3, None, None);
         s.add_monitor("second", uhd, layout("halves"));
-        let v = StateView::new(&s, Some("broken".into()), |w| {
+        let v = StateView::new(&s, false, Some("broken".into()), |w| {
             (Some(format!("app{w}")), (w == 2).then(|| "two".into()))
         });
         assert_eq!(v.config_error.as_deref(), Some("broken"));
+        assert!(!v.stacking);
         assert_eq!(v.monitors.len(), 2);
         let m = &v.monitors[0];
         assert_eq!((m.name.as_str(), m.layout.as_str(), m.focused), ("winit", "wall", true));
@@ -676,14 +796,29 @@ mod tests {
                 focused: true,
                 tabs: vec![
                     TabView {
-                        id: 1,
-                        app_id: Some("app1".into()),
-                        title: None
+                        current: false,
+                        attention: false,
+                        windows: vec![
+                            WindowView {
+                                id: 1,
+                                app_id: Some("app1".into()),
+                                title: None
+                            },
+                            WindowView {
+                                id: 2,
+                                app_id: Some("app2".into()),
+                                title: Some("two".into())
+                            },
+                        ],
                     },
                     TabView {
-                        id: 2,
-                        app_id: Some("app2".into()),
-                        title: Some("two".into())
+                        current: true,
+                        attention: false,
+                        windows: vec![WindowView {
+                            id: 3,
+                            app_id: Some("app3".into()),
+                            title: None
+                        }],
                     },
                 ],
             }

@@ -73,13 +73,15 @@ fn three_windows_state_over_the_socket() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let state: serde_json::Value = serde_json::from_slice(&out.stdout).expect("state is JSON");
     let slot0 = &state["state"]["monitors"][0]["slots"][0];
-    let tabs: Vec<&str> = slot0["tabs"]
+    assert_eq!(slot0["tabs"].as_array().map(Vec::len), Some(1), "one tab: {slot0:#}");
+    assert_eq!(slot0["tabs"][0]["current"], true);
+    let windows: Vec<&str> = slot0["tabs"][0]["windows"]
         .as_array()
-        .expect("tabs")
+        .expect("windows")
         .iter()
-        .filter_map(|t| t["app_id"].as_str())
+        .filter_map(|w| w["app_id"].as_str())
         .collect();
-    assert_eq!(tabs, ["a", "b", "c"], "bottom to top");
+    assert_eq!(windows, ["a", "b", "c"], "bottom to top");
     assert_eq!(slot0["rect"]["w"], rects("wall")[0].w);
     assert_eq!(slot0["rect"]["h"], rects("wall")[0].h);
     drop(client);
@@ -271,9 +273,15 @@ fn slot_count(state: &serde_json::Value) -> usize {
     state["monitors"][0]["slots"].as_array().map_or(0, Vec::len)
 }
 
-fn tab_count(state: &serde_json::Value) -> usize {
+/// Windows in every slot, any tab.
+fn window_count(state: &serde_json::Value) -> usize {
+    let len = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len);
     state["monitors"][0]["slots"].as_array().map_or(0, |slots| {
-        slots.iter().map(|s| s["tabs"].as_array().map_or(0, Vec::len)).sum()
+        slots
+            .iter()
+            .flat_map(|s| s["tabs"].as_array().into_iter().flatten())
+            .map(|t| len(&t["windows"]))
+            .sum()
     })
 }
 
@@ -288,7 +296,7 @@ fn an_edited_config_is_picked_up_and_a_broken_one_keeps_the_old() {
     let state = wait_state(&orrery, |s| slot_count(s) == 4);
     assert!(state["config_error"].is_null(), "{state:#}");
     assert_eq!(state["monitors"][0]["layout"], "wall");
-    assert_eq!(tab_count(&state), 3);
+    assert_eq!(window_count(&state), 3);
     let quarter = Some((SIZE.0 / 2, SIZE.1 / 2));
     assert!(client.wait_for(|s| s.windows.iter().all(|w| w.size == quarter)));
 
@@ -303,7 +311,7 @@ fn an_edited_config_is_picked_up_and_a_broken_one_keeps_the_old() {
     orrery.write_config(&with_wall(3, 1));
     let state = wait_state(&orrery, |s| s["config_error"].is_null());
     assert_eq!(slot_count(&state), 3);
-    assert_eq!(tab_count(&state), 3, "no window lost on the way");
+    assert_eq!(window_count(&state), 3, "no window lost on the way");
     drop(client);
     assert!(orrery.stop().success());
 }

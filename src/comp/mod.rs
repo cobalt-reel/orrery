@@ -194,6 +194,17 @@ pub fn reapply_layouts(stacks: &mut Stacks, config: &Config) -> Vec<(String, Str
     kept
 }
 
+/// The running `stacking` after a reload from `old` to `new`: what `toggle-stacking` set survives, unless the
+/// config's own `stacking` changed, which then wins.
+#[must_use]
+pub fn stacking_after_reload(running: bool, old: &Config, new: &Config) -> bool {
+    if old.stacking == new.stacking {
+        running
+    } else {
+        new.stacking
+    }
+}
+
 /// The layout an output starts with: its monitor rule, else the first layout.
 pub fn layout_for_output(config: &Config, output: &str) -> Option<Layout> {
     let by_rule = config
@@ -233,6 +244,8 @@ pub struct Orrery {
     next_id: WinId,
     /// Where every window is.
     pub stacks: Stacks,
+    /// Where a window with nowhere else to go opens (see `Config::stacking`); `toggle-stacking` flips it.
+    pub stacking: bool,
     pub config: Config,
     /// Why the config file was not loaded (startup or the last reload); drawn as a red bar, shown in `state`.
     pub config_error: Option<String>,
@@ -312,6 +325,7 @@ impl Orrery {
             children: Vec::new(),
             next_id: 1,
             stacks: Stacks::new(),
+            stacking: config.stacking,
             config,
             config_error,
             config_path,
@@ -359,8 +373,9 @@ impl Orrery {
         id
     }
 
-    /// A toplevel's own surface committed. The first buffer opens it on top of the focused slot; a null buffer
-    /// (unmap) takes it out of the stacks and back to waiting.
+    /// A toplevel's own surface committed. The first buffer opens it on top of the focused slot's current stack,
+    /// or with stacking off as a new tab there; a null buffer (unmap) takes it out of the stacks and back to
+    /// waiting.
     pub fn toplevel_committed(&mut self, id: WinId, has_buffer: bool) {
         let Some(toplevel) = self.windows.get(&id).and_then(|w| w.toplevel()).cloned() else {
             return;
@@ -377,7 +392,11 @@ impl Orrery {
             toplevel.send_configure();
         }
         if has_buffer && self.opened.insert(id) {
-            self.stacks.open_stacked(id);
+            if self.stacking {
+                self.stacks.open_stacked(id);
+            } else {
+                self.stacks.open_tab(id, None, None);
+            }
             self.arrange();
         }
     }
@@ -547,6 +566,15 @@ impl Orrery {
                 self.loop_signal.stop();
                 Response::ok()
             }
+            Request::ToggleStacking => {
+                self.stacking = !self.stacking;
+                tracing::info!("stacking {}", if self.stacking { "on" } else { "off" });
+                Response::ok()
+            }
+            Request::Spawn { argv } => match self.spawn(&argv) {
+                Ok(()) => Response::ok(),
+                Err(e) => Response::error(e),
+            },
             pure => match pure.apply(&mut self.stacks, &self.config) {
                 Ok(()) => {
                     self.arrange();
@@ -558,8 +586,8 @@ impl Orrery {
     }
 
     /// Reads the config file again. A good one replaces the config (binds, colours, layouts: each monitor takes
-    /// its layout's new definition by name, or after a fallback start its monitor rule) and clears
-    /// `config_error`; a broken one leaves everything as it was and sets `config_error`, which shows as the red
+    /// its layout's new definition by name, or after a fallback start its monitor rule; `stacking` as
+    /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets `config_error`, which shows as the red
     /// bar until a good config loads. A file gone while running (an editor between delete and write, say) keeps
     /// the running config: the built-in one stands in only at startup. That is an error answer for `reload` but
     /// not a `config_error`.
@@ -581,6 +609,7 @@ impl Orrery {
                         tracing::info!("the new config has no layout {layout:?}; monitor {monitor} keeps it");
                     }
                 }
+                self.stacking = stacking_after_reload(self.stacking, &self.config, &config);
                 self.config = config;
                 self.config_error = None;
                 self.arrange();
@@ -608,7 +637,7 @@ impl Orrery {
 
     /// The `state` answer.
     pub fn state_view(&self) -> StateView {
-        let mut view = StateView::new(&self.stacks, self.config_error.clone(), |id| {
+        let mut view = StateView::new(&self.stacks, self.stacking, self.config_error.clone(), |id| {
             self.windows
                 .get(&id)
                 .and_then(|w| w.toplevel())
@@ -884,6 +913,21 @@ mod tests {
         assert_eq!(s.monitors()[0].layout(), &wide);
         assert_eq!(s.monitors()[1].layout(), &halves);
         assert_eq!(s.placements().map(|p| (p.monitor, p.win)).collect::<Vec<_>>(), [(0, 1)]);
+    }
+
+    #[test]
+    fn a_toggled_stacking_survives_a_reload_unless_the_config_changes_it() {
+        let on = config::default_config();
+        let off = Config {
+            stacking: false,
+            ..on.clone()
+        };
+        // Toggled off at runtime: an unchanged config keeps it off, and the other way round.
+        assert!(!stacking_after_reload(false, &on, &on));
+        assert!(stacking_after_reload(true, &off, &off));
+        // The config's own value changed: it wins, whatever the runtime said.
+        assert!(!stacking_after_reload(true, &on, &off));
+        assert!(stacking_after_reload(false, &off, &on));
     }
 
     #[test]

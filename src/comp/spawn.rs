@@ -1,4 +1,4 @@
-//! `spawn` binds: start a program with orrery as its display, detached from orrery's terminal and signals.
+//! `spawn` binds and `orrery msg spawn`: start a program with orrery as its display, detached from orrery's terminal and signals.
 //! Children are reaped on SIGCHLD (`Orrery::reap_children`, from the signal source in `run`). They are not
 //! signalled when orrery exits: each leads its own process group, deliberately, so a program started from
 //! orrery outlives it like one started from a launcher.
@@ -43,16 +43,19 @@ pub fn command(argv: &[String], display: &OsStr) -> Option<Command> {
 }
 
 impl Orrery {
-    pub fn spawn(&mut self, argv: &[String]) {
+    /// Starts `argv` (see `command`); the error says why it could not be started (a key logs it, `msg` answers
+    /// it).
+    pub fn spawn(&mut self, argv: &[String]) -> Result<(), String> {
         let Some(mut cmd) = command(argv, &self.socket_name) else {
-            return;
+            return Err("nothing to spawn: the argv is empty".into());
         };
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!("spawned {argv:?} (pid {})", child.id());
                 self.children.push(child);
+                Ok(())
             }
-            Err(e) => tracing::warn!("cannot spawn {argv:?}: {e}"),
+            Err(e) => Err(format!("cannot spawn {argv:?}: {e}")),
         }
     }
 

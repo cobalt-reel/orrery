@@ -40,8 +40,8 @@ fn start() -> (Compositor, Client) {
     (orrery, client)
 }
 
-/// Each slot's tabs as app ids, bottom to top, on the first monitor.
-fn tabs(state: &Value) -> Vec<Vec<String>> {
+/// Each slot's tabs, left to right, each its windows' app ids bottom to top, on the first monitor.
+fn tabs(state: &Value) -> Vec<Vec<Vec<String>>> {
     state["monitors"][0]["slots"]
         .as_array()
         .expect("slots")
@@ -51,9 +51,31 @@ fn tabs(state: &Value) -> Vec<Vec<String>> {
                 .as_array()
                 .expect("tabs")
                 .iter()
-                .map(|t| t["app_id"].as_str().unwrap_or("?").to_owned())
+                .map(|t| {
+                    t["windows"]
+                        .as_array()
+                        .expect("windows")
+                        .iter()
+                        .map(|w| w["app_id"].as_str().unwrap_or("?").to_owned())
+                        .collect()
+                })
                 .collect()
         })
+        .collect()
+}
+
+/// Each slot's windows, tab by tab, bottom to top.
+fn windows(state: &Value) -> Vec<Vec<String>> {
+    tabs(state).into_iter().map(|slot| slot.concat()).collect()
+}
+
+/// The index of each slot's current tab (None for an empty slot).
+fn current_tabs(state: &Value) -> Vec<Option<usize>> {
+    state["monitors"][0]["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .map(|slot| slot["tabs"].as_array()?.iter().position(|t| t["current"] == true))
         .collect()
 }
 
@@ -91,8 +113,12 @@ fn state_describes_monitors_slots_and_tabs() {
     assert_eq!(mon["slots"].as_array().map(Vec::len), Some(6));
     assert_eq!(mon["slots"][3]["name"], "hero");
     assert_eq!(mon["slots"][3]["rect"]["w"], rects("wall")[3].w);
-    assert_eq!(tabs(&state)[0], strs(&["a", "b", "c"]));
-    assert_eq!(state["monitors"][0]["slots"][0]["tabs"][2]["title"], "C");
+    assert_eq!(windows(&state)[0], strs(&["a", "b", "c"]));
+    assert_eq!(tabs(&state)[0], [strs(&["a", "b", "c"])], "one tab, three deep");
+    assert_eq!(state["monitors"][0]["slots"][0]["tabs"][0]["windows"][2]["title"], "C");
+    assert_eq!(state["monitors"][0]["slots"][0]["tabs"][0]["current"], true);
+    assert_eq!(state["monitors"][0]["slots"][0]["tabs"][0]["attention"], false);
+    assert_eq!(state["stacking"], true);
     assert_eq!(focused_slot(&state), Some(0));
     // Pretty-printed for people: more than one line.
     let out = orrery.msg(&["state"]);
@@ -109,7 +135,7 @@ fn focus_slot_moves_focus_and_new_windows_open_there() {
     let w = client.create_window("w", "W");
     let hero = size(rects("wall")[3]);
     assert!(client.wait_for(|s| s.windows[w].mapped() && s.windows[w].size == hero));
-    assert_eq!(tabs(&orrery.state())[3], strs(&["w"]));
+    assert_eq!(windows(&orrery.state())[3], strs(&["w"]));
     // At the edge: no-op, still ok.
     orrery.msg_ok(&["focus-slot", "up"]);
     assert_eq!(focused_slot(&orrery.state()), Some(3));
@@ -118,10 +144,10 @@ fn focus_slot_moves_focus_and_new_windows_open_there() {
 }
 
 #[test]
-fn move_tab_takes_the_whole_stack_to_the_neighbour() {
+fn move_takes_the_whole_stack_to_the_neighbour() {
     let (orrery, mut client) = start();
     let [a, b, c] = open_three(&mut client);
-    orrery.msg_ok(&["move-tab", "right"]);
+    orrery.msg_ok(&["move", "right"]);
     let hero = size(rects("wall")[3]);
     let ok = client.wait_for(|s| s.windows.iter().all(|w| w.size == hero) && s.windows[c].activated());
     assert!(
@@ -131,9 +157,114 @@ fn move_tab_takes_the_whole_stack_to_the_neighbour() {
     );
     assert!(!client.window(a).mapped() && !client.window(b).mapped());
     let state = orrery.state();
-    assert!(tabs(&state)[0].is_empty());
-    assert_eq!(tabs(&state)[3], strs(&["a", "b", "c"]));
+    assert!(windows(&state)[0].is_empty());
+    assert_eq!(tabs(&state)[3], [strs(&["a", "b", "c"])], "one tab, the whole stack");
     assert_eq!(focused_slot(&state), Some(3));
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn move_tab_is_gone() {
+    let (orrery, client) = start();
+    let out = orrery.msg(&["move-tab", "right"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "nothing was sent");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown request"));
+    let answer = orrery.raw(b"{\"cmd\":\"move-tab\",\"dir\":\"right\"}\n");
+    assert!(answer.contains("bad request"), "{answer}");
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn split_makes_the_top_window_a_tab_of_its_own() {
+    let (orrery, mut client) = start();
+    let [a, b, c] = open_three(&mut client);
+    orrery.msg_ok(&["split"]);
+    let state = orrery.state();
+    assert_eq!(tabs(&state)[0], [strs(&["a", "b"]), strs(&["c"])]);
+    assert_eq!(current_tabs(&state)[0], Some(1), "the new tab is current");
+    client.roundtrip();
+    assert!(client.window(c).mapped() && client.window(c).activated());
+    // Back to the first tab: b is its top.
+    orrery.msg_ok(&["cycle-tab", "prev"]);
+    assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated() && !s.windows[c].mapped()));
+    assert!(!client.window(a).mapped());
+    // A stack of one has nothing to split; still ok.
+    orrery.msg_ok(&["cycle-tab", "next"]);
+    orrery.msg_ok(&["split"]);
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"]), strs(&["c"])]);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn with_stacking_off_a_new_window_opens_as_a_new_tab() {
+    let (orrery, mut client) = start();
+    open_three(&mut client);
+    orrery.msg_ok(&["toggle-stacking"]);
+    assert_eq!(orrery.state()["stacking"], false);
+    let d = client.create_window("d", "D");
+    assert!(client.wait_for(|s| s.windows[d].mapped() && s.windows[d].activated()));
+    let state = orrery.state();
+    assert_eq!(tabs(&state)[0], [strs(&["a", "b", "c"]), strs(&["d"])]);
+    assert_eq!(current_tabs(&state)[0], Some(1));
+    // An empty focused slot gets its first tab either way.
+    orrery.msg_ok(&["focus-slot", "right"]);
+    let e = client.create_window("e", "E");
+    assert!(client.wait_for(|s| s.windows[e].mapped()));
+    assert_eq!(tabs(&orrery.state())[3], [strs(&["e"])]);
+    // On again: on top of the current stack.
+    orrery.msg_ok(&["toggle-stacking"]);
+    assert_eq!(orrery.state()["stacking"], true);
+    let f = client.create_window("f", "F");
+    assert!(client.wait_for(|s| s.windows[f].mapped() && !s.windows[e].mapped()));
+    assert_eq!(tabs(&orrery.state())[3], [strs(&["e", "f"])]);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_toggled_stacking_survives_a_reload_unless_the_config_changes_it() {
+    let (orrery, client) = start();
+    let stacking = || orrery.state()["stacking"].clone();
+    orrery.msg_ok(&["toggle-stacking"]);
+    // The same config (stacking on): the toggle stays.
+    orrery.write_config(config::DEFAULT);
+    orrery.msg_ok(&["reload"]);
+    assert_eq!(stacking(), false);
+    // The config's own value changed (to off): it wins over the toggle (on again).
+    orrery.msg_ok(&["toggle-stacking"]);
+    assert_eq!(stacking(), true);
+    let off = config::DEFAULT.replace("stacking #true", "stacking #false");
+    orrery.write_config(&off);
+    orrery.msg_ok(&["reload"]);
+    assert_eq!(stacking(), false);
+    // Unchanged again: the toggle survives.
+    orrery.msg_ok(&["toggle-stacking"]);
+    orrery.write_config(&format!("{off}// touched\n"));
+    orrery.msg_ok(&["reload"]);
+    assert_eq!(stacking(), true);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn msg_spawn_runs_the_argv_and_reports_a_failure() {
+    let (orrery, client) = start();
+    assert_eq!(
+        orrery.msg_ok(&["spawn", "sh", "-c", "exit 0"]),
+        serde_json::json!({"ok": true})
+    );
+    let err = orrery.msg_err(&["spawn", "/nonexistent/program", "--flag"]);
+    assert!(
+        err["error"].as_str().is_some_and(|e| e.contains("cannot spawn")),
+        "{err}"
+    );
+    // No program: refused before anything is sent.
+    let out = orrery.msg(&["spawn"]);
+    assert!(!out.status.success() && out.stdout.is_empty());
     drop(client);
     assert!(orrery.stop().success());
 }
@@ -146,8 +277,8 @@ fn swap_slot_swaps_whole_stacks() {
     let below = size(rects("wall")[1]);
     assert!(client.wait_for(|s| s.windows.iter().all(|w| w.size == below) && s.windows[c].activated()));
     let state = orrery.state();
-    assert!(tabs(&state)[0].is_empty());
-    assert_eq!(tabs(&state)[1], strs(&["a", "b", "c"]));
+    assert!(windows(&state)[0].is_empty());
+    assert_eq!(windows(&state)[1], strs(&["a", "b", "c"]));
     assert_eq!(focused_slot(&state), Some(1), "focus follows the stack");
     drop(client);
     assert!(orrery.stop().success());
@@ -164,16 +295,16 @@ fn cycle_tab_shows_the_next_tab_and_moves_nothing() {
     client.roundtrip();
     assert!(client.window(b).mapped() && !client.window(a).mapped());
     // The hero gets two tabs, [a, b] and [c], the second current.
-    orrery.msg_ok(&["move-tab", "right"]);
+    orrery.msg_ok(&["move", "right"]);
     orrery.msg_ok(&["focus-slot", "left"]);
     let c = client.create_window("c", "C");
     assert!(client.wait_for(|s| s.windows[c].mapped()));
-    orrery.msg_ok(&["move-tab", "right"]);
+    orrery.msg_ok(&["move", "right"]);
     let hero = size(rects("wall")[3]);
     assert!(client.wait_for(|s| s.windows[c].size == hero && s.windows[c].activated() && !s.windows[b].mapped()));
     orrery.msg_ok(&["cycle-tab", "next"]);
     assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated() && !s.windows[c].mapped()));
-    assert_eq!(tabs(&orrery.state())[3], strs(&["a", "b", "c"]), "tabs never move");
+    assert_eq!(windows(&orrery.state())[3], strs(&["a", "b", "c"]), "tabs never move");
     orrery.msg_ok(&["cycle-tab", "prev"]);
     assert!(client.wait_for(|s| s.windows[c].mapped() && s.windows[c].activated() && !s.windows[b].mapped()));
     assert!(!client.window(a).mapped());
@@ -220,7 +351,7 @@ fn close_asks_the_focused_window_to_go() {
     assert!(client.wait_for(|s| s.windows[c].close_requested));
     assert!(!client.window(a).close_requested && !client.window(b).close_requested);
     // Asking is not closing: c stays until the client destroys it.
-    assert_eq!(tabs(&orrery.state())[0], strs(&["a", "b", "c"]));
+    assert_eq!(windows(&orrery.state())[0], strs(&["a", "b", "c"]));
     client.destroy_window(c);
     assert!(client.wait_for(|s| s.windows[b].mapped() && s.windows[b].activated()));
 
@@ -262,7 +393,7 @@ fn reload_reports_a_broken_config_and_keeps_the_old_one() {
         "state shows it until fixed"
     );
     orrery.msg_ok(&["layout", "pair"]);
-    assert_eq!(tabs(&orrery.state()).concat(), strs(&["a", "b", "c"]));
+    assert_eq!(windows(&orrery.state()).concat(), strs(&["a", "b", "c"]));
 
     orrery.write_config(config::DEFAULT);
     orrery.msg_ok(&["reload"]);
@@ -403,12 +534,12 @@ fn a_disconnected_client_leaves_exactly_the_other_tabs() {
     assert!(second.wait_for(|s| s.windows[c].mapped()));
     let b = first.create_window("b", "B");
     assert!(first.wait_for(|s| s.windows[b].mapped()));
-    assert_eq!(tabs(&orrery.state())[0], strs(&["a", "c", "b"]));
+    assert_eq!(windows(&orrery.state())[0], strs(&["a", "c", "b"]));
 
     drop(first);
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let t = tabs(&orrery.state());
+        let t = windows(&orrery.state());
         if t[0] == strs(&["c"]) {
             assert!(t[1..].iter().all(Vec::is_empty), "{t:?}");
             break;
@@ -623,7 +754,7 @@ fn a_reader_that_does_not_read_does_not_stall_orrery() {
     // orrery answers others while the slow reader's answer waits for room.
     let begun = Instant::now();
     assert_eq!(
-        orrery.state()["monitors"][0]["slots"][0]["tabs"]
+        orrery.state()["monitors"][0]["slots"][0]["tabs"][0]["windows"]
             .as_array()
             .map(Vec::len),
         Some(120)

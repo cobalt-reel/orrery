@@ -18,9 +18,12 @@ layout "halves" {
 
 monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
 
+stacking #true            // a new window goes on top of the focused stack; #false: a new tab there
+
 colors {
     focus "#ff7edb"
     badge "#ff7edb"
+    attention "#ffb000"
     background "#1a1625"
 }
 
@@ -29,16 +32,18 @@ binds {
     "Mod+J" focus-slot "down"
     "Mod+K" focus-slot "up"
     "Mod+L" focus-slot "right"
-    "Mod+Shift+H" move-tab "left"
-    "Mod+Shift+J" move-tab "down"
-    "Mod+Shift+K" move-tab "up"
-    "Mod+Shift+L" move-tab "right"
+    "Mod+Shift+H" move "left"
+    "Mod+Shift+J" move "down"
+    "Mod+Shift+K" move "up"
+    "Mod+Shift+L" move "right"
     "Mod+Ctrl+H" swap-slot "left"
     "Mod+Ctrl+J" swap-slot "down"
     "Mod+Ctrl+K" swap-slot "up"
     "Mod+Ctrl+L" swap-slot "right"
     "Mod+Tab" cycle-tab "next"
     "Mod+Shift+Tab" cycle-tab "prev"
+    "Mod+S" split
+    "Mod+Shift+S" toggle-stacking
     "Mod+1" layout "wall"
     "Mod+2" layout "halves"
     "Mod+Return" spawn "kitty"

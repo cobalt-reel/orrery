@@ -31,6 +31,8 @@ pub struct Color {
 pub struct Colors {
     pub focus: Color,
     pub badge: Color,
+    /// A slot or tab holding a window that asked for attention.
+    pub attention: Color,
     pub background: Color,
 }
 
@@ -44,9 +46,11 @@ pub enum Cycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     FocusSlot(Dir),
-    MoveTab(Dir),
+    Move(Dir),
     SwapSlot(Dir),
     CycleTab(Cycle),
+    Split,
+    ToggleStacking,
     Layout(String),
     Spawn(Vec<String>),
     Close,
@@ -71,6 +75,9 @@ pub struct Config {
     pub modifier: Mods,
     pub layouts: Vec<Layout>,
     pub monitors: Vec<MonitorRule>,
+    /// Where a window with nowhere else to go opens at startup: on top of the focused stack, or (false) as a new
+    /// tab there. The running value is the compositor's (`toggle-stacking`).
+    pub stacking: bool,
     pub colors: Colors,
     pub binds: Vec<Bind>,
 }
@@ -122,6 +129,7 @@ impl Default for Colors {
         Self {
             focus: Color::rgb(0xff, 0x7e, 0xdb),
             badge: Color::rgb(0xff, 0x7e, 0xdb),
+            attention: Color::rgb(0xff, 0xb0, 0x00),
             background: Color::rgb(0x1a, 0x16, 0x25),
         }
     }
@@ -277,6 +285,7 @@ impl<'a> Parser<'a> {
         // Every declared layout name, valid or not, so a broken layout doesn't also flag its references.
         let mut layout_names: Vec<String> = Vec::new();
         let mut monitors: Vec<RawMonitor> = Vec::new();
+        let mut stacking: Option<bool> = None;
         let mut colors: Option<Colors> = None;
         let mut raw_binds: Vec<RawBind> = Vec::new();
         let mut seen_binds = false;
@@ -312,6 +321,17 @@ impl<'a> Parser<'a> {
                         } else {
                             monitors.push(m);
                         }
+                    }
+                }
+                "stacking" => {
+                    if stacking.is_some() {
+                        self.err(node, "`stacking` is set twice");
+                    }
+                    self.no_children(node);
+                    self.props(node, &[]);
+                    match positional(node).as_slice() {
+                        [e] if e.value().as_bool().is_some() => stacking = e.value().as_bool(),
+                        _ => self.err(node, "`stacking` takes #true or #false"),
                     }
                 }
                 "colors" => {
@@ -361,6 +381,7 @@ impl<'a> Parser<'a> {
                     layout: m.layout,
                 })
                 .collect(),
+            stacking: stacking.unwrap_or(true),
             colors: colors.unwrap_or_default(),
             binds,
         })
@@ -606,6 +627,7 @@ impl<'a> Parser<'a> {
             let slot = match key {
                 "focus" => &mut colors.focus,
                 "badge" => &mut colors.badge,
+                "attention" => &mut colors.attention,
                 "background" => &mut colors.background,
                 other => {
                     self.err(child, format!("unknown colour `{other}`"));
@@ -692,14 +714,14 @@ impl<'a> Parser<'a> {
         let arg_at = rest.first().map_or(verb_at, |e| e.span().offset());
         let strings: Option<Vec<&str>> = rest.iter().map(|e| e.value().as_string()).collect();
         let action = match (verb, strings.as_deref()) {
-            ("focus-slot" | "move-tab" | "swap-slot", Some([dir])) => {
+            ("focus-slot" | "move" | "swap-slot", Some([dir])) => {
                 let Some(dir) = parse_dir(dir) else {
                     self.err_at(arg_at, format!("{dir:?} is not a direction (left, right, up, down)"));
                     return None;
                 };
                 match verb {
                     "focus-slot" => Action::FocusSlot(dir),
-                    "move-tab" => Action::MoveTab(dir),
+                    "move" => Action::Move(dir),
                     _ => Action::SwapSlot(dir),
                 }
             }
@@ -715,7 +737,7 @@ impl<'a> Parser<'a> {
             ("spawn", Some(argv @ [_, ..])) if argv.iter().all(|a| !a.is_empty()) => {
                 Action::Spawn(argv.iter().map(|s| (*s).to_owned()).collect())
             }
-            ("focus-slot" | "move-tab" | "swap-slot", _) => {
+            ("focus-slot" | "move" | "swap-slot", _) => {
                 self.err_at(verb_at, format!("`{verb}` takes one direction"));
                 return None;
             }
@@ -734,10 +756,12 @@ impl<'a> Parser<'a> {
                 );
                 return None;
             }
+            ("split", Some([])) => Action::Split,
+            ("toggle-stacking", Some([])) => Action::ToggleStacking,
             ("close", Some([])) => Action::Close,
             ("show-tabs", Some([])) => Action::ShowTabs,
             ("quit", Some([])) => Action::Quit,
-            ("close" | "show-tabs" | "quit", _) => {
+            ("split" | "toggle-stacking" | "close" | "show-tabs" | "quit", _) => {
                 self.err_at(arg_at, format!("`{verb}` takes no arguments"));
                 return None;
             }
@@ -915,6 +939,12 @@ mod tests {
         b: 0xdb,
         a: 0xff,
     };
+    const AMBER: Color = Color {
+        r: 0xff,
+        g: 0xb0,
+        b: 0x00,
+        a: 0xff,
+    };
 
     fn bind(mods: Mods, key: &str, keysym: u32, action: Action) -> Bind {
         Bind {
@@ -957,9 +987,11 @@ mod tests {
                 output: "winit".into(),
                 layout: "wall".into(),
             }],
+            stacking: true,
             colors: Colors {
                 focus: PINK,
                 badge: PINK,
+                attention: AMBER,
                 background: Color {
                     r: 0x1a,
                     g: 0x16,
@@ -972,16 +1004,18 @@ mod tests {
                 bind(MOD, "J", k::KEY_j, Action::FocusSlot(Dir::Down)),
                 bind(MOD, "K", k::KEY_k, Action::FocusSlot(Dir::Up)),
                 bind(MOD, "L", k::KEY_l, Action::FocusSlot(Dir::Right)),
-                bind(MOD_SHIFT, "H", k::KEY_h, Action::MoveTab(Dir::Left)),
-                bind(MOD_SHIFT, "J", k::KEY_j, Action::MoveTab(Dir::Down)),
-                bind(MOD_SHIFT, "K", k::KEY_k, Action::MoveTab(Dir::Up)),
-                bind(MOD_SHIFT, "L", k::KEY_l, Action::MoveTab(Dir::Right)),
+                bind(MOD_SHIFT, "H", k::KEY_h, Action::Move(Dir::Left)),
+                bind(MOD_SHIFT, "J", k::KEY_j, Action::Move(Dir::Down)),
+                bind(MOD_SHIFT, "K", k::KEY_k, Action::Move(Dir::Up)),
+                bind(MOD_SHIFT, "L", k::KEY_l, Action::Move(Dir::Right)),
                 bind(MOD_CTRL, "H", k::KEY_h, Action::SwapSlot(Dir::Left)),
                 bind(MOD_CTRL, "J", k::KEY_j, Action::SwapSlot(Dir::Down)),
                 bind(MOD_CTRL, "K", k::KEY_k, Action::SwapSlot(Dir::Up)),
                 bind(MOD_CTRL, "L", k::KEY_l, Action::SwapSlot(Dir::Right)),
                 bind(MOD, "Tab", k::KEY_Tab, Action::CycleTab(Cycle::Next)),
                 bind(MOD_SHIFT, "Tab", k::KEY_Tab, Action::CycleTab(Cycle::Prev)),
+                bind(MOD, "S", k::KEY_s, Action::Split),
+                bind(MOD_SHIFT, "S", k::KEY_s, Action::ToggleStacking),
                 bind(MOD, "1", k::KEY_1, Action::Layout("wall".into())),
                 bind(MOD, "2", k::KEY_2, Action::Layout("halves".into())),
                 bind(MOD, "Return", k::KEY_Return, Action::Spawn(vec!["kitty".into()])),
@@ -1070,8 +1104,62 @@ mod tests {
             Action::Spawn(vec!["kitty".into(), "-e".into(), "htop".into()])
         );
         assert_eq!(c.colors.focus, Color { r: 1, g: 2, b: 3, a: 4 });
-        // Unset colours keep their defaults.
+        // Unset colours keep their defaults, and so does stacking.
         assert_eq!(c.colors.badge, PINK);
+        assert_eq!(c.colors.attention, AMBER);
+        assert!(c.stacking);
+    }
+
+    #[test]
+    fn stacking_and_attention_are_read() {
+        let n = line_of("stacking #true");
+        let c = parse(&with_line(n, "stacking #false")).expect("parses");
+        assert!(!c.stacking);
+        // Left out, it is on.
+        let c = parse(&with_line(n, "")).expect("parses");
+        assert!(c.stacking);
+        let n = line_of("attention \"#ffb000\"");
+        let c = parse(&with_line(n, "    attention \"#00ff0080\"")).expect("parses");
+        assert_eq!(
+            c.colors.attention,
+            Color {
+                r: 0,
+                g: 0xff,
+                b: 0,
+                a: 0x80
+            }
+        );
+    }
+
+    #[test]
+    fn stacking_takes_one_bool() {
+        let n = line_of("stacking #true");
+        for bad in [
+            "stacking",
+            "stacking \"yes\"",
+            "stacking 1",
+            "stacking #true #false",
+            "stacking x=#true",
+        ] {
+            assert_problem(&with_line(n, bad), n, "stacking");
+        }
+        assert_problem(&with_line(n, "stacking #true {\n}"), n, "block");
+        assert_problem(&with_line(n, "stacking #true\nstacking #false"), n + 1, "twice");
+    }
+
+    #[test]
+    fn move_tab_is_gone_and_split_and_toggle_stacking_take_nothing() {
+        let n = line_of("\"Mod+Shift+H\"");
+        assert_problem(&with_line(n, "    \"Mod+Shift+H\" move-tab \"left\""), n, "move-tab");
+        assert_problem(&with_line(n, "    \"Mod+Shift+H\" move"), n, "direction");
+        let n = line_of("\"Mod+S\"");
+        assert_problem(&with_line(n, "    \"Mod+S\" split \"now\""), n, "no arguments");
+        let n = line_of("\"Mod+Shift+S\"");
+        assert_problem(
+            &with_line(n, "    \"Mod+Shift+S\" toggle-stacking #true"),
+            n,
+            "toggle-stacking",
+        );
     }
 
     #[test]
@@ -1112,6 +1200,8 @@ mod tests {
     fn colors_must_be_hex() {
         let n = line_of("focus \"#ff7edb\"");
         assert_problem(&with_line(n, "    focus \"pink\""), n, "colour");
+        let n = line_of("attention \"#ffb000\"");
+        assert_problem(&with_line(n, "    attention \"amber\""), n, "colour");
         assert_problem(&with_line(n, "    focus \"#ff7ed\""), n, "colour");
         assert_problem(&with_line(n, "    focus \"#gg7edb\""), n, "colour");
     }
