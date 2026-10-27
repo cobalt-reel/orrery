@@ -385,7 +385,9 @@ impl Request {
             }
             // No monitor means no focused stack: nothing to move, a no-op like moving from an empty slot, whereas
             // `workspace` would have nowhere to show what it asks for.
-            Request::MoveToWorkspace { number } => stacks.move_to_workspace(*number),
+            Request::MoveToWorkspace { number } => {
+                stacks.move_to_workspace(*number);
+            }
             Request::State
             | Request::Close
             | Request::Reload
@@ -907,8 +909,12 @@ mod tests {
                 },
                 |s| s.set_layout("winit", layout("halves")),
             ),
-            (Request::Workspace { number: 4 }, |s| s.workspace(4)),
-            (Request::MoveToWorkspace { number: 2 }, |s| s.move_to_workspace(2)),
+            (Request::Workspace { number: 4 }, |s| {
+                s.workspace(4);
+            }),
+            (Request::MoveToWorkspace { number: 2 }, |s| {
+                s.move_to_workspace(2);
+            }),
         ];
         for (req, op) in cases {
             let (mut via_ipc, config) = setup();

@@ -1,11 +1,12 @@
-//! orrery: a static tiling Wayland compositor. The pure core (layout, config, stacks, placement, ipc) holds every
-//! decision; the compositor layer (`comp`) only translates Wayland events into core operations.
+//! orrery: a static tiling Wayland compositor. The pure core (layout, config, stacks, placement, session, ipc) holds
+//! every decision; the compositor layer (`comp`) only translates Wayland events into core operations.
 
 pub mod comp;
 pub mod config;
 pub mod ipc;
 pub mod layout;
 pub mod placement;
+pub mod session;
 pub mod stacks;
 
 /// The program's outward name: the command, the control socket's file (`$XDG_RUNTIME_DIR/<NAME>.sock`), the

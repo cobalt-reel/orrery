@@ -7,8 +7,11 @@
 //! operation acts on the focused monitor's shown workspace unless it names another, keeps each window in exactly
 //! one place, and does nothing when it cannot apply (an edge, an empty slot, an unknown id). The state is private
 //! so nothing outside these methods can break that; callers read it through accessors.
+//!
+//! In a session (`session.rs`) some numbers are owned by other machines: they never exist here, and switching or
+//! moving to one says so (`Outcome::Remote`) instead of making it. Alone, no number is.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Cycle;
 use crate::layout::{Dir, Layout, Rect};
@@ -66,6 +69,18 @@ pub struct Stacks {
     /// Windows that asked to be seen while not focused, and how they were then (see `Mark`, which says what clears
     /// each). A mark also goes when its window closes or loses its monitor, and never comes back by itself.
     attention: BTreeMap<WinId, Mark>,
+    /// Workspace numbers another machine owns: never a workspace or screen here.
+    foreign: BTreeSet<u8>,
+}
+
+/// What `workspace` and `move_to_workspace` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    /// Nothing to do (see each method).
+    Nothing,
+    /// Another machine owns that number: nothing was done here, the session decides.
+    Remote(u8),
 }
 
 /// What a window was when it was marked, which decides what clears the mark (see `settle`).
@@ -337,27 +352,36 @@ impl Stacks {
         Self::default()
     }
 
-    /// The number the next screen added takes: the lowest free one, None when all are taken. Backends name an
-    /// output after it before adding it.
+    /// The number the next screen added takes: the lowest one neither a screen's nor owned elsewhere, None when
+    /// all are taken. Backends name an output after it before adding it.
     #[must_use]
     pub fn next_screen_number(&self) -> Option<u8> {
-        (1..=WORKSPACES).find(|&k| self.monitors.iter().all(|m| m.number != k))
+        (1..=WORKSPACES).find(|&k| self.monitors.iter().all(|m| m.number != k) && !self.foreign.contains(&k))
     }
 
-    /// Adds an output as the screen numbered the lowest number free, k, which locks workspace k and shows it:
-    /// moved here intact if it lived on another monitor (which, if it showed it, then shows its lowest remaining
-    /// one), else made from `default_layout`. Nothing else moves. Pending windows move into it, as one tab of its
-    /// first slot. Layouts must be valid (`Layout::validate`); one with no slots, a name already present or a
-    /// monitor past `WORKSPACES` is ignored.
+    /// Adds an output as the screen numbered `next_screen_number` (see `add_monitor_numbered`); with none free it
+    /// is ignored.
     pub fn add_monitor(&mut self, name: &str, area: Rect, default_layout: Layout) {
+        if let Some(number) = self.next_screen_number() {
+            self.add_monitor_numbered(name, area, default_layout, number);
+        }
+    }
+
+    /// Adds an output as the screen numbered `number`, which locks workspace `number` and shows it: moved here
+    /// intact if it lived on another monitor (which, if it showed it, then shows its lowest remaining one), else
+    /// made from `default_layout`. Nothing else moves. Pending windows move into it, as one tab of its first slot.
+    /// Layouts must be valid (`Layout::validate`). `false` (and nothing done) for a layout with no slots, a name
+    /// already present, or a number out of range, already a screen's or owned elsewhere.
+    pub fn add_monitor_numbered(&mut self, name: &str, area: Rect, default_layout: Layout, number: u8) -> bool {
         // Zero slots would break "one slot per layout slot" even in release; anything else invalid is a caller
         // bug.
-        let free = self.next_screen_number();
-        let Some(number) = free.filter(|_| !default_layout.slots.is_empty()) else {
-            return;
-        };
-        if self.monitors.iter().any(|m| m.name == name) {
-            return;
+        let taken = self.monitors.iter().any(|m| m.number == number || m.name == name);
+        if !(1..=WORKSPACES).contains(&number)
+            || taken
+            || self.foreign.contains(&number)
+            || default_layout.slots.is_empty()
+        {
+            return false;
         }
         debug_assert!(
             default_layout.validate().is_ok(),
@@ -402,6 +426,7 @@ impl Stacks {
             self.workspaces[wi].slots[0].insert_tab(pending);
         }
         self.settle();
+        true
     }
 
     /// Its workspaces move intact (tabs, layout, focused slot) to the focused monitor, or the first one when the
@@ -435,10 +460,17 @@ impl Stacks {
 
     /// Shows workspace `n` on the monitor it lives on and focuses that monitor; one that does not exist is made on
     /// the focused monitor from its default layout. The workspace that monitor showed goes if it is not locked and
-    /// holds no window. Nothing outside 1..=WORKSPACES or without a monitor.
-    pub fn workspace(&mut self, n: u8) {
-        if !(1..=WORKSPACES).contains(&n) || self.monitors.is_empty() {
-            return;
+    /// holds no window. Nothing outside 1..=WORKSPACES or without a monitor; `Remote` for a number owned elsewhere.
+    // No #[must_use]: alone it is never `Remote`, and the outcome is only news to a session.
+    pub fn workspace(&mut self, n: u8) -> Outcome {
+        if !(1..=WORKSPACES).contains(&n) {
+            return Outcome::Nothing;
+        }
+        if self.foreign.contains(&n) {
+            return Outcome::Remote(n);
+        }
+        if self.monitors.is_empty() {
+            return Outcome::Nothing;
         }
         let m = match self.index_of_workspace(n) {
             Some(wi) => self.workspaces[wi].monitor,
@@ -450,19 +482,26 @@ impl Stacks {
         self.monitors[m].shown = n;
         self.focused_monitor = m;
         self.settle();
+        Outcome::Done
     }
 
     /// The focused slot's current tab, its whole stack, becomes a tab of workspace `n` (made hidden on the focused
     /// monitor if it does not exist) right after the current one of that workspace's focused slot. Focus stays,
-    /// and the workspace left is shown, so it stays too. Nothing from an empty slot, into the same workspace, or
-    /// outside 1..=WORKSPACES.
-    pub fn move_to_workspace(&mut self, n: u8) {
+    /// and the workspace left is shown, so it stays too. Nothing from an empty slot or no monitor, into the same
+    /// workspace, or outside 1..=WORKSPACES; `Remote` for a number owned elsewhere (windows never cross machines).
+    pub fn move_to_workspace(&mut self, n: u8) -> Outcome {
+        if !(1..=WORKSPACES).contains(&n) {
+            return Outcome::Nothing;
+        }
+        if self.foreign.contains(&n) {
+            return Outcome::Remote(n);
+        }
         let Some(from) = self.focused_index() else {
-            return;
+            return Outcome::Nothing;
         };
         let ws = &self.workspaces[from];
-        if !(1..=WORKSPACES).contains(&n) || ws.number == n || ws.slots[ws.focus].is_empty() {
-            return;
+        if ws.number == n || ws.slots[ws.focus].is_empty() {
+            return Outcome::Nothing;
         }
         let to = match self.index_of_workspace(n) {
             Some(to) => to,
@@ -470,7 +509,7 @@ impl Stacks {
         };
         // Making one may have shifted the source.
         let Some(from) = self.focused_index() else {
-            return;
+            return Outcome::Nothing;
         };
         let ws = &mut self.workspaces[from];
         let slot = &mut ws.slots[ws.focus];
@@ -478,6 +517,63 @@ impl Stacks {
         let ws = &mut self.workspaces[to];
         ws.slots[ws.focus].insert_tab(tab);
         self.settle();
+        Outcome::Done
+    }
+
+    /// The numbers another machine owns, from now on: `workspace` and `move_to_workspace` leave them alone and new
+    /// screens skip them. Those out of range or existing here are left out (here wins; a join renames first).
+    pub fn set_foreign(&mut self, numbers: impl IntoIterator<Item = u8>) {
+        self.foreign = (numbers.into_iter())
+            .filter(|n| (1..=WORKSPACES).contains(n) && self.index_of_workspace(*n).is_none())
+            .collect();
+    }
+
+    /// No number is owned elsewhere: alone again (the link dropped).
+    pub fn clear_foreign(&mut self) {
+        self.foreign.clear();
+    }
+
+    #[must_use]
+    pub fn foreign(&self) -> &BTreeSet<u8> {
+        &self.foreign
+    }
+
+    /// Workspace `from` takes number `to`, intact; a screen numbered `from` takes `to` too, so it keeps locking it
+    /// (monitors stay in number order, focus stays on its screen). How a join's collisions are applied. `false`
+    /// (and nothing done) for an unknown `from`, or `to` out of range, existing here or owned elsewhere.
+    pub fn renumber_workspace(&mut self, from: u8, to: u8) -> bool {
+        let Some(wi) = self.index_of_workspace(from) else {
+            return false;
+        };
+        if !(1..=WORKSPACES).contains(&to) || self.index_of_workspace(to).is_some() || self.foreign.contains(&to) {
+            return false;
+        }
+        self.workspaces[wi].number = to;
+        self.workspaces.sort_by_key(|w| w.number);
+        for m in &mut self.monitors {
+            if m.number == from {
+                m.number = to;
+            }
+            if m.shown == from {
+                m.shown = to;
+            }
+        }
+        // Back in number order: `at[old]` is each monitor's new index.
+        let mut order: Vec<usize> = (0..self.monitors.len()).collect();
+        order.sort_by_key(|&i| self.monitors[i].number);
+        let mut at = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            at[old] = new;
+        }
+        self.monitors.sort_by_key(|m| m.number);
+        for w in &mut self.workspaces {
+            w.monitor = at[w.monitor];
+        }
+        if let Some(&f) = at.get(self.focused_monitor) {
+            self.focused_monitor = f;
+        }
+        self.settle();
+        true
     }
 
     /// On top of the focused slot's current stack (its first tab when empty), or `pending` with no monitor.
@@ -944,7 +1040,8 @@ mod tests {
     /// exists on the screen numbered k for every screen; each monitor shows one workspace on it; no workspace is
     /// unlocked, hidden and empty; every workspace has one slot per layout slot and its focus in range; no tab is
     /// empty and every slot's current tab is in range (0 when it has none); tiles and placements agree with the
-    /// slots, with what is shown and with focus.
+    /// slots, with what is shown and with focus; numbers owned elsewhere are in range and neither a workspace's nor
+    /// a screen's here.
     fn assert_invariants(s: &Stacks) {
         let n = s.monitors.len();
         let in_order = |k: &[u8]| k.windows(2).all(|p| p[0] < p[1]) && k.iter().all(|k| (1..=WORKSPACES).contains(k));
@@ -1057,6 +1154,11 @@ mod tests {
                 Mark::Unfocused => p.is_some_and(|p| !p.focused),
             };
             assert!(unseen, "window {w} marked {mark:?} but seen or not placed");
+        }
+
+        for k in &s.foreign {
+            assert!((1..=WORKSPACES).contains(k), "foreign {k} out of range");
+            assert!(!numbers.contains(k) && !screens.contains(k), "foreign {k} exists here");
         }
     }
 
@@ -2347,6 +2449,134 @@ mod tests {
         assert_eq!(s.workspaces.len(), usize::from(WORKSPACES));
     }
 
+    #[test]
+    fn workspace_and_move_to_workspace_say_what_they_did() {
+        let mut s = three_tabs();
+        assert_eq!(s.workspace(0), Outcome::Nothing);
+        assert_eq!(s.workspace(11), Outcome::Nothing);
+        assert_eq!(s.workspace(1), Outcome::Done, "already shown: shown all the same");
+        assert_eq!(s.move_to_workspace(1), Outcome::Nothing, "the same workspace");
+        assert_eq!(s.move_to_workspace(11), Outcome::Nothing);
+        assert_eq!(s.move_to_workspace(3), Outcome::Done);
+        assert_eq!(s.workspace(3), Outcome::Done);
+        s.focus_slot(Dir::Right);
+        assert_eq!(s.move_to_workspace(1), Outcome::Nothing, "an empty slot");
+        let mut none = Stacks::new();
+        assert_eq!(none.workspace(2), Outcome::Nothing);
+        assert_eq!(none.move_to_workspace(2), Outcome::Nothing);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn numbers_owned_elsewhere_are_never_made_here() {
+        let mut s = three_tabs();
+        s.set_foreign([2, 3, 0, 11]);
+        assert_eq!(s.foreign(), &BTreeSet::from([2, 3]), "only numbers in range");
+        assert_invariants(&s);
+        let before = s.clone();
+        assert_eq!(s.workspace(2), Outcome::Remote(2));
+        assert_eq!(s.move_to_workspace(3), Outcome::Remote(3));
+        assert_eq!(s, before, "nothing done here");
+        // A screen added meanwhile skips them.
+        assert_eq!(s.next_screen_number(), Some(4));
+        s.add_monitor("second", SIDE, layout("halves"));
+        assert_eq!(numbers(&s), [1, 4]);
+        // Free numbers work as before.
+        assert_eq!(s.move_to_workspace(5), Outcome::Done);
+        assert_eq!(ws_tabs(&s, 5, 0), [vec![2, 3]]);
+        assert_invariants(&s);
+        // A number that exists here is never foreign: the local workspace wins.
+        s.set_foreign([1, 5, 6]);
+        assert_eq!(s.foreign(), &BTreeSet::from([6]));
+        // Without a monitor a foreign number is still elsewhere.
+        let mut none = Stacks::new();
+        none.set_foreign([4]);
+        assert_eq!(none.workspace(4), Outcome::Remote(4));
+        // Cleared: alone again, exactly as before.
+        s.clear_foreign();
+        assert!(s.foreign().is_empty());
+        assert_eq!(s.workspace(6), Outcome::Done);
+        assert_eq!(shown_numbers(&s), [6, 4], "made on the focused screen");
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn add_monitor_numbered_takes_the_number_given() {
+        let mut s = wall_monitor();
+        s.workspace(3);
+        s.open_stacked(1);
+        s.workspace(1);
+        assert!(s.add_monitor_numbered("third", SIDE, layout("halves"), 3));
+        assert_invariants(&s);
+        assert_eq!(numbers(&s), [1, 3]);
+        assert_eq!(workspaces(&s), [(1, 0), (3, 1)], "its workspace moves to it, intact");
+        assert_eq!(shown_numbers(&s), [1, 3]);
+        assert_eq!(s.next_screen_number(), Some(2));
+        assert!(s.add_monitor_numbered("second", SIDE, single(), 2));
+        assert_eq!(numbers(&s), [1, 2, 3], "monitors in number order");
+        assert_eq!(s.monitors[1].name, "second");
+        assert_eq!(s.focused_monitor, 0);
+        assert_invariants(&s);
+        // Refused, nothing done: a number taken, owned elsewhere or out of range, a name taken, no slots.
+        s.set_foreign([5]);
+        let before = s.clone();
+        let mut empty = single();
+        empty.slots.clear();
+        assert!(!s.add_monitor_numbered("x", SIDE, single(), 2));
+        assert!(!s.add_monitor_numbered("x", SIDE, single(), 5));
+        assert!(!s.add_monitor_numbered("x", SIDE, single(), 0));
+        assert!(!s.add_monitor_numbered("x", SIDE, single(), 11));
+        assert!(!s.add_monitor_numbered("winit", SIDE, single(), 4));
+        assert!(!s.add_monitor_numbered("x", SIDE, empty, 4));
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn renumber_workspace_moves_a_workspace_and_its_screen() {
+        // winit (1) shows 1 and hides 5 holding [1]; second (2) shows 2 holding [2], focused.
+        let mut s = wall_monitor();
+        s.add_monitor("second", SIDE, layout("halves"));
+        s.workspace(5);
+        s.open_stacked(1);
+        s.workspace(1);
+        s.focus_monitor("second");
+        s.open_stacked(2);
+        assert!(s.renumber_workspace(5, 7));
+        assert_invariants(&s);
+        assert_eq!(workspaces(&s), [(1, 0), (2, 1), (7, 0)]);
+        assert_eq!(ws_tabs(&s, 7, 0), [vec![1]]);
+        // A screen's own workspace: the screen takes the number too, and the monitors stay in number order.
+        assert!(s.renumber_workspace(1, 9));
+        assert_invariants(&s);
+        assert_eq!(numbers(&s), [2, 9]);
+        assert_eq!(s.monitors[1].name, "winit");
+        assert_eq!(workspaces(&s), [(2, 0), (7, 1), (9, 1)]);
+        assert_eq!(shown_numbers(&s), [2, 9]);
+        assert_eq!(
+            (s.focused_monitor, s.focused_window()),
+            (0, Some(2)),
+            "focus stays on its screen"
+        );
+        assert_eq!(s.next_screen_number(), Some(1));
+        // A shown workspace keeps being shown under its new number.
+        s.focus_monitor("winit");
+        s.workspace(7);
+        assert!(s.renumber_workspace(7, 4));
+        assert_eq!(shown_numbers(&s), [2, 4]);
+        assert_eq!(s.focused_window(), Some(1));
+        assert_invariants(&s);
+        // Refused, nothing done: an unknown one, a number taken, owned elsewhere or out of range, the same number.
+        s.set_foreign([6]);
+        let before = s.clone();
+        assert!(!s.renumber_workspace(3, 8));
+        assert!(!s.renumber_workspace(4, 2));
+        assert!(!s.renumber_workspace(4, 6));
+        assert!(!s.renumber_workspace(4, 0));
+        assert!(!s.renumber_workspace(4, 11));
+        assert!(!s.renumber_workspace(4, 4));
+        assert_eq!(s, before);
+    }
+
     /// xorshift64: enough randomness for a reproducible walk, no dependency.
     struct Rng(u64);
 
@@ -2384,9 +2614,9 @@ mod tests {
             .collect()
     }
 
-    /// One seeded walk of 1,000 operations; returns the most windows open at once, the steps ending with a mark
-    /// and those ending with a window in a hidden workspace.
-    fn walk(seed: u64) -> (usize, usize, usize) {
+    /// One seeded walk of 1,000 operations; returns the most windows open at once, the steps ending with a mark,
+    /// those ending with a window in a hidden workspace and those ending with numbers owned elsewhere.
+    fn walk(seed: u64) -> (usize, usize, usize, usize) {
         let layouts = [layout("wall"), layout("halves"), single()];
         let mut rng = Rng(seed);
         let mut s = wall_monitor();
@@ -2396,6 +2626,7 @@ mod tests {
         let mut most = 0;
         let mut marked_steps = 0;
         let mut hidden_steps = 0;
+        let mut foreign_steps = 0;
         for step in 0..1000 {
             let pick = |rng: &mut Rng, live: &BTreeSet<WinId>| -> WinId {
                 // Mostly a live id; sometimes one that never existed.
@@ -2423,7 +2654,7 @@ mod tests {
             let op = if live.len() > 12 && rng.below(2) == 0 {
                 3
             } else {
-                rng.below(24)
+                rng.below(28)
             };
             match op {
                 0 | 1 => {
@@ -2547,7 +2778,11 @@ mod tests {
                 }
                 20 | 21 => {
                     let n = number(&mut rng);
-                    s.workspace(n);
+                    let outcome = s.workspace(n);
+                    if before.foreign.contains(&n) {
+                        assert_eq!(outcome, Outcome::Remote(n), "seed {seed} step {step}: workspace {n}");
+                        assert_eq!(s, before, "seed {seed} step {step}: remote workspace {n} acted here");
+                    }
                     assert_eq!(
                         all_tabs(&s),
                         all_tabs(&before),
@@ -2563,7 +2798,11 @@ mod tests {
                 }
                 22 => {
                     let n = number(&mut rng);
-                    s.move_to_workspace(n);
+                    let outcome = s.move_to_workspace(n);
+                    if before.foreign.contains(&n) {
+                        assert_eq!(outcome, Outcome::Remote(n), "seed {seed} step {step}: move {n}");
+                        assert_eq!(s, before, "seed {seed} step {step}: remote move {n} acted here");
+                    }
                     assert_eq!(
                         (s.focused_monitor, shown_numbers(&s)),
                         (before.focused_monitor, shown_numbers(&before)),
@@ -2576,7 +2815,65 @@ mod tests {
                     let unseen = before.placements().any(|p| p.win == w && !p.focused);
                     assert_eq!(s.is_marked(w), unseen, "seed {seed} step {step}: mark {w}");
                 }
-                _ => s.clear_mark(pick(&mut rng, &live)),
+                23 => s.clear_mark(pick(&mut rng, &live)),
+                24 => {
+                    let mask = rng.below(1 << WORKSPACES);
+                    s.set_foreign((1..=WORKSPACES).filter(|k| mask & (1 << (k - 1)) != 0));
+                    let mut only = s.clone();
+                    only.foreign.clone_from(&before.foreign);
+                    assert_eq!(only, before, "seed {seed} step {step}: set_foreign changed more");
+                }
+                25 => s.clear_foreign(),
+                26 => {
+                    let (from, to) = (number(&mut rng), number(&mut rng));
+                    let fits = before.index_of_workspace(from).is_some()
+                        && (1..=WORKSPACES).contains(&to)
+                        && before.index_of_workspace(to).is_none()
+                        && !before.foreign.contains(&to);
+                    assert_eq!(
+                        s.renumber_workspace(from, to),
+                        fits,
+                        "seed {seed} step {step}: renumber {from} to {to}"
+                    );
+                    if fits {
+                        // Everything as it was under the new number: tabs, homes, views, focus.
+                        let renamed = |k: u8| if k == from { to } else { k };
+                        let mut tabs: Vec<_> = all_tabs(&before).into_iter().map(|(k, t)| (renamed(k), t)).collect();
+                        tabs.sort();
+                        assert_eq!(all_tabs(&s), tabs, "seed {seed} step {step}: renumber");
+                        let homes_then: BTreeMap<u8, String> =
+                            homes(&before).into_iter().map(|(k, m)| (renamed(k), m)).collect();
+                        assert_eq!(homes(&s), homes_then, "seed {seed} step {step}: renumber moved one");
+                        let views = |x: &Stacks, f: &dyn Fn(u8) -> u8| -> BTreeMap<String, (u8, u8)> {
+                            (x.monitors.iter())
+                                .map(|m| (m.name.clone(), (f(m.number), f(m.shown))))
+                                .collect()
+                        };
+                        assert_eq!(views(&s, &|k| k), views(&before, &renamed));
+                        assert_eq!(
+                            s.monitors[s.focused_monitor].name, before.monitors[before.focused_monitor].name,
+                            "seed {seed} step {step}: renumber moved focus"
+                        );
+                    } else {
+                        assert_eq!(s, before, "seed {seed} step {step}: refused renumber changed things");
+                    }
+                }
+                _ => {
+                    let n = number(&mut rng);
+                    next_monitor += 1;
+                    let l = layouts[rng.below(3) as usize].clone();
+                    let fits = (1..=WORKSPACES).contains(&n)
+                        && before.monitors.iter().all(|m| m.number != n)
+                        && !before.foreign.contains(&n);
+                    assert_eq!(
+                        s.add_monitor_numbered(&format!("m{next_monitor}"), UHD, l, n),
+                        fits,
+                        "seed {seed} step {step}: add_monitor_numbered {n}"
+                    );
+                    if !fits {
+                        assert_eq!(s, before, "seed {seed} step {step}: refused add_monitor_numbered");
+                    }
+                }
             }
             if !matches!(op, 17 | 18) {
                 assert!(
@@ -2589,15 +2886,16 @@ mod tests {
             most = most.max(live.len());
             marked_steps += usize::from(!s.attention.is_empty());
             hidden_steps += usize::from(s.placements().any(|p| !p.shown));
+            foreign_steps += usize::from(!s.foreign.is_empty());
         }
-        (most, marked_steps, hidden_steps)
+        (most, marked_steps, hidden_steps, foreign_steps)
     }
 
     #[test]
     fn random_walks_lose_nothing() {
         let mut seed: u64 = 0x51c3_9a07_d2e4;
         for _ in 0..32 {
-            let (most, marked_steps, hidden_steps) = walk(seed);
+            let (most, marked_steps, hidden_steps, foreign_steps) = walk(seed);
             assert!(
                 marked_steps > 50,
                 "seed {seed}: marks held on {marked_steps} steps only"
@@ -2605,6 +2903,10 @@ mod tests {
             assert!(
                 hidden_steps > 50,
                 "seed {seed}: windows hidden on {hidden_steps} steps only"
+            );
+            assert!(
+                foreign_steps > 50,
+                "seed {seed}: numbers owned elsewhere on {foreign_steps} steps only"
             );
             assert!(
                 (4..=40).contains(&most),
