@@ -52,3 +52,41 @@ Commit `bare metal: DRM, GBM and libinput`.
 ### Task 3: as built
 
 Full suite, clippy, fmt, release build, cleanliness scan, README vs design, "As built"; then the user's live test.
+
+## As built
+
+Commits, by task: 1 `729a2f9`, `7a32c67`; 2 `2c98a0c`, `ee2d4cc`; 3 this one (design and plan: `d9e95a2`). 407 tests
+(308 unit, 99 integration, most of them headless end to end), one more ignored (slow: every prefix of the example
+config); fmt and clippy clean, release build clean. The DRM backend itself is not reachable from the tests: its pure
+parts are (`src/comp/backend_drm/plan.rs`: connector changes, CRTC assignment, preferred mode, the screen under a
+point, keeping the pointer on the screens, repaint delay, flip watchdog, late flip events, the refused-frame
+recovery).
+
+Deviations from the design and this plan:
+- One `DrmCompositor` per screen with no planes (`FrameFlags::empty()`, no cursor plane): everything is composited by
+  GL; no direct scanout. Swapchains are 8 bits per channel (ARGB, else ABGR).
+- Rendering is split: `render::output_elements` builds a screen's elements, `render_output` draws them (nested) and
+  bare metal hands them to its `DrmCompositor`, whose own damage tracking decides whether a frame is queued.
+- Pacing: a screen draws only when its last flip is done; draws are tried by the 16 ms tick, once after input, and
+  60% of a frame after each flip. A check finding nothing to draw, or failing, sends the frame callbacks itself. A
+  flip whose event does not come within 1 s is given up on; each frame carries a sequence number, and a flip event
+  stamped before the frame waited for was queued is ignored.
+- A frame the kernel refuses (atomic test failed) resets every output, at most once per resume, hotplug or frame
+  drawn; a screen refused again after its reset is closed as if unplugged and stays dark until plugged in again.
+- Resume takes the GPU back with every output reset (`activate(true)`), then rescans the connectors.
+- Relative motion goes through `device_motion` (so `crossing::step` both clamps the pointer and crosses in a
+  session); a screen unplugged under the pointer brings it back to the nearest screen. Absolute motion maps onto the
+  screen the pointer is on.
+- The theme cursor (`render::CursorDraw::Named`) is used wherever orrery draws the pointer, nested remote input too;
+  `Orrery::draws_pointer` and `pointer_drawn` decide where it is drawn (hidden on bare metal while input is away).
+- `open-screen` and `close-screen` (and a second `orrery run`, which joins) answer that monitors decide on bare
+  metal. Screens close the gap after an unplug: `lay_side_by_side` moved from the nested backend to `Orrery`.
+
+Known limits:
+- One GPU; no Xwayland; no hardware cursor; no linux-dmabuf (OpenGL clients render in software, Vulkan clients fail);
+  scale 1, preferred mode only; no layer-shell, lock or idle.
+- libinput defaults (no tap-to-click, no natural scrolling); keyboard LEDs do not light; touch and tablet tools are
+  ignored.
+- Make and model of monitors are not read (no EDID parsing): outputs say `Unknown` and the connector name.
+
+Live test: pending.
