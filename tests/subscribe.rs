@@ -3,7 +3,7 @@
 
 mod support;
 
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 
 use orrery_wm::config;
@@ -61,7 +61,7 @@ fn a_subscriber_gets_the_state_then_every_change() {
 
     // A title changes: its own event, and the tabs showing it.
     client.set_title(a, "renamed");
-    let title = sub.next("title");
+    let title = sub.wait_for("a's new title", |v| v["event"] == "title" && v["app_id"] == "a");
     assert_eq!(
         (title["app_id"].as_str(), title["title"].as_str()),
         (Some("a"), Some("renamed"))
@@ -108,6 +108,8 @@ fn a_subscriber_that_never_reads_is_dropped_and_orrery_carries_on() {
     let orrery = Compositor::start(config::DEFAULT, SIZE);
     let mut stalled = UnixStream::connect(orrery.control_socket()).expect("connect");
     stalled.write_all(b"{\"cmd\":\"subscribe\"}\n").expect("subscribe");
+    // `msg subscribe` whose own output nobody reads: it stops reading too, and is dropped mid-line.
+    let mut unread = orrery.subscribe_unread();
     let reader = orrery.subscribe();
     reader.next("state");
 
@@ -116,23 +118,66 @@ fn a_subscriber_that_never_reads_is_dropped_and_orrery_carries_on() {
     let long = |n: usize| format!("{n:04}{}", "t".repeat(3800));
     let windows: Vec<usize> = (0..20).map(|n| client.create_window("w", &long(n))).collect();
     assert!(client.wait_for(|s| s.windows[windows[19]].mapped()));
+    // Each change waited for, so none coalesce with the next: some 3 MiB in all.
     for round in 0..40 {
-        client.set_title(windows[round % 20], &long(100 + round));
+        let title = long(100 + round);
+        client.set_title(windows[round % 20], &title);
+        reader.wait_for("the new title", |v| {
+            v["event"] == "title" && v["title"] == title.as_str()
+        });
     }
-    // The reader saw every change, to the last.
-    let last = long(139);
-    reader.wait_for("the last title", |v| {
-        v["event"] == "title" && v["title"] == last.as_str()
-    });
-
     // The stalled one was dropped: what was sent is there to read, then EOF.
     stalled.set_read_timeout(Some(TIMEOUT)).expect("timeout");
     let mut got = Vec::new();
     stalled.read_to_end(&mut got).expect("EOF, not a timeout");
     assert!(got.starts_with(b"{\"event\":\"state\""));
     assert!(orrery.log().contains("dropped"), "{}", orrery.log());
+    // `msg subscribe`, read at last, printed whole lines only (not the cut-off end), then ended.
+    let mut printed = String::new();
+    let mut out = unread.stdout.take().expect("piped stdout");
+    out.read_to_string(&mut printed).expect("its output");
+    let status = support::wait_or_kill(&mut unread, "msg subscribe kept running after it was dropped");
+    assert!(status.success(), "{status:?}");
+    assert!(printed.ends_with('\n'));
+    for line in printed.lines() {
+        assert!(
+            serde_json::from_str::<Value>(line).is_ok(),
+            "not JSON: {}...",
+            &line[..line.len().min(80)]
+        );
+    }
+    assert_eq!(
+        orrery.log().matches("dropped: more than 1 MiB unread").count(),
+        2,
+        "{}",
+        orrery.log()
+    );
     assert_eq!(orrery.state()["monitors"][0]["name"], "headless");
     drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_subscriber_may_shut_its_sending_side_and_still_read() {
+    let orrery = Compositor::start(config::DEFAULT, SIZE);
+    let mut half = UnixStream::connect(orrery.control_socket()).expect("connect");
+    half.write_all(b"{\"cmd\":\"subscribe\"}\n").expect("subscribe");
+    half.shutdown(std::net::Shutdown::Write).expect("half-close");
+    half.set_read_timeout(Some(TIMEOUT)).expect("timeout");
+    let mut lines = std::io::BufReader::new(half.try_clone().expect("clone")).lines();
+    let first = lines.next().expect("a line").expect("read");
+    assert!(first.starts_with("{\"event\":\"state\""), "{first}");
+    orrery.msg_ok(&["workspace", "2"]);
+    let next = lines.next().expect("a line").expect("read");
+    assert!(next.starts_with("{\"event\":\"workspace\""), "{next}");
+    // Gone for good: noticed at once, though nothing is sent to it.
+    drop(lines);
+    drop(half);
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !orrery.log().contains("hung up") {
+        assert!(std::time::Instant::now() < deadline, "{}", orrery.log());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(orrery.stop().success());
 }
 

@@ -47,6 +47,13 @@ pub fn socket_path_in(dir: &Path) -> PathBuf {
     dir.join(format!("{NAME}.sock"))
 }
 
+/// The environment variable giving programs orrery starts its control socket (`ORRERY_SOCKET`), which `orrery msg`
+/// uses when no `--socket` is given: a program started by one of several orrerys talks to that one.
+#[must_use]
+pub fn socket_env() -> String {
+    format!("{}_SOCKET", NAME.to_ascii_uppercase())
+}
+
 /// `$XDG_RUNTIME_DIR/orrery.sock`.
 #[must_use]
 pub fn default_socket_path() -> Option<PathBuf> {
@@ -557,8 +564,8 @@ pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
     exchange(stream, request)
 }
 
-/// `orrery msg subscribe`: subscribes at `path` and hands each line to `line` as it comes, until orrery ends the
-/// stream (or `line` fails: the reader went away). There is no timeout: events may be hours apart. False when the
+/// `orrery msg subscribe`: subscribes at `path` and hands each whole line to `line` as it comes, until orrery ends
+/// the stream (or `line` fails: the reader went away). There is no timeout: events may be hours apart. False when the
 /// subscription was refused (that answer is handed on too).
 pub fn subscribe(path: &Path, mut line: impl FnMut(&str) -> std::io::Result<()>) -> anyhow::Result<bool> {
     let mut stream = UnixStream::connect(path)
@@ -571,8 +578,16 @@ pub fn subscribe(path: &Path, mut line: impl FnMut(&str) -> std::io::Result<()>)
     stream.write_all(&request).context("sending the request")?;
     let mut first = true;
     let mut ok = true;
-    for text in std::io::BufReader::new(stream).lines() {
-        let text = text.context("reading the stream")?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        reader.read_until(b'\n', &mut buf).context("reading the stream")?;
+        // At the end: nothing, or the cut-off rest of a line (a dropped subscriber's), which is no JSON to hand on.
+        if buf.pop() != Some(b'\n') {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf);
         if std::mem::take(&mut first) {
             // An event line is no response; a response is the refusal.
             ok = serde_json::from_str::<Response>(&text).map_or(true, |r| r.ok);

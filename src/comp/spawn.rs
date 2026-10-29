@@ -7,10 +7,12 @@
 
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt as _;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 use super::Orrery;
+use super::ipc_server::socket_env;
 use crate::NAME;
 use crate::placement::Launch;
 
@@ -21,12 +23,13 @@ const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
 /// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
 /// toolkit falls back to the host's Xwayland) for the child only (orrery's own environment keeps the host's, which
 /// winit needs), `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` saying where it runs (portals and toolkits read them),
+/// `control` (orrery's control socket) as `ORRERY_SOCKET` (`ipc_server::socket_env`; removed without one),
 /// `token` as its xdg-activation token under both names
 /// toolkits read (removed without one: a token orrery was started with is not orrery's to hand on), no stdio, its
 /// own process group (a Ctrl+C in orrery's terminal does not reach it), and an empty signal mask. None for an
 /// empty argv.
 #[must_use]
-pub fn command(argv: &[String], display: &OsStr, token: Option<&str>) -> Option<Command> {
+pub fn command(argv: &[String], display: &OsStr, control: Option<&Path>, token: Option<&str>) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -34,6 +37,10 @@ pub fn command(argv: &[String], display: &OsStr, token: Option<&str>) -> Option<
         .env_remove("DISPLAY")
         .env("XDG_CURRENT_DESKTOP", NAME)
         .env("XDG_SESSION_TYPE", "wayland");
+    match control {
+        Some(path) => cmd.env(socket_env(), path),
+        None => cmd.env_remove(socket_env()),
+    };
     for name in TOKEN_VARS {
         match token {
             Some(t) => cmd.env(name, t),
@@ -71,7 +78,7 @@ impl Orrery {
         let token = self.xdg_activation_state.create_external_token(None).0.clone();
         self.xdg_activation_state.remove_token(&token);
         let token = String::from(token);
-        let Some(mut cmd) = command(argv, &self.socket_name, Some(&token)) else {
+        let Some(mut cmd) = command(argv, &self.socket_name, self.control_socket.as_deref(), Some(&token)) else {
             return Err("nothing to spawn: the argv is empty".into());
         };
         match cmd.spawn() {
@@ -123,6 +130,7 @@ impl Orrery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comp::ipc_server;
 
     /// Blocks SIGTERM and SIGINT in this thread, as calloop does in orrery's.
     fn block_term() {
@@ -141,7 +149,7 @@ mod tests {
     #[test]
     fn the_child_does_not_see_the_host_x_display() {
         // With DISPLAY set (Xwayland in the host), toolkits may pick X and open outside orrery.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&(OsStr::new("DISPLAY"), None)), "{envs:?}");
         assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wayland-9")))));
@@ -149,7 +157,7 @@ mod tests {
 
     #[test]
     fn the_child_gets_its_activation_token_under_both_names() {
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), Some("tok123")).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, Some("tok123")).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
             assert!(
@@ -158,7 +166,7 @@ mod tests {
             );
         }
         // Without one, a token orrery itself was started with is not handed on: it is not orrery's to give.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
             assert!(envs.contains(&(OsStr::new(name), None)), "{name}: {envs:?}");
@@ -167,15 +175,30 @@ mod tests {
 
     #[test]
     fn the_child_learns_the_desktop_and_session_type() {
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&(OsStr::new("XDG_CURRENT_DESKTOP"), Some(OsStr::new(NAME)))));
         assert!(envs.contains(&(OsStr::new("XDG_SESSION_TYPE"), Some(OsStr::new("wayland")))));
     }
 
     #[test]
+    fn the_child_finds_the_control_socket() {
+        let socket = Path::new("/run/user/1000/orrery.sock");
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), Some(socket), None).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        let name = ipc_server::socket_env();
+        assert!(
+            envs.contains(&(OsStr::new(&name), Some(socket.as_os_str()))),
+            "{envs:?}"
+        );
+        // Without one, an outer orrery's is not handed on.
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
+        assert!(cmd.get_envs().any(|e| e == (OsStr::new(&name), None)));
+    }
+
+    #[test]
     fn empty_argv_is_nothing() {
-        assert!(command(&[], OsStr::new("wayland-9"), None).is_none());
+        assert!(command(&[], OsStr::new("wayland-9"), None, None).is_none());
     }
 
     #[test]
@@ -190,7 +213,7 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            let mut cmd = command(&argv, OsStr::new("wayland-test-7"), None).unwrap();
+            let mut cmd = command(&argv, OsStr::new("wayland-test-7"), None, None).unwrap();
             cmd.stdout(Stdio::piped());
             cmd.output().unwrap()
         })

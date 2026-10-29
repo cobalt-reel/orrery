@@ -1,5 +1,6 @@
 //! The event stream's subscribers: control connections that sent `subscribe`. Each gets a `state` event, then the
-//! events of every loop iteration that changed something (`events::Summary`), one JSON object per line. Writes
+//! events of every loop iteration that changed something (`events::Summary`, taken at most every
+//! `events::PUBLISH_EVERY`: a change within that waits for a timer), one JSON object per line. Writes
 //! never block: what the socket does not take waits in the subscriber's backlog and goes as it drains; a backlog past
 //! `MAX_BACKLOG` drops the subscriber (its reader sees EOF and may subscribe again). Unlike a request, a
 //! subscription has no deadline.
@@ -8,13 +9,15 @@ use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken};
 
 use super::Orrery;
 use super::ipc_server::write_some;
-use crate::events::{Event, Summary};
+use crate::events::{Event, Summary, publish_wait};
 
 /// Bytes a subscriber may leave unread before it is dropped.
 pub const MAX_BACKLOG: usize = 1 << 20;
@@ -27,6 +30,10 @@ pub struct Subscribers {
     live: BTreeMap<u64, Subscriber>,
     /// What the last events were derived from; None while nobody subscribes.
     sent: Option<Summary>,
+    /// When the last summary was taken.
+    last: Option<Instant>,
+    /// The timer waking the loop for a summary put off by `PUBLISH_EVERY`, while one is set.
+    timer: Option<RegistrationToken>,
 }
 
 struct Subscriber {
@@ -36,7 +43,7 @@ struct Subscriber {
     done: usize,
     /// Its `state` is still to come, with the next iteration's events (so both are taken at the same moment).
     fresh: bool,
-    /// The source noticing that it hangs up; None once it has half-closed (then a failed write notices).
+    /// The source noticing that it hangs up (reading what it sends until it half-closes, then only its hang-up).
     hangup: Option<RegistrationToken>,
     /// The source writing its backlog as the socket drains, while there is one.
     writer: Option<RegistrationToken>,
@@ -86,32 +93,7 @@ impl Orrery {
         let watched = stream.try_clone().map_err(|e| format!("cannot subscribe: {e}"))?;
         self.subscribers.next += 1;
         let id = self.subscribers.next;
-        let hangup = (self.loop_handle).insert_source(
-            Generic::new(watched, Interest::READ, Mode::Level),
-            move |_, stream, state| {
-                let stream: &UnixStream = stream;
-                // A subscriber has nothing to say: what it sends is read and ignored, up to its end.
-                let mut chunk = [0u8; 1024];
-                loop {
-                    match (&*stream).read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(PostAction::Continue),
-                        Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                        Err(_) => break,
-                    }
-                }
-                // This source goes by returning Remove, never by the token.
-                if let Some(sub) = state.subscribers.live.get_mut(&id) {
-                    sub.hangup = None;
-                }
-                if hung_up(stream) {
-                    state.unsubscribe(id, "hung up");
-                }
-                Ok(PostAction::Remove)
-            },
-        );
-        let hangup = hangup.map_err(|e| format!("cannot watch a subscriber: {e}"))?;
+        let hangup = self.watch(id, watched, Interest::READ)?;
         tracing::info!("subscriber {id} subscribed");
         let subscriber = Subscriber {
             stream,
@@ -125,6 +107,53 @@ impl Orrery {
         Ok(())
     }
 
+    /// A source on subscriber `id`'s socket noticing its hang-up: with `Interest::READ`, what it sends is read and
+    /// ignored (a few reads a wake) up to its end; there, a hang-up drops it, while a half-close (it said `subscribe`
+    /// and shut its sending side, still reading) leaves a source with no interest, which epoll still wakes on hang-up.
+    fn watch(&mut self, id: u64, stream: UnixStream, interest: Interest) -> Result<RegistrationToken, String> {
+        let token =
+            (self.loop_handle).insert_source(Generic::new(stream, interest, Mode::Level), move |_, stream, state| {
+                let stream: &UnixStream = stream;
+                if interest.readable {
+                    let mut chunk = [0u8; 1024];
+                    let mut ended = false;
+                    for _ in 0..4 {
+                        match (&*stream).read(&mut chunk) {
+                            Ok(0) => ended = true,
+                            Ok(_) => continue,
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                            Err(_) => ended = true,
+                        }
+                        break;
+                    }
+                    if !ended {
+                        return Ok(PostAction::Continue);
+                    }
+                } else if !hung_up(stream) {
+                    return Ok(PostAction::Continue);
+                }
+                // This source goes by returning Remove, never by its token.
+                if let Some(sub) = state.subscribers.live.get_mut(&id) {
+                    sub.hangup = None;
+                }
+                if hung_up(stream) {
+                    state.unsubscribe(id, "hung up");
+                    return Ok(PostAction::Remove);
+                }
+                let rewatched = stream.try_clone().map_err(|e| e.to_string());
+                match rewatched.and_then(|s| state.watch(id, s, Interest::EMPTY)) {
+                    Ok(token) => match state.subscribers.live.get_mut(&id) {
+                        Some(sub) => sub.hangup = Some(token),
+                        None => state.loop_handle.remove(token),
+                    },
+                    Err(e) => state.unsubscribe(id, &format!("dropped: {e}")),
+                }
+                Ok(PostAction::Remove)
+            });
+        token.map_err(|e| format!("cannot watch a subscriber: {e}"))
+    }
+
     /// Subscriber `id` goes, with its sources (its socket closes: its reader sees EOF).
     fn unsubscribe(&mut self, id: u64, why: &str) {
         let Some(sub) = self.subscribers.live.remove(&id) else {
@@ -136,13 +165,29 @@ impl Orrery {
         tracing::info!("subscriber {id} {why}");
     }
 
-    /// Once per loop iteration: the events since the last (or, to a new subscriber, the `state`) to every
-    /// subscriber. Nothing at all is looked at while nobody subscribes.
+    /// At the end of every loop iteration: the events since the last summary (or, to a new subscriber, the `state`)
+    /// to every subscriber. Within `PUBLISH_EVERY` of the last summary a timer is set for the rest instead: its wake
+    /// ends an iteration too, so the last change still goes out. Nothing is looked at while nobody subscribes.
     pub fn publish_events(&mut self) {
         if self.subscribers.live.is_empty() {
             self.subscribers.sent = None;
             return;
         }
+        let at = Instant::now();
+        if let Some(wait) = publish_wait(self.subscribers.last, at) {
+            if self.subscribers.timer.is_none() {
+                let timer = (self.loop_handle).insert_source(Timer::from_duration(wait), |_, _, state| {
+                    state.subscribers.timer = None;
+                    TimeoutAction::Drop
+                });
+                match timer {
+                    Ok(t) => self.subscribers.timer = Some(t),
+                    Err(e) => tracing::warn!("cannot time the event stream: {e}"),
+                }
+            }
+            return;
+        }
+        self.subscribers.last = Some(at);
         let view = self.summary_view();
         let now = Summary::new(&view, |w| self.stacks.is_marked(w), self.config_reads);
         let events = (self.subscribers.sent.as_ref()).map_or_else(Vec::new, |sent| sent.events(&now));

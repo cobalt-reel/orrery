@@ -452,26 +452,55 @@ fn spawn_at_start_runs_once_with_the_session_environment() {
     let out = dir.path().join("started.txt");
     std::fs::write(
         &script,
-        "#!/bin/sh\necho \"$XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE $WAYLAND_DISPLAY\" >> \"$1\"\n",
+        "#!/bin/sh\necho \"$2 $XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE $WAYLAND_DISPLAY $ORRERY_SOCKET\" >> \"$1\"\n",
     )
     .expect("write the script");
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
-    let line = format!("spawn-at-start \"{}\" \"{}\"\n", script.display(), out.display());
-    let orrery = Compositor::start(&format!("{}{line}", config::DEFAULT), SIZE);
+    let start = |tag: &str| {
+        format!(
+            "spawn-at-start \"{}\" \"{}\" \"{tag}\"\n",
+            script.display(),
+            out.display()
+        )
+    };
+    let orrery = Compositor::start(&format!("{}{}", config::DEFAULT, start("first")), SIZE);
     let lines = || std::fs::read_to_string(&out).unwrap_or_default();
-    let deadline = std::time::Instant::now() + support::TIMEOUT;
-    while lines().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the program never ran: {}",
-            orrery.log()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(lines(), format!("{NAME} wayland {}\n", orrery.display));
-    // Not on a reload.
+    let wait_for = |what: &str| {
+        let deadline = std::time::Instant::now() + support::TIMEOUT;
+        while !lines().contains(what) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {what:?}: {}{}",
+                lines(),
+                orrery.log()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    wait_for("first");
+    let env = format!(
+        "{NAME} wayland {} {}",
+        orrery.display,
+        orrery.control_socket().display()
+    );
+    assert_eq!(lines(), format!("first {env}\n"));
+
+    // A reload with one more: neither runs. A spawn after it does, and is the second line: had the reload started
+    // anything, it would have come before.
+    orrery.write_config(&format!("{}{}{}", config::DEFAULT, start("first"), start("second")));
     orrery.msg_ok(&["reload"]);
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert_eq!(lines().lines().count(), 1, "{}", lines());
+    let (s, o) = (script.display().to_string(), out.display().to_string());
+    orrery.msg_ok(&["spawn", &s, &o, "spawned"]);
+    wait_for("spawned");
+    assert_eq!(lines(), format!("first {env}\nspawned {env}\n"));
+
+    // `orrery msg` in such a program finds this orrery by `ORRERY_SOCKET`, whatever XDG_RUNTIME_DIR says.
+    let answer = std::process::Command::new(support::BIN)
+        .args(["msg", "state"])
+        .env(orrery_wm::comp::ipc_server::socket_env(), orrery.control_socket())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .output()
+        .expect("run orrery msg");
+    assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
     assert!(orrery.stop().success());
 }

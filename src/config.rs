@@ -314,7 +314,26 @@ impl Mods {
 }
 
 /// Sources above this are refused before parsing.
-const MAX_SOURCE: usize = 1 << 20;
+pub const MAX_SOURCE: usize = 1 << 20;
+
+/// A config file's text, None when it is longer than `limit` bytes (no more than one byte past it is read). Only a
+/// regular file is read, and opening never waits: a FIFO, a terminal or a device (`/dev/stdin`, `/dev/zero`) would
+/// hold up or flood the event loop, which reads configs.
+pub fn read_file(path: &Path, limit: usize) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    file.take(limit.saturating_add(1)).read_to_string(&mut text)?;
+    Ok((text.len() as u64 <= limit).then_some(text))
+}
 /// Deepest `{` nesting allowed; the config needs 2. kdl's parser recurses per level, so an unbounded depth can
 /// overflow the stack and abort the process, which no error handling can catch.
 const MAX_DEPTH: usize = 16;
@@ -449,13 +468,11 @@ impl Sources<'_> {
             return self.problem(at, offset, message);
         }
         self.files.push(path.clone());
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
+        let text = match read_file(&path, MAX_SOURCE.saturating_sub(self.bytes)) {
+            Ok(Some(t)) => t,
+            Ok(None) => return self.problem(at, offset, "the config and its includes are larger than 1 MiB".into()),
             Err(e) => return self.problem(at, offset, format!("cannot read {}: {e}", path.display())),
         };
-        if self.bytes + text.len() > MAX_SOURCE {
-            return self.problem(at, offset, "the config and its includes are larger than 1 MiB".into());
-        }
         chain.push((path.clone(), canonical));
         self.read(Some(path), text, chain);
         chain.pop();
@@ -637,6 +654,16 @@ impl<'a> Parser<'a> {
             ..Problem::at(src, offset, message.into())
         };
         self.problems.push((self.at, problem));
+    }
+
+    /// `[FILE:]LINE:COL` of `offset` in text `at`, as a problem there would show it.
+    fn place(&self, (at, offset): (usize, usize)) -> String {
+        let (file, src) = &self.texts[at];
+        let p = Problem::at(src, offset, String::new());
+        match file {
+            Some(f) => format!("{}:{}:{}", f.display(), p.line, p.col),
+            None => format!("{}:{}", p.line, p.col),
+        }
     }
 
     /// The config from the top-level `nodes` of `docs` (`Sources::order`).
@@ -969,6 +996,8 @@ impl<'a> Parser<'a> {
     /// Expand `Mod`, check layout targets and refuse duplicates (same mods and keysym) that disagree.
     fn resolve_binds(&mut self, raw_binds: Vec<RawBind>, modifier: Mods, layout_names: &[String]) -> Vec<Bind> {
         let mut binds: Vec<Bind> = Vec::new();
+        // Where each bind in `binds` was written: (text, offset).
+        let mut written_at: Vec<(usize, usize)> = Vec::new();
         for raw in raw_binds {
             self.at = raw.at;
             if let Action::Layout(name) = &raw.action
@@ -981,15 +1010,17 @@ impl<'a> Parser<'a> {
             } else {
                 raw.mods
             };
-            if let Some(b) = binds.iter().find(|b| b.mods == mods && b.keysym == raw.keysym) {
+            if let Some(i) = binds.iter().position(|b| b.mods == mods && b.keysym == raw.keysym) {
                 // The same action twice is one bind: with `mod "Alt"`, `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are.
-                if b.action == raw.action {
+                if binds[i].action == raw.action {
                     continue;
                 }
                 let written = raw.node.name().value();
-                self.err(raw.node, format!("{written:?} is bound twice"));
+                let other = self.place(written_at[i]);
+                self.err(raw.node, format!("{written:?} is bound twice (also at {other})"));
                 continue;
             }
+            written_at.push((raw.at, raw.node.span().offset()));
             binds.push(Bind {
                 mods,
                 key: raw.key,
@@ -2662,7 +2693,52 @@ mod tests {
         let actions: Vec<&Action> = c.binds.iter().map(|b| &b.action).collect();
         assert_eq!(actions, [&Action::Quit, &Action::Close], "the same bind twice is one");
         let clash = format!("{ONE}binds {{\n \"Mod+Q\" quit\n}}\nbinds {{\n \"Mod+Q\" close\n}}\n");
-        assert_problem(&clash, 9, "bound twice");
+        assert_problem(&clash, 9, "bound twice (also at 6:2)");
+        // Across files, the other place names its file: a snippet's bind is not overridden, it clashes.
+        let dir = tree(&[
+            (
+                "main.kdl",
+                &format!("{ONE}include \"keys.kdl\"\nbinds {{\n \"Mod+Q\" close\n}}\n"),
+            ),
+            ("keys.kdl", "binds {\n \"Mod+Q\" quit\n}\n"),
+        ]);
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        let (main, keys) = (dir.path().join("main.kdl"), dir.path().join("keys.kdl"));
+        let want = format!(
+            "{}:7:2: \"Mod+Q\" is bound twice (also at {}:2:2)",
+            main.display(),
+            keys.display()
+        );
+        assert_eq!(err.to_string(), want);
+    }
+
+    #[test]
+    fn only_regular_files_are_read_and_never_past_the_limit() {
+        let dir = tree(&[("sub/x.kdl", "")]);
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // Safety: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // A FIFO nobody writes to would block the reader for ever; a device may never end.
+        for target in [fifo.display().to_string(), "/dev/zero".into(), "sub".into()] {
+            std::fs::write(dir.path().join("main.kdl"), format!("{ONE}include \"{target}\"\n")).unwrap();
+            let err = parse_main(dir.path(), None).config.unwrap_err();
+            assert!(err.to_string().contains("not a regular file"), "{target}: {err}");
+        }
+        assert!(
+            read_file(&fifo, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        let ten = dir.path().join("ten");
+        std::fs::write(&ten, "0123456789").unwrap();
+        assert_eq!(read_file(&ten, 10).unwrap().as_deref(), Some("0123456789"));
+        assert_eq!(read_file(&ten, 9).unwrap(), None, "longer than the limit");
+        assert_eq!(
+            read_file(&dir.path().join("none"), 9).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]

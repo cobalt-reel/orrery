@@ -27,7 +27,7 @@ enum Command {
         override_usage = msg_usage()
     )]
     Msg {
-        #[arg(long, help = socket_help())]
+        #[arg(long, help = msg_socket_help())]
         socket: Option<PathBuf>,
         /// Run the request on that machine of the session (through the primary).
         #[arg(long, value_name = "MACHINE")]
@@ -78,6 +78,13 @@ struct RunArgs {
 // The default paths in `--help`, from `NAME` (doc comments cannot hold it).
 fn socket_help() -> String {
     format!("The control socket. Default: `$XDG_RUNTIME_DIR/{NAME}.sock`")
+}
+
+fn msg_socket_help() -> String {
+    format!(
+        "The control socket. Default: `${}`, else `$XDG_RUNTIME_DIR/{NAME}.sock`",
+        ipc_server::socket_env()
+    )
 }
 
 /// `spawn` is the only subcommand; clap's own second form (`msg <COMMAND>`) would hide `--socket`.
@@ -155,8 +162,12 @@ fn check(path: Option<PathBuf>) -> ExitCode {
         eprintln!("{NAME} check: no config path: pass --config or set XDG_CONFIG_HOME or HOME");
         return ExitCode::FAILURE;
     };
-    let src = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
+    let src = match config::read_file(&path, config::MAX_SOURCE) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("{}: the config is larger than 1 MiB", path.display());
+            return ExitCode::FAILURE;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "{}: no such file ({NAME} would use the built-in config)",
@@ -200,6 +211,17 @@ fn check(path: Option<PathBuf>) -> ExitCode {
     }
 }
 
+/// The control socket `orrery msg` talks to: `--socket`, else `ORRERY_SOCKET` (`env`, set for the programs an orrery
+/// starts; empty is unset), else the default.
+fn msg_socket(
+    flag: Option<PathBuf>,
+    env: Option<std::ffi::OsString>,
+    default: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    flag.or_else(|| env.filter(|e| !e.is_empty()).map(PathBuf::from))
+        .or_else(default)
+}
+
 /// The request `orrery msg` sends for `words`, run on machine `to` when given (never a `subscribe`).
 fn msg_request(to: Option<String>, words: &[String]) -> Result<Request, String> {
     let request = ipc::parse_words(words)?;
@@ -223,7 +245,8 @@ fn msg(socket: Option<PathBuf>, to: Option<String>, words: &[String]) -> ExitCod
             return ExitCode::FAILURE;
         }
     };
-    let Some(path) = socket.or_else(ipc_server::default_socket_path) else {
+    let env = std::env::var_os(ipc_server::socket_env());
+    let Some(path) = msg_socket(socket, env, ipc_server::default_socket_path) else {
         eprintln!("{NAME} msg: no control socket: pass --socket or set XDG_RUNTIME_DIR");
         return ExitCode::FAILURE;
     };
@@ -334,6 +357,20 @@ mod tests {
             (to, argv),
             (Some("desk".into()), vec!["foot".into(), "--to".into(), "x".into()])
         );
+    }
+
+    #[test]
+    fn msg_finds_the_socket_by_flag_then_environment_then_default() {
+        let (flag, env, default) = ("/flag.sock", "/env.sock", "/default.sock");
+        let pick = |f: Option<&str>, e: Option<&str>| {
+            msg_socket(f.map(PathBuf::from), e.map(std::ffi::OsString::from), || {
+                Some(PathBuf::from(default))
+            })
+        };
+        assert_eq!(pick(Some(flag), Some(env)), Some(PathBuf::from(flag)));
+        assert_eq!(pick(None, Some(env)), Some(PathBuf::from(env)));
+        assert_eq!(pick(None, None), Some(PathBuf::from(default)));
+        assert_eq!(pick(None, Some("")), Some(PathBuf::from(default)), "empty is unset");
     }
 
     #[test]

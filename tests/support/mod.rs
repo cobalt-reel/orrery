@@ -358,6 +358,21 @@ impl Drop for Subscription {
 }
 
 impl Compositor {
+    /// `orrery msg --socket <ours> subscribe`, its stdout piped but not read: it blocks once the pipe is full.
+    pub fn subscribe_unread(&self) -> Child {
+        Command::new(BIN)
+            .arg("msg")
+            .arg("--socket")
+            .arg(self.control_socket())
+            .arg("subscribe")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run orrery msg subscribe")
+    }
+
     /// `orrery msg --socket <ours> subscribe`, running.
     pub fn subscribe(&self) -> Subscription {
         let mut child = Command::new(BIN)

@@ -1,14 +1,27 @@
 //! The event stream (`orrery msg subscribe`): a `state` snapshot, then events for what changed. Pure: the
-//! compositor takes a `Summary` of its state once per event-loop iteration and sends the events that lead from the
-//! last one sent to it, so every change is covered, however it was made, and changes within one iteration coalesce.
+//! compositor takes a `Summary` of its state once per event-loop iteration (at most every `PUBLISH_EVERY`) and sends
+//! the events that lead from the last one sent to it, so every change a bar shows is covered, however it was made,
+//! and changes in between coalesce.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::ipc::{ColorsView, LayerView, SessionView, StateView, TabView, WindowView};
 use crate::layout::Rect;
 use crate::stacks::WinId;
+
+/// Summaries are taken at most this often: a fast pointer wakes the event loop a thousand times a second, and
+/// a bar needs no more than a frame's worth.
+pub const PUBLISH_EVERY: Duration = Duration::from_millis(8);
+
+/// How long to wait before the next summary, the last taken at `last`; None: take it now.
+#[must_use]
+pub fn publish_wait(last: Option<Instant>, now: Instant) -> Option<Duration> {
+    let since = now.saturating_duration_since(last?);
+    (since < PUBLISH_EVERY).then(|| PUBLISH_EVERY - since)
+}
 
 /// One line of the stream. Each carries all a bar needs to redraw its part without asking again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,8 +38,10 @@ pub enum Event {
     Focus(Focus),
     /// The focused slot's tabs (another slot focused, or its tabs or their titles changed).
     Tabs(Tabs),
-    /// A window's title or app id changed (one event per window).
+    /// A window entered the slots (opened, or mapped again), or its title or app id changed; one per window.
     Title(WindowView),
+    /// A window left the slots: closed, or unmapped by its client.
+    Closed { id: WinId },
     /// The windows asking for attention, and the workspaces holding them.
     Attention { windows: Vec<WinId>, workspaces: Vec<u8> },
     /// Each screen's layout and its slots' rectangles (a layout switched, a screen resized, a bar's zone).
@@ -214,7 +229,7 @@ impl Summary {
     }
 
     /// The events leading from `self` (sent last) to `now`, in this order: workspace, layout, focus, tabs, titles
-    /// (by window id), attention, layers, session, config.
+    /// and closed windows (by window id), attention, layers, session, config.
     #[must_use]
     pub fn events(&self, now: &Summary) -> Vec<Event> {
         let changed = |was: &Event, is: &Event| (was != is).then(|| is.clone());
@@ -230,8 +245,11 @@ impl Summary {
         };
         let moved = at(&self.focus) != at(&now.focus);
         let titles = (now.titles.iter())
-            .filter(|(w, is)| self.titles.get(w).is_some_and(|was| was != *is))
+            .filter(|(w, is)| self.titles.get(w) != Some(*is))
             .map(|(_, is)| Event::Title(is.clone()));
+        let closed = (self.titles.keys())
+            .filter(|w| !now.titles.contains_key(w))
+            .map(|&id| Event::Closed { id });
         let session = self.session.as_ref().map(steady) != now.session.as_ref().map(steady);
         let mut events: Vec<Event> = [
             changed(&self.workspace, &now.workspace),
@@ -242,6 +260,7 @@ impl Summary {
         .into_iter()
         .flatten()
         .chain(titles)
+        .chain(closed)
         .collect();
         events.extend(
             [
@@ -356,6 +375,18 @@ mod tests {
     }
 
     #[test]
+    fn summaries_are_taken_at_most_every_8_ms() {
+        let t = Instant::now();
+        assert_eq!(publish_wait(None, t), None, "the first at once");
+        assert_eq!(
+            publish_wait(Some(t), t + Duration::from_millis(3)),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(publish_wait(Some(t), t + PUBLISH_EVERY), None);
+        assert_eq!(publish_wait(Some(t), t + Duration::from_secs(1)), None);
+    }
+
+    #[test]
     fn nothing_changed_is_no_event() {
         let mut w = World::new();
         w.open(1, "one");
@@ -366,7 +397,7 @@ mod tests {
     fn a_new_window_changes_the_workspace_focus_and_tabs() {
         let mut w = World::new();
         let events = after(&mut w, |w| w.open(1, "one"));
-        assert_eq!(names(&events), ["workspace", "focus", "tabs"]);
+        assert_eq!(names(&events), ["workspace", "focus", "tabs", "title"]);
         let Event::Workspace { screens, workspaces } = &events[0] else {
             panic!("{events:?}");
         };
@@ -424,7 +455,7 @@ mod tests {
         let mut w = World::new();
         w.open(1, "one");
         let events = after(&mut w, |w| w.open(2, "two"));
-        assert_eq!(names(&events), ["focus", "tabs"]);
+        assert_eq!(names(&events), ["focus", "tabs", "title"]);
         let Event::Tabs(tabs) = &events[1] else {
             panic!("{events:?}");
         };
@@ -455,6 +486,21 @@ mod tests {
             w.titles.insert(2, "zwei".into());
         });
         assert_eq!(names(&events), ["tabs", "title"]);
+    }
+
+    #[test]
+    fn a_window_appearing_has_its_title_and_one_going_is_closed() {
+        let mut w = World::new();
+        w.open(1, "one");
+        let events = after(&mut w, |w| w.open(2, "two"));
+        assert_eq!(events.last(), Some(&Event::Title(window(2, "two"))));
+        let events = after(&mut w, |w| w.stacks.close(1));
+        assert_eq!(names(&events), ["tabs", "closed"]);
+        assert_eq!(events[1], Event::Closed { id: 1 });
+        assert_eq!(
+            serde_json::to_string(&events[1]).unwrap(),
+            r#"{"event":"closed","id":1}"#
+        );
     }
 
     #[test]

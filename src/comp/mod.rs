@@ -191,8 +191,12 @@ pub struct ConfigRead {
 /// Reads and parses the config file at `path` with what it includes. The error lists every problem as
 /// `FILE:LINE:COL: message`.
 pub fn read_config_file(path: &Path) -> ConfigRead {
-    match std::fs::read_to_string(path) {
-        Ok(src) => {
+    match config::read_file(path, config::MAX_SOURCE) {
+        Ok(None) => ConfigRead {
+            config: Err(format!("{}: the config is larger than 1 MiB", path.display())),
+            files: vec![path.to_owned()],
+        },
+        Ok(Some(src)) => {
             let read = config::parse_file(&src, path, home_dir().as_deref());
             ConfigRead {
                 config: read.config.map(Some).map_err(|e| e.to_string()),
@@ -463,6 +467,8 @@ pub struct Orrery {
     config_reads: u64,
     /// The event stream's subscribers.
     subscribers: subscribers::Subscribers,
+    /// The control socket's path, handed to the programs orrery starts.
+    control_socket: Option<PathBuf>,
     /// In opening order, which is not the monitors' (number) order: look monitors up by name, never by index.
     pub outputs: Vec<Output>,
     /// Each output's global, by output name, to take away with it.
@@ -573,6 +579,7 @@ impl Orrery {
             config_is_fallback,
             config_reads: 0,
             subscribers: subscribers::Subscribers::default(),
+            control_socket: None,
             outputs: Vec::new(),
             output_globals: HashMap::new(),
             screens: None,
@@ -1321,6 +1328,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     let mut state = Orrery::new(&event_loop, display.handle(), config_path)?;
     state.socket_name = listen(display, &mut event_loop)?;
     state.debug_inject = opts.debug_inject;
+    state.control_socket = Some(control_path.clone());
 
     event_loop
         .handle()
@@ -1577,6 +1585,22 @@ mod tests {
             err.contains(&format!("{}:2:1: unknown node", broken.display())),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_config_file_must_be_a_regular_file_of_at_most_1_mib() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.kdl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // Safety: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Read on the event loop: a FIFO must not wait for a writer.
+        let err = read_config_file(&fifo).config.unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let big = dir.path().join("big.kdl");
+        std::fs::write(&big, format!("// {}\n", "x".repeat(config::MAX_SOURCE))).unwrap();
+        let err = read_config_file(&big).config.unwrap_err();
+        assert!(err.contains("1 MiB") && err.contains("big.kdl"), "{err}");
     }
 
     #[test]

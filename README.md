@@ -199,7 +199,7 @@ orrery msg close
 orrery msg reload                     # re-read the config now (it is also watched)
 orrery msg quit
 orrery msg '{"cmd":"layout","name":"wall"}'   # a single argument is taken as a JSON request
-orrery msg --socket /path/to/orrery.sock state
+orrery msg --socket /path/to/orrery.sock state   # default: $ORRERY_SOCKET, else $XDG_RUNTIME_DIR/orrery.sock
 orrery msg --to side state            # any request, run on that machine of the session (see Linking machines)
 orrery msg inject key 38 down         # testing aid (--debug-inject only): input as if from this machine's devices
                                       #   (forwarded as theirs is): key XKB-KEYCODE down|up, motion DX DY (relative),
@@ -233,10 +233,10 @@ Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. `colo
 ends the stream (it quits, or drops a subscriber that leaves more than 1 MiB unread: reconnect then); it exits 0
 then, 1 when nothing answers or the subscription is refused (at most 16 subscribers at once). It is not for `--to`.
 The first line is `{"event":"state", ...}`: everything `state` carries, at the top level, except `last_key`: no
-keystroke ever appears in the stream. Then a line per change: once per turn of its event loop orrery compares what
-the events carry with what it sent last, so changes within one turn come as one event, and every change is seen
-however it was made (a key, `msg`, a client, a reload, another machine). Each event carries all a bar needs to redraw
-its part without asking again; within a turn they come in this order:
+keystroke ever appears in the stream. Then a line per change: after each turn of its event loop, at most every
+8 ms, orrery compares what the events carry with what it sent last, so changes in between come as one event, and
+every change a bar shows is seen however it was made (a key, `msg`, a client, a reload, another machine). Each event
+carries all a bar needs to redraw its part without asking again; at one time they come in this order:
 
 | `event` | When | Carries |
 |---------|------|---------|
@@ -244,7 +244,8 @@ its part without asking again; within a turn they come in this order:
 | `layout` | a screen's layout or its slots' rectangles change (a layout or workspace switch, a resize, a bar's exclusive zone) | `screens`, each `{ name, workspace, layout, slots }`, the slots as `{ index, name, rect }` |
 | `focus` | the focus moves to another screen, workspace, slot or window | `screen`, `workspace`, `slot`, `slot_name`, `window` (`{ id, app_id, title }`, null for an empty slot); all null without a screen |
 | `tabs` | another slot is focused, or the focused slot's tabs, current tab, windows or titles change | `screen`, `workspace`, `slot` and its `tabs`, as `state` lists them (`{ current, attention, windows }`) |
-| `title` | a window's title or app id changes (one event per window) | `id`, `app_id`, `title` |
+| `title` | a window enters a slot (opened, or mapped again), or its title or app id changes; one per window | `id`, `app_id`, `title` |
+| `closed` | a window leaves the slots (closed, or unmapped by its client); one per window | `id` |
 | `attention` | a window asks for attention, or its mark goes | `windows` (ids) and `workspaces` (numbers) asking |
 | `layers` | a layer surface appears, goes, moves or takes the keyboard | `screens`, each `{ name, layers }`, each layer `{ namespace, layer, rect, keyboard }` |
 | `session` | a machine joins or leaves, a link goes up or down, input moves, the link error changes (latency alone does not) | `session` as in `state`, null alone |
@@ -261,19 +262,21 @@ its part without asking again; within a turn they come in this order:
 `spawn` binds, `orrery msg spawn` and `spawn-at-start` run a program directly (no shell: write `"sh" "-c" "..."` for
 one), detached (a process group of its own, no stdin, stdout or stderr), in orrery's own environment with:
 `WAYLAND_DISPLAY` set to orrery's socket; `DISPLAY` removed, so no toolkit falls back to the host's X server;
-`XDG_CURRENT_DESKTOP=orrery` and `XDG_SESSION_TYPE=wayland`, which portals, toolkits and desktop entries read; and an
-xdg-activation token as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`, so its window opens where it was started.
+`XDG_CURRENT_DESKTOP=orrery` and `XDG_SESSION_TYPE=wayland`, which portals, toolkits and desktop entries read;
+`ORRERY_SOCKET` set to orrery's control socket, which `orrery msg` uses when not given `--socket` (so a program talks
+to the orrery that started it); and an xdg-activation token as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`, so
+its window opens where it was started.
 
 ## The config, its reload and `orrery check`
 
-orrery looks at its config file and the files it includes once a second (modification time and size) and reloads
-it when one changes, or at once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at runtime is kept,
-unless the file's own `stacking` value changed): every workspace, hidden ones too, takes the new definition of its
-layout by name (a workspace whose layout is gone keeps it; that is logged, not an error). Monitor rules apply to new
-outputs only, except after a start on the built-in config (the file was missing or broken): the first good file then
-also applies its monitor rules, as a start with it would have. A broken file changes nothing: the old config stays,
-the error is in `orrery msg state` as `config_error`, and a **4 px red bar** runs along the top of every output
-until a good config loads. At startup a broken file means the built-in config, with the bar. A file deleted while
+orrery looks at its config file and the files it includes once a second (modification time and size) and reloads it when
+one changes, or at once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at
+runtime is kept, unless the file's own `stacking` value changed): every workspace, hidden ones too, takes the new
+definition of its layout by name (a workspace whose layout is gone keeps it; that is logged, not an error). Monitor
+rules apply to new outputs only, except after a start on the built-in config (the file was missing or broken): the first
+good file then also applies its monitor rules, as a start with it would have. A broken file changes nothing: the old
+config stays, the error is in `orrery msg state` as `config_error`, and a **4 px red bar** runs along the top of every
+output until a good config loads. At startup a broken file means the built-in config, with the bar. A file deleted while
 running keeps the running config.
 
 ```sh
@@ -337,9 +340,11 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   config with one line. `PATH` is relative to the including file's directory, absolute, or starts with `~/` for the
   home directory. An included file may hold anything the main one may (its `binds` add to the others'; anything else
   set twice is an error wherever the two are) and include more, up to 8 deep; a cycle is an error naming the chain
-  of files, and the config with everything it includes is at most 1 MiB. Problems in an included file, or a missing
-  one, are config errors like any (`FILE:LINE:COL` names the file); the watcher watches included files too, a
-  missing one included (creating it reloads), and `orrery check` follows includes.
+  of files, and the config with everything it includes is at most 1 MiB. Only regular files are read (not a FIFO or
+  a device). Problems in an included file, or a missing one, are config errors like any (`FILE:LINE:COL` names the
+  file); the watcher watches included files too, a missing one included (creating it reloads), and `orrery check`
+  follows includes. An included bind cannot be overridden: binding its keys to something else is an error naming
+  both places, so change such a bind by removing it from the snippet (or not including the snippet).
 - `spawn-at-start "PROGRAM" ["ARG"...]`: run once when orrery starts, with its screens and control socket up, as a
   `spawn` bind runs it (see [Programs orrery starts](#programs-orrery-starts)); any number, in order. Never again on
   a reload (nor when a config broken at startup is fixed by one).

@@ -26,8 +26,8 @@ in `examples/kitty/`. Agreed 2026-10-29. Notifications, lock and idle stay later
   for each change: `workspace` (shown/created/gone, per screen), `focus` (screen, workspace, slot, window), `tabs` (a
   slot's tabs and titles changed), `title`, `attention`, `layout`, `session` (machines, link up/down, where input is),
   `config` (reloaded). Each event carries enough to redraw a bar without asking again.
-- Events are coalesced per loop iteration. A subscriber that does not read keeps at most a bounded backlog; past it,
-  it is dropped (its reader sees EOF and can reconnect). Keystrokes never appear.
+- Events are coalesced per loop iteration, at most every 8 ms. A subscriber that does not read keeps at most a
+  bounded backlog; past it, it is dropped (its reader sees EOF and can reconnect). Keystrokes never appear.
 
 ## Session environment
 
