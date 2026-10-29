@@ -243,13 +243,15 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   `~/` for the home directory.
 - `name "NAME"`: this machine's name in a session, 1 to 64 bytes, unique in it; default: the hostname.
 - `keyboard { layout "..."; variant "..."; options "..."; model "..."; repeat-delay MS; repeat-rate N }`: every
-  child optional. The four xkb names are as xkb takes them (`layout "us,de"`, `options "grp:alt_shift_toggle"`); one
-  left out comes from `XKB_DEFAULT_LAYOUT` (`_VARIANT`, `_OPTIONS`, `_MODEL`), else xkb's own default (`us`). An
-  empty `variant` or `options` means none. A keymap xkb cannot build is a config error (so `orrery check` catches
-  a misspelt layout). `repeat-delay` is the hold before a key repeats, 1 to 10000 ms (default 200); `repeat-rate`
-  the repeats a second, 0 (no repeat) to 1000 (default 25). A reload that changes the block sends the new keymap
-  and repeat to every client (in a session, while the primary's input is here, the new keymap comes back with
-  this machine's own input).
+  child optional. The four xkb names are as xkb takes them (`layout "us,de"`, `options "grp:alt_shift_toggle"`);
+  `options` and `model` left out come from `XKB_DEFAULT_OPTIONS` and `XKB_DEFAULT_MODEL`, else xkb's own default.
+  The variant comes with the layout: both from the block (`variant` needs `layout`), or both from
+  `XKB_DEFAULT_LAYOUT` and `XKB_DEFAULT_VARIANT` (else `us`). An empty `variant` or `options` means none. A keymap
+  xkb cannot build is a config error (so `orrery check` catches a misspelt layout). `repeat-delay` is the hold
+  before a key repeats, 1 to 10000 ms (default 200); `repeat-rate` the repeats a second, 0 (no repeat) to 1000
+  (default 25). A reload that changes the block sends the new keymap (on the layout in use, when the layouts are
+  the same) and repeat to every client (in a session, while the primary's input is here, the new keymap comes back
+  with this machine's own input).
 - `colors { focus "#rrggbb"; badge "#rrggbb"; attention "#rrggbb"; background "#rrggbb" }`: each also
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
   one window and the tab strips, `attention` the badge of a slot holding a window that asked for attention,

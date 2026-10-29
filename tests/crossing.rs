@@ -354,6 +354,44 @@ fn a_keyboard_reloaded_while_the_primarys_keymap_is_in_use_comes_after_it() {
 }
 
 #[test]
+fn a_reload_keeping_the_layouts_comes_back_on_the_one_in_use() {
+    let (dir, secret) = secret_file(&random_secret());
+    let p = primary_with("desk", 0, &secret, INJECT);
+    let toggle = "keyboard {\n    layout \"us,de\"\n    options \"grp:caps_toggle\"\n}\n";
+    let s = satellite_with("side", port(&p), &secret, INJECT);
+    let config = std::fs::read_to_string(s.config_path()).expect("the satellite's config");
+    s.write_config(&format!("{config}\n{toggle}"));
+    s.msg_ok(&["reload"]);
+    wait("the satellite to join", &p, joined);
+    wait("the satellite to see it", &s, connected);
+    let (mut c, _) = focused_window(&s);
+    inject(&s, &["key", &CAPS.to_string(), "down"]);
+    inject(&s, &["key", &CAPS.to_string(), "up"]);
+    assert!(c.wait_for(|st| st.group == 1), "group {}", c.state.group);
+    send(&p, json!({"msg": "keymap", "xkb": KEYMAP_DE}));
+    send_words(&p, &["handoff"]);
+    assert!(
+        c.wait_for(|st| st.group == 0 && st.keymaps.len() == 2),
+        "{:?}",
+        c.state.keymaps
+    );
+    // Other options, the same layouts, while the primary's keymap is in use: back on de after.
+    s.write_config(&format!(
+        "{config}\n{}",
+        toggle.replace("grp:caps_toggle", "grp:caps_toggle,compose:ralt")
+    ));
+    s.msg_ok(&["reload"]);
+    send_words(&p, &["release"]);
+    assert!(
+        c.wait_for(|st| st.keymaps.len() == 3 && st.group == 1),
+        "{:?} group {}",
+        c.state.keymaps,
+        c.state.group
+    );
+    drop(dir);
+}
+
+#[test]
 fn a_keymap_that_does_not_compile_closes_the_link() {
     let (_dir, p, s) = pair();
     let (mut c, _) = focused_window(&s);

@@ -240,10 +240,14 @@ impl Orrery {
         self.remote.local_keymap.is_some()
     }
 
-    /// While `keymap_kept`: `text` is this machine's keymap to come back to, on its first layout.
-    pub(super) fn replace_kept_keymap(&mut self, text: String) {
-        if let Some(kept) = &mut self.remote.local_keymap {
-            *kept = (text, Layout(0));
+    /// While `keymap_kept`: `text` is this machine's keymap to come back to, on the layout it was on when
+    /// `same_layouts`, else on its first.
+    pub(super) fn replace_kept_keymap(&mut self, text: String, same_layouts: bool) {
+        if let Some((kept, layout)) = &mut self.remote.local_keymap {
+            *kept = text;
+            if !same_layouts {
+                *layout = Layout(0);
+            }
         }
     }
 
@@ -254,7 +258,7 @@ impl Orrery {
     }
 
     /// The keymap in use to its layout `layout`, if it has that many.
-    fn select_layout(&mut self, layout: Layout) {
+    pub(super) fn select_layout(&mut self, layout: Layout) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };

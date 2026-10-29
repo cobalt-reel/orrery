@@ -105,7 +105,7 @@ pub struct Config {
 }
 
 /// The `keyboard` block: the xkb names, each None for `XKB_DEFAULT_*` (xkbcommon reads them, else uses its own
-/// default), and key repeat.
+/// default; the variant comes with the layout, so a variant needs a layout), and key repeat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyboard {
     pub layout: Option<String>,
@@ -172,6 +172,12 @@ impl Keyboard {
     pub fn repeat_info(&self) -> (i32, i32) {
         let wire = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
         (wire(self.repeat_rate), wire(self.repeat_delay))
+    }
+
+    /// The same layouts (and variants): a new keymap of these stays on the layout in use.
+    #[must_use]
+    pub fn same_layouts(&self, other: &Keyboard) -> bool {
+        (&self.layout, &self.variant) == (&other.layout, &other.variant)
     }
 
     /// The same keymap: the same names (the repeat aside).
@@ -569,6 +575,7 @@ impl<'a> Parser<'a> {
         let mut keyboard = Keyboard::default();
         let mut seen: Vec<&str> = Vec::new();
         let mut names_ok = true;
+        let mut variant_at = None;
         for child in children(node) {
             let key = child.name().value();
             if seen.contains(&key) {
@@ -594,6 +601,9 @@ impl<'a> Parser<'a> {
                         names_ok = false;
                         continue;
                     }
+                    if key == "variant" {
+                        variant_at = Some(child.span().offset());
+                    }
                     *match key {
                         "layout" => &mut keyboard.layout,
                         "variant" => &mut keyboard.variant,
@@ -615,6 +625,11 @@ impl<'a> Parser<'a> {
                 }
                 other => self.err(child, format!("unknown keyboard setting `{other}`")),
             }
+        }
+        // xkb takes a variant only with the layout it is for: without one, both come from the environment.
+        if let Some(at) = variant_at.filter(|_| keyboard.layout.is_none()) {
+            self.err_at(at, "`variant` needs `layout` (it is a variant of that layout)");
+            names_ok = false;
         }
         if names_ok && keyboard.keymap_text().is_none() {
             self.err(
@@ -2129,6 +2144,9 @@ mod tests {
             ("variant \"a\\u{0}b\"", "control"),
             ("options \"ctrl:nocaps\" x=1", "unknown property"),
             ("layout \"de\" {\n}", "block"),
+            // xkb takes the variant with the layout: without one, both would come from the environment.
+            ("variant \"nodeadkeys\"", "`variant` needs `layout`"),
+            ("variant \"\"", "`variant` needs `layout`"),
             ("repeat-delay 0", "1 to 10000"),
             ("repeat-delay 10001", "1 to 10000"),
             ("repeat-delay \"600\"", "1 to 10000"),

@@ -1,6 +1,7 @@
-//! Named cursors from an xcursor theme (`XCURSOR_THEME`, `XCURSOR_SIZE`), looked up as libXcursor does: the theme,
-//! the themes it inherits, then `default`. Nothing found there: the built-in cursor (`render::fallback_cursor`).
-//! Lookups take the search path and the environment's values as arguments, so tests point them at a temp dir.
+//! Named cursors from an xcursor theme (`XCURSOR_THEME`, `XCURSOR_SIZE`), looked up like libXcursor (plus the XDG
+//! dirs; `Inherits` merged across dirs): the theme, the themes it inherits, then `default`. Nothing found there: the
+//! built-in cursor (`render::fallback_cursor`). Lookups take the search path and the environment's values as
+//! arguments, so tests point them at a temp dir.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,8 +26,9 @@ pub fn theme_and_size(theme: Option<&str>, size: Option<&str>) -> (String, u32) 
 }
 
 /// Where themes are looked for, from `env` (a variable's value; empty is unset): `XCURSOR_PATH` (`:`-separated,
-/// `~` the home) when set, else libXcursor's: `$XDG_DATA_HOME/icons` (`~/.local/share/icons`), `~/.icons`, each
-/// `$XDG_DATA_DIRS` entry's `icons` (`/usr/local/share`, `/usr/share`), `/usr/share/pixmaps`.
+/// `~` the home) when set, else like libXcursor's (plus the XDG dirs): `$XDG_DATA_HOME/icons`
+/// (`~/.local/share/icons`), `~/.icons`, each `$XDG_DATA_DIRS` entry's `icons` (`/usr/local/share`, `/usr/share`),
+/// `/usr/share/pixmaps`.
 #[must_use]
 pub fn search_path(env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     let var = |k: &str| env(k).filter(|v| !v.is_empty());

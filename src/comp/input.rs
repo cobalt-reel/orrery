@@ -8,6 +8,7 @@ use smithay::backend::input::{
 };
 use smithay::desktop::WindowSurfaceType;
 use std::collections::HashSet;
+use std::sync::PoisonError;
 
 use smithay::input::keyboard::{FilterResult, Keycode, Keysym, ModifiersState, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -288,7 +289,8 @@ impl Orrery {
     }
 
     /// The config's `keyboard` on the seat where it differs from `old`: a new keymap goes to every client (while the
-    /// primary's keymap is in use, it is the one that comes back after), new repeat info too. Err when xkb cannot
+    /// primary's keymap is in use, it is the one that comes back after), on the layout in use when the layouts are
+    /// the same (other options, say), new repeat info too. Err when xkb cannot
     /// build the keymap (the old one stays).
     pub fn apply_keyboard(&mut self, old: &Keyboard) -> Result<(), String> {
         let Some(keyboard) = self.seat.get_keyboard() else {
@@ -303,12 +305,21 @@ impl Orrery {
             return Ok(());
         }
         let failed = || "xkb cannot build the keymap of the `keyboard` block; keeping the old one".to_owned();
+        let same_layouts = new.same_layouts(old);
         if self.keymap_kept() {
             let text = new.keymap_text().ok_or_else(failed)?;
-            self.replace_kept_keymap(text);
+            self.replace_kept_keymap(text, same_layouts);
             return Ok(());
         }
-        keyboard.set_xkb_config(self, new.xkb()).map_err(|_| failed())
+        let layout = keyboard.with_xkb_state(self, |context| {
+            (context.xkb().lock().unwrap_or_else(PoisonError::into_inner)).active_layout()
+        });
+        keyboard.set_xkb_config(self, new.xkb()).map_err(|_| failed())?;
+        // A new keymap starts on its first layout: back to the one in use, when the layouts are the same.
+        if same_layouts {
+            self.select_layout(layout);
+        }
+        Ok(())
     }
 
     /// The host window lost keyboard focus: no release will arrive for what is down now. Input away comes back (the

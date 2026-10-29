@@ -92,7 +92,8 @@ impl BackendChoice {
 }
 
 /// A DRM connector's name as the kernel (and so every other compositor) gives it: its kind's name, from the
-/// `DRM_MODE_CONNECTOR_*` number, and its id among the connectors of that kind (`DP-3`, `HDMI-A-1`, `eDP-1`).
+/// `DRM_MODE_CONNECTOR_*` number, and its id among the connectors of that kind (`DP-3`, `HDMI-A-1`, `eDP-1`). The
+/// one source of output names on bare metal: the DRM backend gives it `u32::from(interface)` and `interface_id`.
 #[must_use]
 pub fn connector_name(kind: u32, id: u32) -> String {
     const KINDS: [&str; 21] = [
@@ -988,7 +989,10 @@ impl Orrery {
                 }
                 let old = std::mem::replace(&mut self.config, config);
                 let keyboard = self.apply_keyboard(&old.keyboard).err();
-                self.config_error = self.link_reload().or(keyboard);
+                self.config_error = match (keyboard, self.link_reload()) {
+                    (Some(k), Some(l)) => Some(format!("{k}; {l}")),
+                    (k, l) => k.or(l),
+                };
                 self.arrange();
                 tracing::info!("config reloaded");
                 match &self.config_error {

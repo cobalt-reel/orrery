@@ -14,6 +14,7 @@ const SIZE: (i32, i32) = (1280, 720);
 const CTRL: u32 = 37;
 const ALT: u32 = 64;
 const F2: u32 = 68;
+const CAPS: u32 = 66;
 
 fn with_keyboard(block: &str) -> String {
     format!("{}\nkeyboard {{\n{block}\n}}\n", config::DEFAULT)
@@ -61,6 +62,36 @@ fn a_reload_brings_the_new_keymap_and_repeat_to_clients() {
         c.state.repeat
     );
     assert_eq!(c.state.keymaps[2], us);
+}
+
+#[test]
+fn a_reload_keeping_the_layouts_keeps_the_one_in_use() {
+    let toggle = "layout \"us,de\"\noptions \"grp:caps_toggle\"";
+    let o = Compositor::start_with(&with_keyboard(toggle), SIZE, &["--debug-inject"]);
+    let mut c = Client::new(o.connect());
+    // A focused window: the client is told the layout in use with wl_keyboard.modifiers.
+    let w = c.create_window("typed", "T");
+    assert!(c.wait_for(|st| st.keyboard_focus == Some(w) && st.keymaps.len() == 1));
+    for state in ["down", "up"] {
+        o.msg_ok(&["inject", "key", &CAPS.to_string(), state]);
+    }
+    assert!(c.wait_for(|st| st.group == 1), "group {}", c.state.group);
+    // Other options, the same layouts: still on de.
+    o.write_config(&with_keyboard(
+        &toggle.replace("grp:caps_toggle", "grp:caps_toggle,compose:ralt"),
+    ));
+    o.msg_ok(&["reload"]);
+    assert!(c.wait_for(|st| st.keymaps.len() == 2), "{:?}", c.state.keymaps);
+    c.roundtrip();
+    assert_eq!(c.state.group, 1);
+    // Other layouts: the first.
+    o.write_config(&with_keyboard("layout \"de,us\"\noptions \"grp:caps_toggle\""));
+    o.msg_ok(&["reload"]);
+    assert!(
+        c.wait_for(|st| st.keymaps.len() == 3 && st.group == 0),
+        "group {}",
+        c.state.group
+    );
 }
 
 #[test]
