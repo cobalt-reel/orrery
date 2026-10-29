@@ -364,7 +364,7 @@ pub struct Orrery {
     pub windows: HashMap<WinId, Window>,
     /// Toplevel surface -> id, so commits find their window without a scan.
     surfaces: HashMap<WlSurface, WinId>,
-    /// Every layer surface, in mapping order (the most recently mapped last); see `layers`.
+    /// Every layer surface orrery knows, wherever it is (drawing order is its screen's map's); see `layers`.
     layers: Vec<layers::Layered>,
     /// The layer surface a click gave the keyboard, and where the stacks' focus was then (`Orrery::layer_keyboard`).
     layer_focus: Option<(WlSurface, layers::FocusKey)>,
@@ -449,9 +449,10 @@ impl ClientData for ClientState {
 }
 
 impl Orrery {
+    /// The state for `dh`'s display, with no Wayland socket yet (`run` opens it with `listen`).
     fn new(
-        event_loop: &mut EventLoop<'static, Orrery>,
-        display: Display<Orrery>,
+        event_loop: &EventLoop<'static, Orrery>,
+        dh: DisplayHandle,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         // The stamp first: an edit landing while the file is read is then seen again by the watcher.
@@ -461,7 +462,6 @@ impl Orrery {
             error: config_error,
             fallback: config_is_fallback,
         } = load_config(config_path.as_deref());
-        let dh = display.handle();
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
@@ -482,11 +482,9 @@ impl Orrery {
         }
         seat.add_pointer();
 
-        let socket_name = listen(display, event_loop)?;
-
         Ok(Self {
             start_time: Instant::now(),
-            socket_name,
+            socket_name: OsString::new(),
             display_handle: dh,
             loop_signal: event_loop.get_signal(),
             loop_handle: event_loop.handle(),
@@ -1233,7 +1231,8 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("cannot watch signals: {e}"))?;
 
-    let mut state = Orrery::new(&mut event_loop, display, config_path)?;
+    let mut state = Orrery::new(&event_loop, display.handle(), config_path)?;
+    state.socket_name = listen(display, &mut event_loop)?;
     state.debug_inject = opts.debug_inject;
 
     event_loop

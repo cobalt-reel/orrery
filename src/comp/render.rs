@@ -18,11 +18,11 @@ use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, 
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind, render_elements};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
-use smithay::desktop::layer_map_for_output;
+use smithay::desktop::{PopupManager, WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Transform};
+use smithay::utils::{IsAlive as _, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::Layer;
 
@@ -462,25 +462,43 @@ fn cursor_elements(
     }
 }
 
-/// The layer surfaces of `output` on `layers` (front to back), front to back, each with its popups in front.
-fn layer_elements(output: &Output, layers: &[Layer], renderer: &mut GlesRenderer) -> Vec<OrreryElement> {
+/// The layer surfaces of `output` on `layers` (front to back), front to back, as much of each as `kinds` says: its
+/// popups (in front) and its own surface with its subsurfaces.
+fn layer_elements(
+    output: &Output,
+    layers: &[Layer],
+    kinds: WindowSurfaceType,
+    renderer: &mut GlesRenderer,
+) -> Vec<OrreryElement> {
     let map = layer_map_for_output(output);
+    let scale = Scale::from(1.0);
     let mut out = Vec::new();
+    let mut tree = |surface: &WlSurface, at: Point<i32, Logical>| {
+        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(renderer, surface, at.to_physical(1), scale, 1.0, Kind::Unspecified);
+        out.extend(elements.into_iter().map(OrreryElement::Surface));
+    };
     for &layer in layers {
         for surface in map.layers_on(layer).rev() {
             let Some(at) = layer_origin(&map, surface) else {
                 continue;
             };
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                surface.render_elements(renderer, at.to_physical(1), Scale::from(1.0), 1.0);
-            out.extend(elements.into_iter().map(OrreryElement::Surface));
+            if kinds.contains(WindowSurfaceType::POPUP) {
+                for (popup, offset) in PopupManager::popups_for_surface(surface.wl_surface()) {
+                    tree(popup.wl_surface(), at + offset - popup.geometry().loc);
+                }
+            }
+            if kinds.contains(WindowSurfaceType::TOPLEVEL) {
+                tree(surface.wl_surface(), at);
+            }
         }
     }
     out
 }
 
 /// What the monitor named after `output` shows (scale 1, output-local coordinates), front to back: the pointer,
-/// the red bar, overlay and top layer surfaces, decorations, windows, bottom and background layer surfaces.
+/// the red bar, overlay and top layer surfaces, popups of bottom and background ones (menus of a bar there must
+/// show over the windows), decorations, windows, bottom and background layer surfaces.
 pub fn output_elements(
     output: &str,
     state: &Orrery,
@@ -507,7 +525,8 @@ pub fn output_elements(
     let mut elements = cursor_elements(output, state, renderer, decorations);
     elements.extend(solid_elements(&mut decorations.bar, scene.bar.as_slice()));
     if let Some(screen) = &screen {
-        elements.extend(layer_elements(screen, &ABOVE, renderer));
+        elements.extend(layer_elements(screen, &ABOVE, WindowSurfaceType::ALL, renderer));
+        elements.extend(layer_elements(screen, &BELOW, WindowSurfaceType::POPUP, renderer));
     }
     elements.extend(solid_elements(&mut decorations.buffers, &scene.solids));
 
@@ -528,7 +547,8 @@ pub fn output_elements(
         );
     }
     if let Some(screen) = &screen {
-        elements.extend(layer_elements(screen, &BELOW, renderer));
+        let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
+        elements.extend(layer_elements(screen, &BELOW, own, renderer));
     }
     elements
 }

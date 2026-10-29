@@ -3,16 +3,24 @@
 //! Smithay's `LayerMap` for its output, which places them as the protocol says; what their exclusive zones leave is
 //! the area the screen's layout divides (`Stacks::set_area`). A layer surface is in its map from its first commit
 //! (so the initial configure carries its size) until it unmaps (a null buffer) or goes; it is drawn, hit and given
-//! the keyboard only while mapped (it has a buffer).
+//! the keyboard only while mapped (it has a buffer). Its zone counts from that first commit: one that never draws
+//! keeps it (as other compositors do; the map must place it to size the configure). A buffer before the configure
+//! is acked, on the first commit or the first after an unmap, is a protocol error.
 //!
-//! The keyboard: an `exclusive` surface on the top or overlay layer takes it while mapped (the most recently mapped
-//! wins) and gives it back to the focused window when it goes; while it has it, binds do not run, except quit,
-//! reclaim and vt (`runs_over_exclusive`). An `on_demand` surface takes it on a click and loses it when a window
-//! (or slot) is focused; `exclusive` on the bottom or background layer does the same, as the protocol allows. `none`
-//! never takes it. Layer surfaces never enter the stacks.
+//! Zones are Smithay's arithmetic, which differs from the protocol's letter in corner cases: a positive zone on a
+//! surface anchored to a corner, or to the top and bottom edges only (left and right only), still takes room along
+//! one edge, and one anchored to all four edges takes the whole screen, which `usable_area` then ignores.
+//!
+//! Order is the map's, as drawn (later in front on each layer): popups of bottom and background surfaces are drawn
+//! and hit over the windows, under top and overlay surfaces. The keyboard: an `exclusive` surface on the top or
+//! overlay layer takes it while mapped (the frontmost one, on the focused screen first) and gives it back to the
+//! focused window when it goes; while it has it, binds do not run, except quit, reclaim and vt
+//! (`runs_over_exclusive`). An `on_demand` surface takes it on a click and loses it when a window (or slot) is
+//! focused; `exclusive` on the bottom or background layer does the same, as the protocol allows. `none` never takes
+//! it. Layer surfaces never enter the stacks.
 
 use smithay::backend::renderer::utils::with_renderer_surface_state;
-use smithay::desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output};
+use smithay::desktop::{LayerMap, LayerSurface, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -33,7 +41,7 @@ pub const ABOVE: [Layer; 2] = [Layer::Overlay, Layer::Top];
 /// The layers under the slots, front to back.
 pub const BELOW: [Layer; 2] = [Layer::Bottom, Layer::Background];
 
-/// A layer surface orrery knows.
+/// A layer surface orrery knows (its order is not the drawing order: that is its map's).
 #[derive(Debug)]
 pub struct Layered {
     pub surface: LayerSurface,
@@ -69,6 +77,7 @@ pub fn runs_over_exclusive(action: &Action) -> bool {
     matches!(action, Action::Quit | Action::Reclaim | Action::Vt(_))
 }
 
+/// A layer as `state` names it.
 #[must_use]
 pub fn layer_name(layer: Layer) -> LayerName {
     match layer {
@@ -79,9 +88,9 @@ pub fn layer_name(layer: Layer) -> LayerName {
     }
 }
 
-/// Where a mapped layer surface's own surface starts, output-local (its bounding box may reach further up-left, by
-/// its subsurfaces).
-pub fn layer_origin(map: &smithay::desktop::LayerMap, layer: &LayerSurface) -> Option<Point<i32, Logical>> {
+/// Where a layer surface's own surface starts in `map`, output-local (its bounding box may reach further up-left, by
+/// its subsurfaces); None when it is not in the map.
+pub fn layer_origin(map: &LayerMap, layer: &LayerSurface) -> Option<Point<i32, Logical>> {
     Some(map.layer_geometry(layer)?.loc - layer.bbox().loc)
 }
 
@@ -120,10 +129,10 @@ impl Orrery {
     }
 
     /// A layer surface's own surface committed. The first commit (or the first after an unmap) puts it in its
-    /// screen's map and is answered with a configure carrying its size; a buffer maps it (the most recent one last,
-    /// for the keyboard); a null buffer unmaps it: out of the map, and back to waiting for a first commit. Every
-    /// commit arranges the screen's layer surfaces again (size, anchors, margins, zone), and a changed usable area or
-    /// mapping arranges the windows.
+    /// screen's map (in front on its layer) and is answered with a configure carrying its size; a buffer maps it, but
+    /// one before that configure is acked is a protocol error; a null buffer unmaps it: out of the map, and back to
+    /// waiting for a first commit. Every commit arranges the screen's layer surfaces again (size, anchors, margins,
+    /// zone); a changed usable area or mapping arranges the windows, anything else at least the focus.
     pub fn layer_committed(&mut self, surface: &WlSurface) {
         let Some(i) = self.layers.iter().position(|l| l.surface.wl_surface() == surface) else {
             return;
@@ -133,17 +142,22 @@ impl Orrery {
         };
         let has_buffer = with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
         let layer = self.layers[i].surface.clone();
+        // Posts the error (the client is disconnected, and the surface forgotten when it goes).
+        if has_buffer && !layer.layer_surface().ensure_configured() {
+            return;
+        }
         let was_mapped = self.layers[i].mapped;
         {
             let mut map = layer_map_for_output(&output);
             if was_mapped && !has_buffer {
                 map.unmap_layer(&layer);
-                // The client starts over (a commit without a buffer, then the configure): answered as a first one.
+                // The client starts over (a commit without a buffer, then the configure to ack before drawing): its
+                // next commit is answered as a first one, and a buffer before that ack is refused.
                 with_states(surface, |states| {
                     if let Some(data) = states.data_map.get::<LayerSurfaceData>() {
-                        data.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .initial_configure_sent = false;
+                        let mut data = data.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        data.initial_configure_sent = false;
+                        data.configured = false;
                     }
                 });
             } else {
@@ -165,15 +179,13 @@ impl Orrery {
                 }
             }
         }
-        if has_buffer != was_mapped {
-            let mut record = self.layers.remove(i);
-            record.mapped = has_buffer;
-            self.layers.push(record);
-        }
+        self.layers[i].mapped = has_buffer;
         if self.layers_arranged(&output) || has_buffer != was_mapped {
             self.arrange();
         } else {
+            // It may have moved, grown or changed its keyboard interactivity.
             self.update_keyboard_focus();
+            self.update_pointer_focus();
         }
     }
 
@@ -264,16 +276,33 @@ impl Orrery {
         }
     }
 
-    /// The layer surface that should have the keyboard, and whether it holds it exclusively: the most recently mapped
-    /// `exclusive` one over the slots, else the one a click gave it while the stacks' focus has not moved since and
-    /// it still takes the keyboard (forgotten otherwise).
+    fn is_mapped(&self, layer: &LayerSurface) -> bool {
+        self.layers.iter().any(|l| l.mapped && l.surface == *layer)
+    }
+
+    /// The frontmost mapped `exclusive` layer surface over the slots, as drawn: the focused screen's first, then the
+    /// others in opening order.
+    fn exclusive_layer(&self) -> Option<WlSurface> {
+        let focused = (self.stacks.monitors().get(self.stacks.focused_monitor())).map(|m| m.name().to_owned());
+        let mut outputs: Vec<&Output> = self.outputs.iter().collect();
+        outputs.sort_by_key(|o| Some(o.name()) != focused);
+        outputs.into_iter().find_map(|o| {
+            let map = layer_map_for_output(o);
+            (ABOVE.iter())
+                .flat_map(|&layer| map.layers_on(layer).rev())
+                .find(|l| {
+                    l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive && self.is_mapped(l)
+                })
+                .map(|l| l.wl_surface().clone())
+        })
+    }
+
+    /// The layer surface that should have the keyboard, and whether it holds it exclusively: `exclusive_layer`, else
+    /// the one a click gave it while the stacks' focus has not moved since and it still takes the keyboard
+    /// (forgotten otherwise).
     pub(super) fn layer_keyboard(&mut self) -> Option<(WlSurface, bool)> {
-        let exclusive = (self.layers.iter().rev().filter(|l| l.mapped)).find(|l| {
-            let state = l.surface.cached_state();
-            state.keyboard_interactivity == KeyboardInteractivity::Exclusive && ABOVE.contains(&state.layer)
-        });
-        if let Some(l) = exclusive {
-            return Some((l.surface.wl_surface().clone(), true));
+        if let Some(surface) = self.exclusive_layer() {
+            return Some((surface, true));
         }
         let key = self.focus_key();
         let (surface, at) = self.layer_focus.as_ref()?;
@@ -287,10 +316,11 @@ impl Orrery {
     }
 
     /// The layer surface on one of `layers` (front to back) under `pos` (global), on the screen there, with the
-    /// surface hit (its own, a subsurface's or a popup's) and that surface's origin.
+    /// surface hit (of `kinds`: its own, a subsurface's, a popup's) and that surface's origin.
     pub(super) fn layer_under(
         &self,
         layers: &[Layer],
+        kinds: WindowSurfaceType,
         pos: Point<f64, Logical>,
     ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
         let (output, geo) = self.outputs.iter().find_map(|o| {
@@ -304,7 +334,7 @@ impl Orrery {
                 let Some(at) = layer_origin(&map, l) else {
                     continue;
                 };
-                if let Some((surface, loc)) = l.surface_under(local - at.to_f64(), WindowSurfaceType::ALL) {
+                if let Some((surface, loc)) = l.surface_under(local - at.to_f64(), kinds) {
                     return Some((l.clone(), surface, (loc + at + geo.loc).to_f64()));
                 }
             }
@@ -334,19 +364,16 @@ impl Orrery {
         let map = layer_map_for_output(&o);
         let mut views = Vec::new();
         for &layer in BELOW.iter().rev().chain(ABOVE.iter().rev()) {
-            let on: Vec<&Layered> = (self.layers.iter())
-                .filter(|l| l.mapped && l.output == output && l.surface.layer() == layer)
-                .collect();
-            for l in on {
-                let Some(mut rect) = map.layer_geometry(&l.surface) else {
+            for l in map.layers_on(layer).filter(|l| self.is_mapped(l)) {
+                let Some(mut rect) = map.layer_geometry(l) else {
                     continue;
                 };
                 rect.loc += geo.loc;
                 views.push(LayerView {
-                    namespace: l.surface.namespace().to_owned(),
+                    namespace: l.namespace().to_owned(),
                     layer: layer_name(layer),
                     rect: rect_of(rect),
-                    keyboard: keyboard.as_ref() == Some(l.surface.wl_surface()),
+                    keyboard: keyboard.as_ref() == Some(l.wl_surface()),
                 });
             }
         }
@@ -392,6 +419,205 @@ mod tests {
             let mut zone = Rectangle::from_size((0, 0).into());
             (zone.size.w, zone.size.h) = (w, h);
             assert_eq!(usable_area(SCREEN, zone), SCREEN, "{w}x{h}");
+        }
+    }
+
+    /// An orrery in this process, with no socket, backend or loop running: its display is pumped by hand against a
+    /// client on a socket pair.
+    mod in_process {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+
+        use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+        use smithay::reexports::calloop::EventLoop;
+        use smithay::reexports::wayland_server::Display;
+        use smithay::utils::Transform;
+        use wayland_client::protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface};
+        use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+        use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+
+        use super::super::Orrery;
+        use crate::comp::ClientState;
+        use crate::layout::Rect;
+
+        /// A bar client: what it bound, and the latest configure (serial, width, height).
+        #[derive(Default)]
+        struct Bar {
+            compositor: Option<wl_compositor::WlCompositor>,
+            shm: Option<wl_shm::WlShm>,
+            shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+            configure: Option<(u32, u32, u32)>,
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for Bar {
+            fn event(
+                bar: &mut Self,
+                registry: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global { name, interface, .. } = event {
+                    match interface.as_str() {
+                        "wl_compositor" => bar.compositor = Some(registry.bind(name, 4, qh, ())),
+                        "wl_shm" => bar.shm = Some(registry.bind(name, 1, qh, ())),
+                        "zwlr_layer_shell_v1" => bar.shell = Some(registry.bind(name, 4, qh, ())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Bar {
+            fn event(
+                bar: &mut Self,
+                _: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+                event: zwlr_layer_surface_v1::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
+                    bar.configure = Some((serial, width, height));
+                }
+            }
+        }
+
+        delegate_noop!(Bar: ignore wl_compositor::WlCompositor);
+        delegate_noop!(Bar: ignore wl_shm::WlShm);
+        delegate_noop!(Bar: ignore wl_shm_pool::WlShmPool);
+        delegate_noop!(Bar: ignore wl_buffer::WlBuffer);
+        delegate_noop!(Bar: ignore wl_surface::WlSurface);
+        delegate_noop!(Bar: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+
+        /// Requests to orrery and events back, a few times over (the socket pair never blocks).
+        fn pump(
+            display: &mut Display<Orrery>,
+            state: &mut Orrery,
+            conn: &Connection,
+            queue: &mut EventQueue<Bar>,
+            bar: &mut Bar,
+        ) {
+            for _ in 0..4 {
+                conn.flush().expect("client flush");
+                display.dispatch_clients(state).expect("dispatch");
+                display.flush_clients().expect("server flush");
+                if let Some(guard) = conn.prepare_read() {
+                    // Nothing to read is fine.
+                    let _ = guard.read();
+                }
+                queue.dispatch_pending(bar).expect("client dispatch");
+            }
+        }
+
+        fn mode(w: i32, h: i32) -> Mode {
+            Mode {
+                size: (w, h).into(),
+                refresh: 60_000,
+            }
+        }
+
+        #[test]
+        fn a_resized_screen_with_a_bar_divides_what_the_bar_leaves_of_its_new_size() {
+            let event_loop: EventLoop<'static, Orrery> = EventLoop::try_new().expect("loop");
+            let mut display: Display<Orrery> = Display::new().expect("display");
+            let mut state = Orrery::new(&event_loop, display.handle(), None).expect("state");
+            let output = Output::new(
+                "screen".into(),
+                PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: Subpixel::Unknown,
+                    make: "test".into(),
+                    model: "test".into(),
+                },
+            );
+            output.change_current_state(
+                Some(mode(1280, 720)),
+                Some(Transform::Normal),
+                None,
+                Some((0, 0).into()),
+            );
+            state.add_output(
+                output.clone(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1280,
+                    h: 720,
+                },
+            );
+
+            let (server, client) = UnixStream::pair().expect("socket pair");
+            state
+                .display_handle
+                .insert_client(server, Arc::new(ClientState::default()))
+                .expect("client");
+            let conn = Connection::from_socket(client).expect("connection");
+            let mut queue = conn.new_event_queue();
+            let qh = queue.handle();
+            let mut bar = Bar::default();
+            conn.display().get_registry(&qh, ());
+            pump(&mut display, &mut state, &conn, &mut queue, &mut bar);
+
+            let surface = bar.compositor.as_ref().expect("wl_compositor").create_surface(&qh, ());
+            let shell = bar.shell.as_ref().expect("zwlr_layer_shell_v1");
+            let layer = shell.get_layer_surface(&surface, None, zwlr_layer_shell_v1::Layer::Top, "bar".into(), &qh, ());
+            use zwlr_layer_surface_v1::Anchor;
+            layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+            layer.set_size(0, 30);
+            layer.set_exclusive_zone(30);
+            surface.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut bar);
+            let (serial, width, height) = bar.configure.expect("the initial configure");
+            assert_eq!((width, height), (1280, 30));
+            layer.ack_configure(serial);
+            let file = tempfile::tempfile().expect("shm file");
+            file.set_len(1280 * 30 * 4).expect("size the shm file");
+            let pool = bar
+                .shm
+                .as_ref()
+                .expect("wl_shm")
+                .create_pool(file.as_fd(), 1280 * 30 * 4, &qh, ());
+            let buffer = pool.create_buffer(0, 1280, 30, 1280 * 4, wl_shm::Format::Argb8888, &qh, ());
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut bar);
+            let area = |state: &Orrery| state.stacks.monitors()[0].area();
+            assert_eq!(
+                area(&state),
+                Rect {
+                    x: 0,
+                    y: 30,
+                    w: 1280,
+                    h: 690
+                }
+            );
+
+            // The screen grows (as a nested window resized, or a new mode): the bar is told its new width, and the
+            // layout divides what it leaves of the new size.
+            output.change_current_state(Some(mode(1920, 1080)), None, None, None);
+            state.resize_output(
+                "screen",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1920,
+                    h: 1080,
+                },
+            );
+            assert_eq!(
+                area(&state),
+                Rect {
+                    x: 0,
+                    y: 30,
+                    w: 1920,
+                    h: 1050
+                }
+            );
+            pump(&mut display, &mut state, &conn, &mut queue, &mut bar);
+            assert_eq!(bar.configure.map(|(_, w, h)| (w, h)), Some((1920, 30)));
         }
     }
 

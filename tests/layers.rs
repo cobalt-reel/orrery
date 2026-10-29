@@ -15,6 +15,10 @@ const INJECT: &[&str] = &["--debug-inject"];
 /// xkb keycodes (evdev's plus 8: a client sees evdev's).
 const SUPER: u32 = 133;
 const CTRL: u32 = 37;
+const SHIFT: u32 = 50;
+const ESCAPE: u32 = 9;
+const E: u32 = 26;
+const F2: u32 = 68;
 const A: u32 = 38;
 const ONE: u32 = 10;
 const TWO: u32 = 11;
@@ -127,11 +131,10 @@ fn a_bar_moves_the_slots_down_by_its_zone_and_unmapping_gives_the_room_back() {
         Some(i64::from(SIZE.1)),
         "{after:?}"
     );
+    let bar_rect = json!({"x": 0, "y": 0, "w": SIZE.0, "h": 30});
     assert_eq!(
         layers(&state, 0),
-        [
-            json!({"namespace": "bar", "layer": "top", "rect": {"x": 0, "y": 0, "w": SIZE.0, "h": 30}, "keyboard": false})
-        ]
+        [json!({"namespace": "bar", "layer": "top", "rect": bar_rect, "keyboard": false})]
     );
     // The window is configured to its slot's new size.
     let (_, _, w, h) = after[0];
@@ -332,7 +335,7 @@ fn a_popup_on_a_layer_surface_is_configured_and_takes_the_pointer() {
     let (orrery, mut client) = start();
     let bar = client.create_layer(&LayerSpec::bar(30));
     drawn(&mut client, bar);
-    let p = client.create_layer_popup(bar);
+    let p = client.create_layer_popup(bar, (0, 0));
     assert!(client.wait_for(|s| s.popups[p].configures > 0));
     point(&orrery, 5, 5);
     assert!(
@@ -387,6 +390,115 @@ fn layer_surfaces_go_to_their_screen_and_a_removed_screen_closes_them() {
     assert!(client.wait_for(|s| s.layers[second].closed && s.layers[focused].closed));
     assert!(!client.layer(first).closed);
     assert_eq!(slot_rects(&orrery.state(), 0).iter().map(|r| r.1).min(), Some(20));
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn only_quit_reclaim_and_vt_run_while_an_exclusive_surface_has_the_keyboard() {
+    let (orrery, mut client) = start();
+    full_window(&mut client, "a");
+    let mut spec = LayerSpec::centred("prompt", Layer::Overlay, (200, 100));
+    spec.keyboard = KeyboardInteractivity::Exclusive;
+    let o = client.create_layer(&spec);
+    drawn(&mut client, o);
+    assert!(client.wait_for(|s| s.keyboard_layer == Some(o)));
+
+    let bind = |o: &Compositor| o.state()["last_key"]["bind"].clone();
+    chord(&orrery, &[SUPER, CTRL, TWO]);
+    assert_eq!(bind(&orrery), Value::Null, "a layout bind is the surface's key");
+    chord(&orrery, &[SUPER, ESCAPE]);
+    assert_eq!(bind(&orrery), "Reclaim");
+    chord(&orrery, &[SUPER, CTRL, F2]);
+    assert_eq!(bind(&orrery), "Vt(2)");
+    assert!(
+        orrery.log().contains("vt 2: this backend has no consoles"),
+        "{}",
+        orrery.log()
+    );
+    assert_eq!(layout(&orrery.state()), "wall");
+    // Quit stops it on the press: nothing answers the releases.
+    for k in [SUPER, SHIFT, E] {
+        inject(&orrery, &["key", &k.to_string(), "down"]);
+    }
+    let (status, _) = orrery.wait_exit();
+    assert!(status.success());
+}
+
+#[test]
+fn an_exclusive_overlay_unmapping_under_the_pointer_hands_pointer_and_keyboard_back() {
+    let (orrery, mut client) = start();
+    let a = full_window(&mut client, "a");
+    let spec = LayerSpec {
+        anchor: Anchor::Top | Anchor::Left,
+        keyboard: KeyboardInteractivity::Exclusive,
+        ..LayerSpec::centred("prompt", Layer::Overlay, (50, 50))
+    };
+    let o = client.create_layer(&spec);
+    drawn(&mut client, o);
+    point(&orrery, 10, 10);
+    assert!(client.wait_for(|s| s.pointer_layer == Some(o) && s.keyboard_layer == Some(o)));
+    client.unmap_layer(o);
+    assert!(client.wait_for(|s| s.pointer_focus == Some(a) && s.keyboard_focus == Some(a)));
+    assert_eq!((client.state.pointer_layer, client.state.keyboard_layer), (None, None));
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_bottom_bars_popup_is_over_the_windows_and_a_click_on_it_focuses_no_slot() {
+    let (orrery, mut client) = start();
+    let bar = client.create_layer(&LayerSpec {
+        layer: Layer::Bottom,
+        ..LayerSpec::bar(30)
+    });
+    drawn(&mut client, bar);
+    let a = full_window(&mut client, "a");
+    let first = slot_rects(&orrery.state(), 0)[0];
+    assert_eq!(first.1, 30, "a's slot starts under the bar");
+
+    // A menu reaching down from the bar over a's slot: hit before the window, as it is drawn over it.
+    let p = client.create_layer_popup(bar, (20, 40));
+    assert!(client.wait_for(|s| s.popups[p].configures > 0));
+    point(&orrery, 25, 45);
+    assert!(
+        client.wait_for(|s| s.pointer_popup == Some(p)),
+        "{:?}",
+        client.state.pointer_focus
+    );
+    point(&orrery, 100, 100);
+    assert!(client.wait_for(|s| s.pointer_focus == Some(a)));
+
+    // A click on the menu focuses neither a's slot nor anything else.
+    orrery.msg_ok(&["focus-slot", "right"]);
+    point(&orrery, 25, 45);
+    click(&orrery);
+    assert!(client.wait_for(|s| s.buttons.len() == 2 && s.pointer_popup == Some(p)));
+    assert_eq!(support::focused_slot(&orrery.state()), Some(3), "still the hero slot");
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_layer_surface_drawing_before_its_configure_is_a_protocol_error() {
+    let (orrery, mut client) = start();
+    client.create_layer_attaching_early(&LayerSpec::bar(30));
+    assert!(
+        client.try_roundtrip().is_err(),
+        "the client should have been disconnected"
+    );
+
+    // Unmapped, it must wait for a configure again before drawing.
+    let mut again = Client::new(orrery.connect());
+    let bar = again.create_layer(&LayerSpec::bar(30));
+    drawn(&mut again, bar);
+    again.unmap_layer(bar);
+    let refused = again.attach_layer_buffer_unasked(bar).is_err() || again.try_roundtrip().is_err();
+    assert!(refused, "a buffer with no configure acked since the unmap");
+    let state = orrery.state();
+    assert!(layers(&state, 0).is_empty());
+    assert_eq!(slot_rects(&state, 0).iter().map(|r| r.1).min(), Some(0));
+    drop(again);
     drop(client);
     assert!(orrery.stop().success());
 }

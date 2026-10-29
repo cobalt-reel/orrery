@@ -1,7 +1,8 @@
 //! Input from a backend that has some (winit): a key press matching a bind runs its action (neither the press
 //! nor its release reaches a client), other keys go to the focused window (or the layer surface holding the
-//! keyboard), the pointer to the surface under it (overlay, top, the slots' windows, bottom, background), and a
-//! click focuses the slot under it, unless it lands on a layer surface over the slots.
+//! keyboard), the pointer to the surface under it (overlay, top, popups of bottom and background, the slots'
+//! windows, bottom, background), and a click focuses the slot under it, unless it lands on something drawn over the
+//! slots.
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
@@ -227,11 +228,13 @@ pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
     Some((top, rect))
 }
 
-/// What the pointer is over: a surface, its origin (global), and the layer surface it belongs to, if any.
+/// What the pointer is over: a surface, its origin (global), the layer surface it belongs to, if any, and whether
+/// it is drawn over the slots.
 pub struct Under {
     pub surface: WlSurface,
     pub origin: Point<f64, Logical>,
     pub layer: Option<LayerSurface>,
+    pub over_slots: bool,
 }
 
 impl Orrery {
@@ -240,23 +243,29 @@ impl Orrery {
         self.under(pos).map(|u| (u.surface, u.origin))
     }
 
-    /// What is under `pos`, as drawn, front to back: overlay and top layer surfaces, the slots' windows
-    /// (`window_under`), bottom and background layer surfaces.
+    /// What is under `pos`, as drawn, front to back: overlay and top layer surfaces, popups of bottom and
+    /// background ones, the slots' windows (`window_under`), bottom and background layer surfaces themselves.
     pub fn under(&self, pos: Point<f64, Logical>) -> Option<Under> {
-        let layer = |(layer, surface, origin)| Under {
-            surface,
-            origin,
-            layer: Some(layer),
+        let layer = |over_slots| {
+            move |(layer, surface, origin)| Under {
+                surface,
+                origin,
+                layer: Some(layer),
+                over_slots,
+            }
         };
-        (self.layer_under(&ABOVE, pos).map(layer))
+        let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
+        (self.layer_under(&ABOVE, WindowSurfaceType::ALL, pos).map(layer(true)))
+            .or_else(|| (self.layer_under(&BELOW, WindowSurfaceType::POPUP, pos)).map(layer(true)))
             .or_else(|| {
                 (self.window_under(pos)).map(|(surface, origin)| Under {
                     surface,
                     origin,
                     layer: None,
+                    over_slots: false,
                 })
             })
-            .or_else(|| self.layer_under(&BELOW, pos).map(layer))
+            .or_else(|| self.layer_under(&BELOW, own, pos).map(layer(false)))
     }
 
     /// The window surface under `pos`: only the top window of the slot holding `pos`, and only its parts inside
@@ -444,8 +453,9 @@ impl Orrery {
         let serial = SERIAL_COUNTER.next_serial();
         if state == ButtonState::Pressed && !pointer.is_grabbed() {
             let at = pointer.current_location();
-            let layer = self.under(at).and_then(|u| u.layer);
-            let over_slots = layer.as_ref().is_some_and(|l| ABOVE.contains(&l.layer()));
+            let under = self.under(at);
+            let over_slots = under.as_ref().is_some_and(|u| u.over_slots);
+            let layer = under.and_then(|u| u.layer);
             let slot = (!over_slots)
                 .then(|| slot_at(&self.stacks, at.x as i32, at.y as i32))
                 .flatten();

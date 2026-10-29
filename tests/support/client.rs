@@ -389,6 +389,15 @@ impl Client {
     /// A layer surface as `spec` says, given a buffer of its configured size on each configure; returns its index
     /// in `layers`.
     pub fn create_layer(&mut self, spec: &LayerSpec) -> usize {
+        self.create_layer_with(spec, false)
+    }
+
+    /// Misbehaving: attaches a buffer in the initial commit, before any configure (a protocol error).
+    pub fn create_layer_attaching_early(&mut self, spec: &LayerSpec) -> usize {
+        self.create_layer_with(spec, true)
+    }
+
+    fn create_layer_with(&mut self, spec: &LayerSpec, early: bool) -> usize {
         let qh = self.queue.handle();
         let i = self.state.layers.len();
         let id = LayerId(i);
@@ -401,16 +410,38 @@ impl Client {
         layer_surface.set_anchor(spec.anchor);
         layer_surface.set_exclusive_zone(spec.exclusive_zone);
         layer_surface.set_keyboard_interactivity(spec.keyboard);
+        let mut buffer = None;
+        if early {
+            let b = Client::buffer(&self.state, &qh, 10, 10);
+            surface.attach(Some(&b), 0, 0);
+            buffer = Some(b);
+        }
         // The initial commit, with no buffer: the compositor answers with the first configure.
         surface.commit();
         self.state.layers.push(LayerSurf {
             surface: Some(surface),
             layer_surface: Some(layer_surface),
             auto_buffer: true,
+            attached: early.then_some((10, 10)),
+            buffer,
             ..LayerSurf::default()
         });
-        self.roundtrip();
+        // Errors are allowed here: a misbehaving client gets disconnected.
+        let _ = self.try_roundtrip();
         i
+    }
+
+    /// Misbehaving after `unmap_layer`: attaches a buffer and commits without the commit-configure-ack sequence
+    /// (a protocol error).
+    pub fn attach_layer_buffer_unasked(&mut self, i: usize) -> Result<(), String> {
+        let qh = self.queue.handle();
+        let b = Client::buffer(&self.state, &qh, 10, 10);
+        let l = &mut self.state.layers[i];
+        let surface = l.surface.as_ref().expect("live layer surface");
+        surface.attach(Some(&b), 0, 0);
+        surface.commit();
+        l.buffer = Some(b);
+        self.try_roundtrip()
     }
 
     /// Unmaps layer surface `i` by committing a null buffer; it stays unmapped until `remap_layer`.
@@ -457,9 +488,9 @@ impl Client {
         self.roundtrip();
     }
 
-    /// A 10×10 popup on layer surface `parent` (zwlr_layer_surface_v1.get_popup), its top-left at the parent's;
-    /// returns its index in `popups`.
-    pub fn create_layer_popup(&mut self, parent: usize) -> usize {
+    /// A 10×10 popup on layer surface `parent` (zwlr_layer_surface_v1.get_popup), its top-left at `at` in the
+    /// parent; returns its index in `popups`.
+    pub fn create_layer_popup(&mut self, parent: usize, at: (i32, i32)) -> usize {
         let qh = self.queue.handle();
         let i = self.state.popups.len();
         let id = PopupId(i);
@@ -469,7 +500,7 @@ impl Client {
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, id);
         let positioner = wm_base.create_positioner(&qh, ());
         positioner.set_size(10, 10);
-        positioner.set_anchor_rect(0, 0, 1, 1);
+        positioner.set_anchor_rect(at.0, at.1, 1, 1);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
         let popup = xdg_surface.get_popup(None, &positioner, &qh, id);
