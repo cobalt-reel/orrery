@@ -15,6 +15,16 @@ pub fn connector_changes<C: Copy + Eq>(open: &[C], connected: &[C]) -> (Vec<C>, 
     (gone, new)
 }
 
+/// The connectors that should be screens, given those connected and those closed for good (`Recovery::Close`):
+/// the connected ones not closed, and the closed ones still connected (one unplugged leaves the list, so plugging it
+/// in again opens it).
+#[must_use]
+pub fn screens_wanted<C: Copy + Eq>(connected: &[C], dark: &[C]) -> (Vec<C>, Vec<C>) {
+    let wanted = connected.iter().filter(|c| !dark.contains(c)).copied().collect();
+    let dark = dark.iter().filter(|c| connected.contains(c)).copied().collect();
+    (wanted, dark)
+}
+
 /// A CRTC for each connector wanting one, in order, from the CRTCs it can use (best first: the one already driving it
 /// leads), none in `taken` and none given twice; None for a connector left without.
 #[must_use]
@@ -54,6 +64,36 @@ pub const FLIP_TIMEOUT: Duration = Duration::from_secs(1);
 #[must_use]
 pub fn flip_waits(queued: Option<Instant>, now: Instant) -> bool {
     queued.is_some_and(|t| now.saturating_duration_since(t) < FLIP_TIMEOUT)
+}
+
+/// Whether a page-flip event stamped `event` (CLOCK_MONOTONIC; None or zero: no usable stamp) belongs to the frame
+/// queued at `queued` on that clock: not when it happened before (a late event of a frame given up on, `flip_waits`).
+#[must_use]
+pub fn flip_event_matches(queued: Duration, event: Option<Duration>) -> bool {
+    event.filter(|t| !t.is_zero()).is_none_or(|t| t >= queued)
+}
+
+/// What to do when the kernel refused a screen's new state (an atomic test failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Reset every output once (another session left the CRTCs wired otherwise).
+    ResetAll,
+    /// The screen failed again after a reset made for it: close it, as if unplugged.
+    Close,
+    /// A reset was just made (for another screen) and nothing has drawn since: try it once more as it is.
+    Wait,
+}
+
+/// The recovery for a screen whose frame the kernel refused: `had_reset`, a reset was already made for this screen
+/// (and it has drawn nothing since); `reset_spent`, a reset was made since the last frame of any screen (or the last
+/// resume or hotplug). At most one reset per round, and never one for a screen that already had its own.
+#[must_use]
+pub fn recovery(had_reset: bool, reset_spent: bool) -> Recovery {
+    match (had_reset, reset_spent) {
+        (true, _) => Recovery::Close,
+        (false, false) => Recovery::ResetAll,
+        (false, true) => Recovery::Wait,
+    }
 }
 
 /// The screen (by index into `screens`, global rectangles) holding the point.
@@ -149,6 +189,51 @@ mod tests {
         assert!(!flip_waits(None, t), "no flip pending");
         assert!(flip_waits(Some(t), t + Duration::from_millis(999)));
         assert!(!flip_waits(Some(t), t + FLIP_TIMEOUT), "the event is taken as lost");
+    }
+
+    #[test]
+    fn a_connector_closed_for_good_stays_dark_until_unplugged() {
+        assert_eq!(screens_wanted::<u32>(&[1, 2], &[]), (vec![1, 2], vec![]));
+        assert_eq!(
+            screens_wanted(&[1, 2], &[2]),
+            (vec![1], vec![2]),
+            "still plugged: still dark"
+        );
+        assert_eq!(screens_wanted(&[1], &[2]), (vec![1], vec![]), "unplugged: forgotten");
+        assert_eq!(
+            screens_wanted(&[1, 2], &[]),
+            (vec![1, 2], vec![]),
+            "plugged in again: opens"
+        );
+    }
+
+    #[test]
+    fn a_late_flip_event_is_not_taken_for_the_next_frame() {
+        let queued = Duration::from_millis(5000);
+        assert!(flip_event_matches(queued, Some(Duration::from_millis(5016))));
+        assert!(flip_event_matches(queued, Some(queued)));
+        assert!(
+            !flip_event_matches(queued, Some(Duration::from_millis(4000))),
+            "a frame given up on"
+        );
+        assert!(flip_event_matches(queued, None), "no stamp: taken as it comes");
+        assert!(flip_event_matches(queued, Some(Duration::ZERO)), "a zero stamp is none");
+    }
+
+    #[test]
+    fn a_refused_screen_gets_one_reset_then_goes_dark() {
+        assert_eq!(recovery(false, false), Recovery::ResetAll, "the first failure");
+        assert_eq!(recovery(true, true), Recovery::Close, "failed again after its reset");
+        assert_eq!(
+            recovery(true, false),
+            Recovery::Close,
+            "others drew since: still its second failure"
+        );
+        assert_eq!(
+            recovery(false, true),
+            Recovery::Wait,
+            "another screen's reset was just made"
+        );
     }
 
     const TWO: [Rect; 2] = [rect(0, 0, 1920, 1080), rect(1920, 0, 1280, 1024)];

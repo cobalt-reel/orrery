@@ -122,8 +122,12 @@ such as kitty or foot) or with `orrery msg spawn`.
 - `Super+Shift+E` quits, giving the console back; so does a crash (the seat restores it).
 - No seat, no GPU or no connected monitor: orrery says which and exits non-zero.
 - Limits: one GPU (the boot one); no Xwayland; no hardware cursor (the pointer is drawn into each frame); no
-  linux-dmabuf yet, so clients render in software (shared memory); scale 1, each monitor at its preferred mode; no
-  layer-shell (bars, launchers), lock or idle.
+  linux-dmabuf yet, so OpenGL clients render in software (shared memory) and Vulkan clients fail to start; scale 1,
+  each monitor at its preferred mode; no layer-shell (bars, launchers), lock or idle; touchpads keep libinput's
+  defaults (no tap-to-click, no natural scrolling); keyboard LEDs (Caps Lock, Num Lock) do not light; touch and
+  tablet tools are ignored, and absolute pointers (a virtual machine's, say) map onto the screen the pointer is on.
+- A monitor the kernel keeps refusing (after one reset of every output) is closed as if unplugged and stays dark
+  until it is plugged in again.
 
 ## Default keys
 
