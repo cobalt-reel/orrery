@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use orrery_wm::comp::{self, Backend, RunOptions, ipc_server, net};
+use orrery_wm::comp::{self, BackendChoice, RunOptions, ipc_server, net};
 use orrery_wm::ipc::{Request, Response};
 use orrery_wm::link::Secret;
 use orrery_wm::session::Role;
@@ -58,9 +58,9 @@ enum MsgSpawn {
 
 #[derive(Args)]
 struct RunArgs {
-    /// `winit` runs as a window inside the current session; `headless` has no screen (tests).
-    #[arg(long, value_enum, default_value = "winit")]
-    backend: Backend,
+    /// What orrery runs on.
+    #[arg(long, value_enum, default_value = "auto")]
+    backend: BackendChoice,
     #[arg(long, help = format!("Default: `{}`; the built-in config when it does not exist", config_default()))]
     config: Option<PathBuf>,
     /// The headless output's size.
@@ -259,7 +259,11 @@ mod tests {
         let Some(Command::Run(args)) = Cli::parse_from([NAME, "run"]).command else {
             panic!("run parses");
         };
-        assert_eq!(args.backend, Backend::Winit);
+        assert_eq!(args.backend, BackendChoice::Auto);
+        let Some(Command::Run(args)) = Cli::parse_from([NAME, "run", "--backend", "drm"]).command else {
+            panic!("run parses");
+        };
+        assert_eq!(args.backend, BackendChoice::Drm);
         assert_eq!(args.size, (1920, 1080));
         assert!(args.config.is_none() && args.socket.is_none());
     }

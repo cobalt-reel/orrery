@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use kdl::{KdlDocument, KdlEntry, KdlNode};
-use smithay::input::keyboard::{Keysym, xkb};
+use smithay::input::keyboard::{Keysym, XkbConfig, xkb};
 
 use crate::layout::{Dir, Layout, LayoutError, MAX_WEIGHT, SlotSpec};
 use crate::session::Role;
@@ -68,7 +68,12 @@ pub enum Action {
     /// Keyboard and pointer back to this machine from another in the session (the escape key): matched before
     /// input is forwarded, so it works wherever input is.
     Reclaim,
+    /// To console 1..=CONSOLES (bare metal; where the backend has none, logged and nothing else).
+    Vt(u8),
 }
+
+/// The highest console a `vt` bind can name.
+pub const CONSOLES: u8 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
@@ -96,6 +101,85 @@ pub struct Config {
     pub link: Option<LinkConfig>,
     /// `name`: this machine's name in a session; None: its hostname.
     pub name: Option<String>,
+    pub keyboard: Keyboard,
+}
+
+/// The `keyboard` block: the xkb names, each None for `XKB_DEFAULT_*` (xkbcommon reads them, else uses its own
+/// default), and key repeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyboard {
+    pub layout: Option<String>,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+    pub model: Option<String>,
+    /// Milliseconds a key is held before it repeats.
+    pub repeat_delay: u32,
+    /// Repeats a second; 0: keys do not repeat.
+    pub repeat_rate: u32,
+}
+
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self {
+            layout: None,
+            variant: None,
+            options: None,
+            model: None,
+            repeat_delay: 200,
+            repeat_rate: 25,
+        }
+    }
+}
+
+impl Keyboard {
+    /// The names as Smithay takes them: an empty name is xkbcommon's default (`XKB_DEFAULT_*` first), and so are
+    /// None options; `Some("")` is no options.
+    #[must_use]
+    pub fn xkb(&self) -> XkbConfig<'_> {
+        fn name(n: &Option<String>) -> &str {
+            n.as_deref().unwrap_or("")
+        }
+        XkbConfig {
+            rules: "",
+            model: name(&self.model),
+            layout: name(&self.layout),
+            variant: name(&self.variant),
+            options: self.options.clone(),
+        }
+    }
+
+    /// The keymap these names make, as xkb text; None when xkb cannot build it. The names must hold no NUL (the
+    /// parser refuses control characters): xkbcommon's binding panics on one.
+    #[must_use]
+    pub fn keymap_text(&self) -> Option<String> {
+        let xkb = self.xkb();
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            xkb.rules,
+            xkb.model,
+            xkb.layout,
+            xkb.variant,
+            xkb.options,
+            flags,
+        )?;
+        Some(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
+    }
+
+    /// Key repeat as Wayland sends it: (rate, delay).
+    #[must_use]
+    pub fn repeat_info(&self) -> (i32, i32) {
+        let wire = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
+        (wire(self.repeat_rate), wire(self.repeat_delay))
+    }
+
+    /// The same keymap: the same names (the repeat aside).
+    #[must_use]
+    pub fn same_keymap(&self, other: &Keyboard) -> bool {
+        (&self.layout, &self.variant, &self.options, &self.model)
+            == (&other.layout, &other.variant, &other.options, &other.model)
+    }
 }
 
 /// A machine name (`name`, a satellite's Hello) is at most this many bytes.
@@ -341,6 +425,7 @@ impl<'a> Parser<'a> {
         let mut seen_link: Option<&str> = None;
         let mut name: Option<String> = None;
         let mut seen_name = false;
+        let mut keyboard: Option<Keyboard> = None;
 
         for node in doc.nodes() {
             match node.name().value() {
@@ -421,6 +506,12 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                "keyboard" => {
+                    if keyboard.is_some() {
+                        self.err(node, "`keyboard` is set twice");
+                    }
+                    keyboard = Some(self.keyboard(node));
+                }
                 "binds" => {
                     if seen_binds {
                         self.err(node, "`binds` is set twice");
@@ -467,7 +558,71 @@ impl<'a> Parser<'a> {
             binds,
             link,
             name,
+            keyboard: keyboard.unwrap_or_default(),
         })
+    }
+
+    /// A `keyboard` block. A keymap xkb cannot build is refused here, so neither `check` nor a reload lets one
+    /// through.
+    fn keyboard(&mut self, node: &KdlNode) -> Keyboard {
+        self.no_args(node, "keyboard");
+        let mut keyboard = Keyboard::default();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut names_ok = true;
+        for child in children(node) {
+            let key = child.name().value();
+            if seen.contains(&key) {
+                self.err(child, format!("`{key}` is set twice"));
+            }
+            seen.push(key);
+            self.no_children(child);
+            match key {
+                "layout" | "variant" | "options" | "model" => {
+                    let msg = format!("`{key}` takes one string of xkb names");
+                    let Some((text, at)) = self.only_string(child, &msg) else {
+                        names_ok = false;
+                        continue;
+                    };
+                    if text.chars().any(char::is_control) {
+                        self.err_at(at, format!("`{key}` must not hold control characters"));
+                        names_ok = false;
+                        continue;
+                    }
+                    // An empty variant or options is "none"; an empty layout or model would only be the default.
+                    if text.is_empty() && matches!(key, "layout" | "model") {
+                        self.err_at(at, format!("`{key}` is empty: leave it out for the default"));
+                        names_ok = false;
+                        continue;
+                    }
+                    *match key {
+                        "layout" => &mut keyboard.layout,
+                        "variant" => &mut keyboard.variant,
+                        "options" => &mut keyboard.options,
+                        _ => &mut keyboard.model,
+                    } = Some(text);
+                }
+                "repeat-delay" => {
+                    let msg = "`repeat-delay` takes milliseconds, a whole number from 1 to 10000";
+                    if let Some(n) = self.only_number(child, 1..=10_000, msg) {
+                        keyboard.repeat_delay = n;
+                    }
+                }
+                "repeat-rate" => {
+                    let msg = "`repeat-rate` takes repeats a second, a whole number from 0 to 1000 (0: none)";
+                    if let Some(n) = self.only_number(child, 0..=1000, msg) {
+                        keyboard.repeat_rate = n;
+                    }
+                }
+                other => self.err(child, format!("unknown keyboard setting `{other}`")),
+            }
+        }
+        if names_ok && keyboard.keymap_text().is_none() {
+            self.err(
+                node,
+                "xkb cannot build a keymap from these names (an unknown layout, variant or model?)",
+            );
+        }
+        keyboard
     }
 
     /// A `listen` or `primary` node.
@@ -558,7 +713,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Expand `Mod`, check layout targets and refuse duplicates (same mods and keysym).
+    /// Expand `Mod`, check layout targets and refuse duplicates (same mods and keysym) that disagree.
     fn resolve_binds(&mut self, raw_binds: Vec<RawBind>, modifier: Mods, layout_names: &[String]) -> Vec<Bind> {
         let mut binds: Vec<Bind> = Vec::new();
         for raw in raw_binds {
@@ -572,7 +727,11 @@ impl<'a> Parser<'a> {
             } else {
                 raw.mods
             };
-            if binds.iter().any(|b| b.mods == mods && b.keysym == raw.keysym) {
+            if let Some(b) = binds.iter().find(|b| b.mods == mods && b.keysym == raw.keysym) {
+                // The same action twice is one bind: with `mod "Alt"`, `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are.
+                if b.action == raw.action {
+                    continue;
+                }
                 let written = raw.node.name().value();
                 self.err(raw.node, format!("{written:?} is bound twice"));
                 continue;
@@ -841,8 +1000,19 @@ impl<'a> Parser<'a> {
         };
         // The first argument's position, for errors about its value.
         let arg_at = rest.first().map_or(verb_at, |e| e.span().offset());
+        if verb == "vt" {
+            let n = match rest {
+                [e] => (e.value().as_integer()).and_then(|n| u8::try_from(n).ok()),
+                _ => None,
+            };
+            let Some(n) = n.filter(|n| (1..=CONSOLES).contains(n)) else {
+                self.err_at(arg_at, format!("`vt` takes a console number from 1 to {CONSOLES}"));
+                return None;
+            };
+            return Some(Action::Vt(n));
+        }
         if let "workspace" | "move-to-workspace" = verb {
-            // A number, not a string: the one action that takes one.
+            // A number, not a string, as `vt`'s.
             let n = match rest {
                 [e] => e.value().as_integer().and_then(workspace_number),
                 _ => None,
@@ -961,6 +1131,20 @@ impl<'a> Parser<'a> {
                 None
             }
         }
+    }
+
+    /// Exactly one positional whole number in `range` and no properties; else `msg` is the problem.
+    fn only_number(&mut self, node: &KdlNode, range: std::ops::RangeInclusive<u32>, msg: &str) -> Option<u32> {
+        self.props(node, &[]);
+        let n = match positional(node).as_slice() {
+            [e] => (e.value().as_integer()).and_then(|n| u32::try_from(n).ok()),
+            _ => None,
+        };
+        let n = n.filter(|n| range.contains(n));
+        if n.is_none() {
+            self.err(node, msg);
+        }
+        n
     }
 
     /// Exactly one positional string and no properties.
@@ -1099,6 +1283,12 @@ mod tests {
     };
     const MOD_SHIFT: Mods = Mods { shift: true, ..MOD };
     const MOD_CTRL: Mods = Mods { ctrl: true, ..MOD };
+    const CTRL_ALT: Mods = Mods {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        logo: false,
+    };
     const PINK: Color = Color {
         r: 0xff,
         g: 0x7e,
@@ -1195,10 +1385,20 @@ mod tests {
                 bind(MOD_SHIFT, "E", k::KEY_e, Action::Quit),
                 bind(MOD, "Escape", k::KEY_Escape, Action::Reclaim),
             ])
+            .chain(f_key_binds(MOD_CTRL))
+            .chain(f_key_binds(CTRL_ALT))
             .collect(),
             link: None,
             name: None,
+            keyboard: Keyboard::default(),
         }
+    }
+
+    /// `mods` with F1..F12, for consoles 1..12.
+    fn f_key_binds(mods: Mods) -> Vec<Bind> {
+        (1..=12u8)
+            .map(|n| bind(mods, &format!("F{n}"), k::KEY_F1 + u32::from(n) - 1, Action::Vt(n)))
+            .collect()
     }
 
     /// `mods` with keys 1..9 then 0, for workspaces 1..10.
@@ -1485,6 +1685,20 @@ mod tests {
         let n = line_of("\"Mod+Shift+Q\"");
         // Mod is Alt, and keys compare case-insensitively.
         assert_problem(&with_line(n, "    \"Super+h\" close"), n, "Super+h");
+    }
+
+    #[test]
+    fn a_combination_bound_twice_to_the_same_action_is_one_bind() {
+        // With Mod as Alt, the example's two console binds are the same keys.
+        let c = parse(&DEFAULT.replace("mod \"Super\"", "mod \"Alt\"")).expect("parses");
+        let f1: Vec<&Bind> = (c.binds.iter())
+            .filter(|b| b.mods == CTRL_ALT && b.key == "F1")
+            .collect();
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f1[0].action, Action::Vt(1));
+        let n = line_of("\"Mod+Shift+Q\"");
+        let twice = with_line(n, "    \"Mod+Shift+Q\" close\n    \"Super+Shift+q\" close");
+        assert_eq!(parse(&twice).map(|c| c.binds.len()), Ok(expected_default().binds.len()));
     }
 
     #[test]
@@ -1850,6 +2064,106 @@ mod tests {
         );
         let both = at_end("listen \"0.0.0.0:1\" secret-file=\"/s\"\nprimary \"desk:1\" secret-file=\"/s\"");
         assert_problem(&both, last + 1, "both");
+    }
+
+    #[test]
+    fn the_keyboard_block_sets_xkb_names_and_repeat() {
+        // Left out: every name from the environment (or xkb's own default), the repeat as before.
+        let default = Keyboard {
+            layout: None,
+            variant: None,
+            options: None,
+            model: None,
+            repeat_delay: 200,
+            repeat_rate: 25,
+        };
+        assert_eq!(default_config().keyboard, default);
+        assert_eq!(Keyboard::default(), default);
+        let c = parse(&format!(
+            "{DEFAULT}\nkeyboard {{\n    layout \"us,de\"\n    variant \",nodeadkeys\"\n    \
+             options \"grp:alt_shift_toggle\"\n    model \"pc105\"\n    repeat-delay 600\n    repeat-rate 0\n}}\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            c.keyboard,
+            Keyboard {
+                layout: Some("us,de".into()),
+                variant: Some(",nodeadkeys".into()),
+                options: Some("grp:alt_shift_toggle".into()),
+                model: Some("pc105".into()),
+                repeat_delay: 600,
+                repeat_rate: 0,
+            }
+        );
+        // Any subset; empty options and variant mean none (not the environment's).
+        let c = parse(&format!(
+            "{DEFAULT}\nkeyboard {{\n    options \"\"\n    repeat-rate 40\n}}\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            c.keyboard,
+            Keyboard {
+                options: Some(String::new()),
+                repeat_rate: 40,
+                ..default.clone()
+            }
+        );
+        let xkb = c.keyboard.xkb();
+        assert_eq!((xkb.rules, xkb.model, xkb.layout, xkb.variant), ("", "", "", ""));
+        assert_eq!(xkb.options, Some(String::new()));
+        assert_eq!(default.xkb().options, None, "None: the environment's options");
+    }
+
+    #[test]
+    fn keyboard_lines_are_strict() {
+        let at_end = |extra: &str| format!("{DEFAULT}\n{extra}");
+        let last = DEFAULT.lines().count() + 2;
+        assert_problem(&at_end("keyboard \"de\" {\n}"), last, "no arguments");
+        assert_problem(&at_end("keyboard {\n}\nkeyboard {\n}"), last + 2, "twice");
+        for (bad, word) in [
+            ("layout", "layout"),
+            ("layout 1", "layout"),
+            ("layout \"de\" \"us\"", "layout"),
+            ("layout \"\"", "layout"),
+            ("model \"\"", "model"),
+            ("variant \"a\\u{0}b\"", "control"),
+            ("options \"ctrl:nocaps\" x=1", "unknown property"),
+            ("layout \"de\" {\n}", "block"),
+            ("repeat-delay 0", "1 to 10000"),
+            ("repeat-delay 10001", "1 to 10000"),
+            ("repeat-delay \"600\"", "1 to 10000"),
+            ("repeat-rate -1", "0 to 1000"),
+            ("repeat-rate 1001", "0 to 1000"),
+            ("repeat-rate 2.5", "0 to 1000"),
+            ("speed 3", "unknown"),
+        ] {
+            assert_problem(&at_end(&format!("keyboard {{\n{bad}\n}}")), last + 1, word);
+        }
+        assert_problem(
+            &at_end("keyboard {\nlayout \"de\"\nlayout \"us\"\n}"),
+            last + 2,
+            "twice",
+        );
+        // A keymap xkb cannot build is refused here, so neither `check` nor a reload lets it through.
+        assert_problem(&at_end("keyboard {\nlayout \"no-such-layout\"\n}"), last, "keymap");
+        assert_problem(
+            &at_end("keyboard {\nlayout \"us\"\nvariant \"no-such-variant\"\n}"),
+            last,
+            "keymap",
+        );
+    }
+
+    #[test]
+    fn vt_binds_take_a_console_from_1_to_12() {
+        let n = line_of("\"Mod+Ctrl+F3\"");
+        for bad in ["0", "13", "-1", "\"3\"", "1.5", "", "1 2"] {
+            assert_problem(&with_line(n, &format!("    \"Mod+Ctrl+F3\" vt {bad}")), n, "1 to 12");
+        }
+        let c = parse(&with_line(n, "    \"Mod+Ctrl+F3\" vt 12")).expect("in range");
+        let b = (c.binds.iter())
+            .find(|b| b.key == "F3" && b.mods == MOD_CTRL)
+            .expect("the bind");
+        assert_eq!(b.action, Action::Vt(12));
     }
 
     #[test]

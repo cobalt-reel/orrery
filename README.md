@@ -58,8 +58,12 @@ near 0 % CPU.
 
 Options: `--config PATH` (default `$XDG_CONFIG_HOME/orrery/config.kdl`, else `~/.config/orrery/config.kdl`; no
 file means the built-in config, which is `examples/config.kdl`), `--socket PATH` (the control socket, default
-`$XDG_RUNTIME_DIR/orrery.sock`), `--backend headless --size WxH` (no screen, for tests), and `--debug-inject` (a
-testing aid, off by default: orrery then answers `inject` and `inject-remote`, below).
+`$XDG_RUNTIME_DIR/orrery.sock`), `--backend auto|drm|winit|headless` (below), `--size WxH` (the headless screen's
+size), and `--debug-inject` (a testing aid, off by default: orrery then answers `inject` and `inject-remote`, below).
+
+`--backend`: `auto` (the default) runs nested (`winit`) when `WAYLAND_DISPLAY` or `DISPLAY` is set and bare metal
+(`drm`) otherwise, from a text console; `winit` and `drm` force one; `headless` has no screen and no input devices
+(tests). The bare-metal backend is not built yet: `drm` (and `auto` outside a session) says so and exits.
 
 A second `orrery run` on the same control socket does not start another orrery: it asks the running one for one
 more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used).
@@ -119,6 +123,7 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Space` (held) | show tab strips along the top of each slot holding more than one window: one segment per tab, the current tab bright, pips for its depth |
 | `Super+Shift+E` | quit orrery |
 | `Super+Escape` | in a session: keyboard and pointer back to this machine (see Input crossing) |
+| `Super+Ctrl+F1` ... `F12`, `Ctrl+Alt+F1` ... `F12` | switch to console 1 ... 12 (bare metal; nested and headless they do nothing but log) |
 
 A slot holding more than one window (in any tab, at any depth), or a marked one (below), shows a small badge in its
 top-right corner. A click focuses the slot under the pointer.
@@ -207,7 +212,8 @@ and the secret file's path.
 ### Reference
 
 The config is [KDL v2](https://kdl.dev), read strictly: unknown nodes, properties, actions and modifiers are
-errors, as are duplicates. Every node is optional except at least one `layout`.
+errors, as are duplicates (a key combination bound twice to the same action is one bind: with `mod "Alt"`, the
+example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at least one `layout`.
 
 - `mod "NAME"`: what `Mod` means in binds. One of `Alt`, `Ctrl` (or `Control`), `Shift`, `Super` (or `Logo`),
   or several joined by `+` (`"Alt+Shift"`); default `Super`.
@@ -236,6 +242,14 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   address, IPv6 in brackets). A machine has `listen` or `primary`, never both. `PATH` is absolute, or starts with
   `~/` for the home directory.
 - `name "NAME"`: this machine's name in a session, 1 to 64 bytes, unique in it; default: the hostname.
+- `keyboard { layout "..."; variant "..."; options "..."; model "..."; repeat-delay MS; repeat-rate N }`: every
+  child optional. The four xkb names are as xkb takes them (`layout "us,de"`, `options "grp:alt_shift_toggle"`); one
+  left out comes from `XKB_DEFAULT_LAYOUT` (`_VARIANT`, `_OPTIONS`, `_MODEL`), else xkb's own default (`us`). An
+  empty `variant` or `options` means none. A keymap xkb cannot build is a config error (so `orrery check` catches
+  a misspelt layout). `repeat-delay` is the hold before a key repeats, 1 to 10000 ms (default 200); `repeat-rate`
+  the repeats a second, 0 (no repeat) to 1000 (default 25). A reload that changes the block sends the new keymap
+  and repeat to every client (in a session, while the primary's input is here, the new keymap comes back with
+  this machine's own input).
 - `colors { focus "#rrggbb"; badge "#rrggbb"; attention "#rrggbb"; background "#rrggbb" }`: each also
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
   one window and the tab strips, `attention` the badge of a slot holding a window that asked for attention,
@@ -262,6 +276,7 @@ errors, as are duplicates. Every node is optional except at least one `layout`.
   | `close` | | ask the focused window to close |
   | `show-tabs` | | while held: the tab strips |
   | `quit` | | stop orrery |
+  | `vt` | a console number, 1 to 12 (`vt 2`) | switch to that console (bare metal; elsewhere it is logged and does nothing) |
 
 The example, which is also the built-in config (`examples/config.kdl`; copy it to `~/.config/orrery/config.kdl`
 to start your own):
@@ -286,6 +301,8 @@ layout "halves" {
 }
 
 monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
+
+// keyboard { layout "us"; options "ctrl:nocaps"; repeat-delay 200; repeat-rate 25 }  // unset: XKB_DEFAULT_*
 
 stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
 
@@ -340,6 +357,30 @@ binds {
     "Mod+Space" show-tabs        // held: tab strips visible while down
     "Mod+Shift+E" quit
     "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in a session)
+    "Mod+Ctrl+F1" vt 1           // to console 1 ... 12 (bare metal; elsewhere it does nothing)
+    "Mod+Ctrl+F2" vt 2
+    "Mod+Ctrl+F3" vt 3
+    "Mod+Ctrl+F4" vt 4
+    "Mod+Ctrl+F5" vt 5
+    "Mod+Ctrl+F6" vt 6
+    "Mod+Ctrl+F7" vt 7
+    "Mod+Ctrl+F8" vt 8
+    "Mod+Ctrl+F9" vt 9
+    "Mod+Ctrl+F10" vt 10
+    "Mod+Ctrl+F11" vt 11
+    "Mod+Ctrl+F12" vt 12
+    "Ctrl+Alt+F1" vt 1           // the usual console keys, as binds
+    "Ctrl+Alt+F2" vt 2
+    "Ctrl+Alt+F3" vt 3
+    "Ctrl+Alt+F4" vt 4
+    "Ctrl+Alt+F5" vt 5
+    "Ctrl+Alt+F6" vt 6
+    "Ctrl+Alt+F7" vt 7
+    "Ctrl+Alt+F8" vt 8
+    "Ctrl+Alt+F9" vt 9
+    "Ctrl+Alt+F10" vt 10
+    "Ctrl+Alt+F11" vt 11
+    "Ctrl+Alt+F12" vt 12
 }
 ```
 

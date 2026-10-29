@@ -27,6 +27,8 @@ libc = "0.2.191"
 # Zeroes the link's secret and key when dropped.
 zeroize = "1.9.1"
 snow = { version = "0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+# Cursor themes: finding and reading xcursor files.
+xcursor = "0.3.11"
 # The nested windows' EGL surfaces (Smithay's winit backend uses it but does not re-export it).
 wayland-egl = "0.32.11"
 

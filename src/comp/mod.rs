@@ -4,6 +4,7 @@
 
 mod backend_headless;
 mod backend_winit;
+pub mod cursor_theme;
 mod forward;
 mod frames;
 mod handlers;
@@ -15,7 +16,7 @@ mod render;
 mod spawn;
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,17 +52,82 @@ use crate::layout::{Layout, Rect};
 use crate::placement::{self, Landing, Launches};
 use crate::stacks::{Stacks, WinId, Workspace};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// What orrery runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    /// The hardware itself: DRM/KMS, GBM and libinput through the seat (from a text console).
+    Drm,
     /// A window inside the running Wayland session.
     Winit,
     /// A virtual output with no rendering and no input, for tests.
     Headless,
 }
 
+/// `--backend`: a backend, or `auto` to pick one from the environment (`BackendChoice::backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendChoice {
+    /// Nested inside a running session (`WAYLAND_DISPLAY` or `DISPLAY` set), else bare metal.
+    Auto,
+    /// Bare metal, from a text console.
+    Drm,
+    /// A window inside the running session.
+    Winit,
+    /// No screen and no input devices (tests).
+    Headless,
+}
+
+impl BackendChoice {
+    /// The backend, given `WAYLAND_DISPLAY` and `DISPLAY` (empty counts as unset): an explicit choice as it is;
+    /// `auto` nested when either is set, else bare metal.
+    #[must_use]
+    pub fn backend(self, wayland_display: Option<&OsStr>, display: Option<&OsStr>) -> Backend {
+        let set = |v: Option<&OsStr>| v.is_some_and(|v| !v.is_empty());
+        match self {
+            Self::Auto if set(wayland_display) || set(display) => Backend::Winit,
+            Self::Auto | Self::Drm => Backend::Drm,
+            Self::Winit => Backend::Winit,
+            Self::Headless => Backend::Headless,
+        }
+    }
+}
+
+/// A DRM connector's name as the kernel (and so every other compositor) gives it: its kind's name, from the
+/// `DRM_MODE_CONNECTOR_*` number, and its id among the connectors of that kind (`DP-3`, `HDMI-A-1`, `eDP-1`).
+#[must_use]
+pub fn connector_name(kind: u32, id: u32) -> String {
+    const KINDS: [&str; 21] = [
+        "Unknown",
+        "VGA",
+        "DVI-I",
+        "DVI-D",
+        "DVI-A",
+        "Composite",
+        "SVIDEO",
+        "LVDS",
+        "Component",
+        "DIN",
+        "DP",
+        "HDMI-A",
+        "HDMI-B",
+        "TV",
+        "eDP",
+        "Virtual",
+        "DSI",
+        "DPI",
+        "Writeback",
+        "SPI",
+        "USB",
+    ];
+    let kind = usize::try_from(kind)
+        .ok()
+        .and_then(|k| KINDS.get(k))
+        .unwrap_or(&KINDS[0]);
+    format!("{kind}-{id}")
+}
+
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    pub backend: Backend,
+    pub backend: BackendChoice,
     /// None: `$XDG_CONFIG_HOME/orrery/config.kdl` (or `~/.config/...`), the built-in config when missing.
     pub config: Option<PathBuf>,
     /// The headless output's size; the winit output follows its window.
@@ -251,6 +317,13 @@ pub trait Screens {
     fn close(&mut self, state: &mut Orrery, name: &str) -> Result<(), String>;
 }
 
+/// A backend's consoles (bare metal), set by the backend at init. None on `Orrery`: there are none to switch to
+/// (`vt` binds are logged and do nothing).
+pub trait Consoles {
+    /// Switches to console `vt` (1..=`config::CONSOLES`).
+    fn switch(&mut self, vt: u8) -> Result<(), String>;
+}
+
 /// The layout an output starts with: its monitor rule, else the first layout.
 pub fn layout_for_output(config: &Config, output: &str) -> Option<Layout> {
     let by_rule = config
@@ -314,6 +387,8 @@ pub struct Orrery {
     output_globals: HashMap<String, GlobalId>,
     /// The backend's screens beyond the first; None when it cannot open any.
     pub screens: Option<Box<dyn Screens>>,
+    /// The backend's consoles; None when it has none.
+    pub consoles: Option<Box<dyn Consoles>>,
     /// How long frames take to draw (backends with a renderer record them).
     frames: frames::FrameStats,
     /// This machine in a session of linked orrerys; None alone.
@@ -368,8 +443,14 @@ impl Orrery {
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "seat0");
-        seat.add_keyboard(Default::default(), 200, 25)
-            .context("cannot set up the keyboard (is xkeyboard-config installed?)")?;
+        let (rate, delay) = config.keyboard.repeat_info();
+        // The config's keymap was built once when it was read; should it fail now, xkb's defaults are better than
+        // no keyboard.
+        if seat.add_keyboard(config.keyboard.xkb(), delay, rate).is_err() {
+            tracing::error!("cannot build the keymap of the `keyboard` block; using xkb's default");
+            seat.add_keyboard(Default::default(), delay, rate)
+                .context("cannot set up the keyboard (is xkeyboard-config installed?)")?;
+        }
         seat.add_pointer();
 
         let socket_name = listen(display, event_loop)?;
@@ -404,6 +485,7 @@ impl Orrery {
             outputs: Vec::new(),
             output_globals: HashMap::new(),
             screens: None,
+            consoles: None,
             frames: frames::FrameStats::new(Instant::now()),
             net: None,
             remote: remote::Remote::default(),
@@ -872,13 +954,13 @@ impl Orrery {
 
     /// Reads the config file again. A good one replaces the config (binds, colours, layouts: each monitor takes
     /// its layout's new definition by name, or after a fallback start its monitor rule; `stacking` as
-    /// `stacking_after_reload` says) and clears `config_error`; a broken one leaves everything as it was and sets
-    /// `config_error`, which shows as the red bar until a good config loads. A file gone while running (an editor
-    /// between delete and write, say) keeps the running config: the built-in one stands in only at startup. That
-    /// is an error answer for `reload` but not a `config_error`. In a session the secret file is read again too: a
-    /// different secret drops every link (they open again on it), and one that cannot be read is the
-    /// `config_error` and this answer's error, the config being applied all the same. `listen`, `primary` (the
-    /// `secret-file` path too) and `name` take effect on the next start.
+    /// `stacking_after_reload` says; the keyboard as `apply_keyboard` says) and clears `config_error`; a broken one
+    /// leaves everything as it was and sets `config_error`, which shows as the red bar until a good config loads. A
+    /// file gone while running (an editor between delete and write, say) keeps the running config: the built-in one
+    /// stands in only at startup. That is an error answer for `reload` but not a `config_error`. In a session the
+    /// secret file is read again too: a different secret drops every link (they open again on it), and one that
+    /// cannot be read is the `config_error` and this answer's error, the config being applied all the same.
+    /// `listen`, `primary` (the `secret-file` path too) and `name` take effect on the next start.
     pub fn reload(&mut self) -> Result<(), String> {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());
@@ -904,8 +986,9 @@ impl Orrery {
                          starts again (the secret file's contents are read again now)"
                     );
                 }
-                self.config = config;
-                self.config_error = self.link_reload();
+                let old = std::mem::replace(&mut self.config, config);
+                let keyboard = self.apply_keyboard(&old.keyboard).err();
+                self.config_error = self.link_reload().or(keyboard);
                 self.arrange();
                 tracing::info!("config reloaded");
                 match &self.config_error {
@@ -1043,6 +1126,14 @@ fn listen(display: Display<Orrery>, event_loop: &mut EventLoop<'static, Orrery>)
 /// `orrery run`: builds the state, starts a backend, prints `WAYLAND_DISPLAY=<name>`, runs until quit or
 /// SIGTERM/SIGINT.
 pub fn run(opts: RunOptions) -> anyhow::Result<()> {
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    let backend = (opts.backend).backend(wayland_display.as_deref(), std::env::var_os("DISPLAY").as_deref());
+    if backend == Backend::Drm {
+        bail!(
+            "the bare-metal backend (drm) is not built yet: run {NAME} inside a Wayland or X session \
+             (`--backend winit`)"
+        );
+    }
     let config_path = opts.config.clone().or_else(default_config_path);
 
     // First, before any socket of ours exists: a second orrery must refuse without side effects (one answering
@@ -1082,7 +1173,8 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     control.serve(&event_loop.handle())?;
     tracing::info!("control socket {}", control_path.display());
 
-    match opts.backend {
+    match backend {
+        Backend::Drm => unreachable!("refused above"),
         Backend::Winit => backend_winit::init(&mut event_loop, &mut state)?,
         Backend::Headless => backend_headless::init(&mut event_loop, &mut state, opts.size)?,
     }
@@ -1127,6 +1219,41 @@ mod tests {
         assert_eq!(screen_name("headless", 1), "headless");
         assert_eq!(screen_name("headless", 2), "headless-2");
         assert_eq!(screen_name("winit", 10), "winit-10");
+    }
+
+    #[test]
+    fn auto_is_nested_inside_a_session_and_bare_metal_on_a_console() {
+        let set = Some(OsStr::new("wayland-1"));
+        let x = Some(OsStr::new(":0"));
+        let empty = Some(OsStr::new(""));
+        assert_eq!(BackendChoice::Auto.backend(set, None), Backend::Winit);
+        assert_eq!(BackendChoice::Auto.backend(None, x), Backend::Winit);
+        assert_eq!(BackendChoice::Auto.backend(None, None), Backend::Drm);
+        assert_eq!(
+            BackendChoice::Auto.backend(empty, empty),
+            Backend::Drm,
+            "empty is unset"
+        );
+        // An explicit choice wins whatever the environment says.
+        assert_eq!(BackendChoice::Drm.backend(set, x), Backend::Drm);
+        assert_eq!(BackendChoice::Winit.backend(None, None), Backend::Winit);
+        assert_eq!(BackendChoice::Headless.backend(set, None), Backend::Headless);
+    }
+
+    #[test]
+    fn connectors_are_named_as_the_kernel_names_them() {
+        // DRM_MODE_CONNECTOR_* numbers (drm_mode.h) and the connector's id among its kind.
+        assert_eq!(connector_name(10, 3), "DP-3");
+        assert_eq!(connector_name(11, 1), "HDMI-A-1");
+        assert_eq!(connector_name(14, 1), "eDP-1");
+        assert_eq!(connector_name(1, 1), "VGA-1");
+        assert_eq!(connector_name(3, 2), "DVI-D-2");
+        assert_eq!(connector_name(7, 1), "LVDS-1");
+        assert_eq!(connector_name(15, 1), "Virtual-1");
+        assert_eq!(connector_name(16, 1), "DSI-1");
+        assert_eq!(connector_name(20, 1), "USB-1");
+        assert_eq!(connector_name(0, 1), "Unknown-1");
+        assert_eq!(connector_name(99, 2), "Unknown-2", "a kind newer than this table");
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub struct State {
     pub group: u32,
     /// Each wl_keyboard.keymap's size, in order.
     pub keymaps: Vec<u32>,
+    /// The latest wl_keyboard.repeat_info: (rate, delay).
+    pub repeat: Option<(i32, i32)>,
     pointer: Option<wl_pointer::WlPointer>,
     /// The window under the pointer (wl_pointer.enter, until its leave).
     pub pointer_focus: Option<usize>,
@@ -625,6 +627,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.group = group;
             }
             wl_keyboard::Event::Keymap { size, .. } => state.keymaps.push(size),
+            wl_keyboard::Event::RepeatInfo { rate, delay } => state.repeat = Some((rate, delay)),
             _ => {}
         }
     }

@@ -18,6 +18,8 @@ layout "halves" {
 
 monitor "winit" layout="wall"     // output name -> starting layout; unknown outputs get the first layout
 
+// keyboard { layout "us"; options "ctrl:nocaps"; repeat-delay 200; repeat-rate 25 }  // unset: XKB_DEFAULT_*
+
 stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
 
 colors {
@@ -71,4 +73,28 @@ binds {
     "Mod+Space" show-tabs        // held: tab strips visible while down
     "Mod+Shift+E" quit
     "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in a session)
+    "Mod+Ctrl+F1" vt 1           // to console 1 ... 12 (bare metal; elsewhere it does nothing)
+    "Mod+Ctrl+F2" vt 2
+    "Mod+Ctrl+F3" vt 3
+    "Mod+Ctrl+F4" vt 4
+    "Mod+Ctrl+F5" vt 5
+    "Mod+Ctrl+F6" vt 6
+    "Mod+Ctrl+F7" vt 7
+    "Mod+Ctrl+F8" vt 8
+    "Mod+Ctrl+F9" vt 9
+    "Mod+Ctrl+F10" vt 10
+    "Mod+Ctrl+F11" vt 11
+    "Mod+Ctrl+F12" vt 12
+    "Ctrl+Alt+F1" vt 1           // the usual console keys, as binds
+    "Ctrl+Alt+F2" vt 2
+    "Ctrl+Alt+F3" vt 3
+    "Ctrl+Alt+F4" vt 4
+    "Ctrl+Alt+F5" vt 5
+    "Ctrl+Alt+F6" vt 6
+    "Ctrl+Alt+F7" vt 7
+    "Ctrl+Alt+F8" vt 8
+    "Ctrl+Alt+F9" vt 9
+    "Ctrl+Alt+F10" vt 10
+    "Ctrl+Alt+F11" vt 11
+    "Ctrl+Alt+F12" vt 12
 }

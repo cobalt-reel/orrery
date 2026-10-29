@@ -1222,6 +1222,7 @@ dependencies = [
  "wayland-client",
  "wayland-egl",
  "wayland-protocols",
+ "xcursor",
  "zeroize",
 ]
 

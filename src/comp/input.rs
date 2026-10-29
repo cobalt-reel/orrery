@@ -15,7 +15,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::Orrery;
-use crate::config::{Action, Bind, Mods};
+use crate::config::{Action, Bind, Keyboard, Mods};
 use crate::ipc::{KeyView, Request};
 use crate::layout::Rect;
 use crate::link::ScrollSource;
@@ -165,8 +165,8 @@ pub fn find_bind(binds: &[Bind], mods: Mods, sym: Keysym) -> Option<&Bind> {
     binds.iter().find(|b| matches(b, mods, sym))
 }
 
-/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs and reclaim are keys
-/// only.
+/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs, reclaim and vt are
+/// keys only.
 #[must_use]
 pub fn action_request(action: &Action) -> Option<Request> {
     Some(match action {
@@ -185,7 +185,7 @@ pub fn action_request(action: &Action) -> Option<Request> {
         Action::MoveToWorkspace(number) => Request::MoveToWorkspace { number: *number },
         Action::Close => Request::Close,
         Action::Quit => Request::Quit,
-        Action::ShowTabs | Action::Reclaim => return None,
+        Action::ShowTabs | Action::Reclaim | Action::Vt(_) => return None,
     })
 }
 
@@ -258,8 +258,10 @@ impl Orrery {
     /// A bind's action. Failures are logged: a key has nowhere to answer. A program that would not start is a
     /// warning; a request with nothing to act on (no window to close, say) is not.
     pub fn run_action(&mut self, action: Action) {
-        if action == Action::Reclaim {
-            return self.input_reclaim();
+        match action {
+            Action::Reclaim => return self.input_reclaim(),
+            Action::Vt(vt) => return self.switch_vt(vt),
+            _ => {}
         }
         if let Some(request) = action_request(&action) {
             let response = self.handle_request(request);
@@ -271,6 +273,42 @@ impl Orrery {
                 }
             }
         }
+    }
+
+    /// To console `vt`, where the backend has consoles.
+    fn switch_vt(&mut self, vt: u8) {
+        match &mut self.consoles {
+            Some(consoles) => {
+                if let Err(e) = consoles.switch(vt) {
+                    tracing::warn!("cannot switch to console {vt}: {e}");
+                }
+            }
+            None => tracing::info!("vt {vt}: this backend has no consoles to switch to"),
+        }
+    }
+
+    /// The config's `keyboard` on the seat where it differs from `old`: a new keymap goes to every client (while the
+    /// primary's keymap is in use, it is the one that comes back after), new repeat info too. Err when xkb cannot
+    /// build the keymap (the old one stays).
+    pub fn apply_keyboard(&mut self, old: &Keyboard) -> Result<(), String> {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return Ok(());
+        };
+        let new = self.config.keyboard.clone();
+        if new.repeat_info() != old.repeat_info() {
+            let (rate, delay) = new.repeat_info();
+            keyboard.change_repeat_info(rate, delay);
+        }
+        if new.same_keymap(old) {
+            return Ok(());
+        }
+        let failed = || "xkb cannot build the keymap of the `keyboard` block; keeping the old one".to_owned();
+        if self.keymap_kept() {
+            let text = new.keymap_text().ok_or_else(failed)?;
+            self.replace_kept_keymap(text);
+            return Ok(());
+        }
+        keyboard.set_xkb_config(self, new.xkb()).map_err(|_| failed())
     }
 
     /// The host window lost keyboard focus: no release will arrive for what is down now. Input away comes back (the
@@ -448,6 +486,21 @@ mod tests {
     fn action_for(mods: Mods, raw: u32) -> Option<Action> {
         let c = config::default_config();
         find_bind(&c.binds, mods, sym(raw)).map(|b| b.action.clone())
+    }
+
+    #[test]
+    fn f_keys_with_mod_ctrl_or_ctrl_alt_switch_consoles() {
+        let ctrl_alt = Mods {
+            ctrl: true,
+            alt: true,
+            ..Mods::default()
+        };
+        for n in 1..=12u8 {
+            let f = k::KEY_F1 + u32::from(n) - 1;
+            assert_eq!(action_for(MOD_CTRL, f), Some(Action::Vt(n)));
+            assert_eq!(action_for(ctrl_alt, f), Some(Action::Vt(n)));
+        }
+        assert_eq!(action_request(&Action::Vt(2)), None, "a key only");
     }
 
     #[test]

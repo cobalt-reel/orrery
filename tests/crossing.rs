@@ -327,6 +327,33 @@ fn a_link_drop_releases_what_the_primary_had_down() {
 }
 
 #[test]
+fn a_keyboard_reloaded_while_the_primarys_keymap_is_in_use_comes_after_it() {
+    let (_dir, p, s) = pair();
+    let (mut c, _) = focused_window(&s);
+    let local = c.state.keymaps[0];
+    send(&p, json!({"msg": "keymap", "xkb": KEYMAP_DE}));
+    send_words(&p, &["handoff"]);
+    assert!(c.wait_for(|st| st.keymaps.len() == 2), "{:?}", c.state.keymaps);
+
+    let config = std::fs::read_to_string(s.config_path()).expect("the satellite's config");
+    s.write_config(&format!("{config}\nkeyboard {{\n    layout \"fr\"\n}}\n"));
+    s.msg_ok(&["reload"]);
+    c.roundtrip();
+    assert_eq!(
+        c.state.keymaps.len(),
+        2,
+        "the primary's keymap stays while its input is here"
+    );
+    send_words(&p, &["release"]);
+    assert!(c.wait_for(|st| st.keymaps.len() == 3), "{:?}", c.state.keymaps);
+    assert!(
+        c.state.keymaps[2] != local && c.state.keymaps[2] != c.state.keymaps[1],
+        "the reloaded one: {:?}",
+        c.state.keymaps
+    );
+}
+
+#[test]
 fn a_keymap_that_does_not_compile_closes_the_link() {
     let (_dir, p, s) = pair();
     let (mut c, _) = focused_window(&s);

@@ -235,6 +235,18 @@ impl Orrery {
         self.remote.active = false;
     }
 
+    /// The primary's keymap is in use, this machine's own kept to come back to.
+    pub(super) fn keymap_kept(&self) -> bool {
+        self.remote.local_keymap.is_some()
+    }
+
+    /// While `keymap_kept`: `text` is this machine's keymap to come back to, on its first layout.
+    pub(super) fn replace_kept_keymap(&mut self, text: String) {
+        if let Some(kept) = &mut self.remote.local_keymap {
+            *kept = (text, Layout(0));
+        }
+    }
+
     /// The primary's input is here: the pointer it moves is drawn here (`render::cursor_draw`).
     #[must_use]
     pub fn remote_input_active(&self) -> bool {
