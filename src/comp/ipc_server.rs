@@ -1,13 +1,14 @@
 //! The control socket: `orrery msg` connects, sends one JSON `Request` line, gets one `Response` line back, and
-//! the connection closes. Everything runs on calloop, with no threads and nothing blocking: a connection is a
-//! source that reads until its line is complete, then (if the answer does not fit the socket at once) a source
-//! that writes the rest. Every connection has a total deadline, and only a few may be open at once. A `to` request
-//! for another machine is answered when that machine answers (`net::Reply`), within a longer deadline.
+//! the connection closes; a `subscribe` connection instead becomes a subscription (`subscribers`). Everything runs
+//! on calloop, with no threads and nothing blocking: a connection is a source that reads until its line is complete,
+//! then (if the answer does not fit the socket at once) a source that writes the rest. Every connection has a total
+//! deadline, and only a few may be open at once. A `to` request for another machine is answered when that machine
+//! answers (`net::Reply`), within a longer deadline.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{BufRead as _, ErrorKind, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -296,7 +297,7 @@ fn encode(response: &Response) -> Vec<u8> {
 }
 
 /// Writes as much of `out[*done..]` as fits now. Ok(true) when all is written.
-fn write_some(stream: &UnixStream, out: &[u8], done: &mut usize) -> std::io::Result<bool> {
+pub(super) fn write_some(stream: &UnixStream, out: &[u8], done: &mut usize) -> std::io::Result<bool> {
     while *done < out.len() {
         match (&*stream).write(&out[*done..]) {
             Ok(0) => return Err(ErrorKind::WriteZero.into()),
@@ -377,6 +378,19 @@ fn accept(handle: &LoopHandle<'static, Orrery>, conns: &Registry, stream: UnixSt
                             wait_longer(&h, &registry, id);
                             return Ok(PostAction::Remove);
                         }
+                    }
+                }
+                Line::Done(Ok(Request::Subscribe)) => {
+                    // The connection becomes a subscription: no deadline, and no longer one of `MAX_CONNECTIONS`.
+                    let subscribed = (stream.try_clone())
+                        .map_err(|e| format!("cannot subscribe: {e}"))
+                        .and_then(|s| state.subscribe(s));
+                    match subscribed {
+                        Ok(()) => {
+                            finish(&h, &registry, id);
+                            return Ok(PostAction::Remove);
+                        }
+                        Err(e) => Response::error(e),
                     }
                 }
                 Line::Done(Ok(request)) => state.handle_request(request),
@@ -541,6 +555,36 @@ pub fn send(path: &Path, request: &Request) -> anyhow::Result<Response> {
     let stream = UnixStream::connect(path)
         .with_context(|| format!("cannot reach {NAME} at {} (is it running?)", path.display()))?;
     exchange(stream, request)
+}
+
+/// `orrery msg subscribe`: subscribes at `path` and hands each line to `line` as it comes, until orrery ends the
+/// stream (or `line` fails: the reader went away). There is no timeout: events may be hours apart. False when the
+/// subscription was refused (that answer is handed on too).
+pub fn subscribe(path: &Path, mut line: impl FnMut(&str) -> std::io::Result<()>) -> anyhow::Result<bool> {
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("cannot reach {NAME} at {} (is it running?)", path.display()))?;
+    stream
+        .set_write_timeout(Some(CLIENT_TIMEOUT))
+        .context("socket timeout")?;
+    let mut request = serde_json::to_vec(&Request::Subscribe).context("encoding the request")?;
+    request.push(b'\n');
+    stream.write_all(&request).context("sending the request")?;
+    let mut first = true;
+    let mut ok = true;
+    for text in std::io::BufReader::new(stream).lines() {
+        let text = text.context("reading the stream")?;
+        if std::mem::take(&mut first) {
+            // An event line is no response; a response is the refusal.
+            ok = serde_json::from_str::<Response>(&text).map_or(true, |r| r.ok);
+        }
+        if line(&text).is_err() {
+            break;
+        }
+    }
+    if first {
+        bail!("{NAME} closed the stream without a word");
+    }
+    Ok(ok)
 }
 
 /// `orrery run` where an orrery already answers at `path`: its answer to `open-screen`. None when nothing answers

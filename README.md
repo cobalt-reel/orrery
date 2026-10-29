@@ -182,6 +182,7 @@ ok.
 
 ```sh
 orrery msg state                      # monitors, workspaces, layouts, slots (rects, focus), tabs and their windows
+orrery msg subscribe                  # the event stream: the state, then a line per change, until it ends (below)
 orrery msg focus-slot right           # left | right | up | down
 orrery msg move right                 # the current tab, its whole stack, to the neighbour
 orrery msg swap-slot down
@@ -222,13 +223,51 @@ activation), `frames` (how long drawing a frame takes on the compositor thread: 
 `p95_us`, `max_us` over about the last minute; absent before the first frame and headless, which draws nothing) and
 `last_key`: the last key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a
 bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
-Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. In a session, `state` also carries
-`session` (see [Linking machines](#linking-machines)); alone it has none.
+Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. `colors` holds the config's colours
+(`focus`, `badge`, `attention`, `background`, each `#rrggbbaa`), for programs drawing in orrery's. In a session,
+`state` also carries `session` (see [Linking machines](#linking-machines)); alone it has none.
+
+### The event stream
+
+`orrery msg subscribe` keeps its connection open and prints one JSON object per line as they come, until orrery
+ends the stream (it quits, or drops a subscriber that leaves more than 1 MiB unread: reconnect then); it exits 0
+then, 1 when nothing answers or the subscription is refused (at most 16 subscribers at once). It is not for `--to`.
+The first line is `{"event":"state", ...}`: everything `state` carries, at the top level, except `last_key`: no
+keystroke ever appears in the stream. Then a line per change: once per turn of its event loop orrery compares what
+the events carry with what it sent last, so changes within one turn come as one event, and every change is seen
+however it was made (a key, `msg`, a client, a reload, another machine). Each event carries all a bar needs to redraw
+its part without asking again; within a turn they come in this order:
+
+| `event` | When | Carries |
+|---------|------|---------|
+| `workspace` | a screen shows another workspace, or one appears, goes, gains or loses windows or attention | `screens`, each `{ name, number, workspace, focused }`; `workspaces`, every existing one by number as `{ number, screen, shown, occupied, attention }` |
+| `layout` | a screen's layout or its slots' rectangles change (a layout or workspace switch, a resize, a bar's exclusive zone) | `screens`, each `{ name, workspace, layout, slots }`, the slots as `{ index, name, rect }` |
+| `focus` | the focus moves to another screen, workspace, slot or window | `screen`, `workspace`, `slot`, `slot_name`, `window` (`{ id, app_id, title }`, null for an empty slot); all null without a screen |
+| `tabs` | another slot is focused, or the focused slot's tabs, current tab, windows or titles change | `screen`, `workspace`, `slot` and its `tabs`, as `state` lists them (`{ current, attention, windows }`) |
+| `title` | a window's title or app id changes (one event per window) | `id`, `app_id`, `title` |
+| `attention` | a window asks for attention, or its mark goes | `windows` (ids) and `workspaces` (numbers) asking |
+| `layers` | a layer surface appears, goes, moves or takes the keyboard | `screens`, each `{ name, layers }`, each layer `{ namespace, layer, rect, keyboard }` |
+| `session` | a machine joins or leaves, a link goes up or down, input moves, the link error changes (latency alone does not) | `session` as in `state`, null alone |
+| `config` | the config file was read again (a reload, good or broken) | `error` (as `config_error`) and `colors` |
+
+```json
+{"event":"focus","screen":"winit","workspace":1,"slot":3,"slot_name":"hero","window":{"id":7,"app_id":"kitty","title":"~"}}
+{"event":"title","id":7,"app_id":"kitty","title":"vim"}
+{"event":"workspace","screens":[{"name":"winit","number":1,"workspace":2,"focused":true}],"workspaces":[{"number":1,"screen":"winit","shown":false,"occupied":true,"attention":false},{"number":2,"screen":"winit","shown":true,"occupied":false,"attention":false}]}
+```
+
+## Programs orrery starts
+
+`spawn` binds, `orrery msg spawn` and `spawn-at-start` run a program directly (no shell: write `"sh" "-c" "..."` for
+one), detached (a process group of its own, no stdin, stdout or stderr), in orrery's own environment with:
+`WAYLAND_DISPLAY` set to orrery's socket; `DISPLAY` removed, so no toolkit falls back to the host's X server;
+`XDG_CURRENT_DESKTOP=orrery` and `XDG_SESSION_TYPE=wayland`, which portals, toolkits and desktop entries read; and an
+xdg-activation token as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`, so its window opens where it was started.
 
 ## The config, its reload and `orrery check`
 
-orrery looks at its config file once a second (modification time and size) and reloads it when it changes, or at
-once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at runtime is kept,
+orrery looks at its config file and the files it includes once a second (modification time and size) and reloads
+it when one changes, or at once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at runtime is kept,
 unless the file's own `stacking` value changed): every workspace, hidden ones too, takes the new definition of its
 layout by name (a workspace whose layout is gone keeps it; that is logged, not an error). Monitor rules apply to new
 outputs only, except after a start on the built-in config (the file was missing or broken): the first good file then
@@ -249,7 +288,8 @@ and the secret file's path.
 ### Reference
 
 The config is [KDL v2](https://kdl.dev), read strictly: unknown nodes, properties, actions and modifiers are
-errors, as are duplicates (a key combination bound twice to the same action is one bind: with `mod "Alt"`, the
+errors, as are duplicates (several `binds` blocks are fine, their binds adding up, and a key combination bound
+twice to the same action is one bind: with `mod "Alt"`, the
 example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at least one `layout`.
 
 - `mod "NAME"`: what `Mod` means in binds. One of `Alt`, `Ctrl` (or `Control`), `Shift`, `Super` (or `Logo`),
@@ -293,6 +333,16 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
   one window and the tab strips, `attention` the badge of a slot holding a window that asked for attention,
   `background` what empty slots show. Defaults as in the example.
+- `include "PATH"`: reads another config file as if its nodes stood in place of the line, so a snippet joins a
+  config with one line. `PATH` is relative to the including file's directory, absolute, or starts with `~/` for the
+  home directory. An included file may hold anything the main one may (its `binds` add to the others'; anything else
+  set twice is an error wherever the two are) and include more, up to 8 deep; a cycle is an error naming the chain
+  of files, and the config with everything it includes is at most 1 MiB. Problems in an included file, or a missing
+  one, are config errors like any (`FILE:LINE:COL` names the file); the watcher watches included files too, a
+  missing one included (creating it reloads), and `orrery check` follows includes.
+- `spawn-at-start "PROGRAM" ["ARG"...]`: run once when orrery starts, with its screens and control socket up, as a
+  `spawn` bind runs it (see [Programs orrery starts](#programs-orrery-starts)); any number, in order. Never again on
+  a reload (nor when a config broken at startup is fixed by one).
 - `binds { "COMBO" ACTION [ARGS...] }`: `COMBO` is modifiers and one key joined by `+`, e.g. `"Mod+Shift+H"`:
   modifiers `Mod`, `Alt`, `Ctrl`/`Control`, `Shift`, `Super`/`Logo`; the key is an xkb keysym name, any case
   (`H`, `Return`, `Tab`, `Space`, `1`, `F5`); the `+` key is written `plus` (`"Mod+plus"`). Write the unshifted key
@@ -311,7 +361,7 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   | `layout` | a layout name | switch the layout of the focused screen's workspace (fewer slots: the extra slots' tabs join the last) |
   | `workspace` | a number, 1 to 10 (`workspace 3`, not `"3"`) | show that workspace on its screen and focus it (made on the focused screen if new) |
   | `move-to-workspace` | a number, 1 to 10 | move the focused slot's current tab, its whole stack, to that workspace as a new tab (focus stays) |
-  | `spawn` | program, then its arguments | run it (no shell) with `WAYLAND_DISPLAY` set to orrery and no `DISPLAY` |
+  | `spawn` | program, then its arguments | run it (no shell; see [Programs orrery starts](#programs-orrery-starts)) |
   | `close` | | ask the focused window to close |
   | `show-tabs` | | while held: the tab strips |
   | `quit` | | stop orrery |

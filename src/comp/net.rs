@@ -170,8 +170,7 @@ fn hostname() -> Option<String> {
 /// `link`'s secret file, `~/` taken from `$HOME`.
 #[must_use]
 pub fn secret_path(link: &LinkConfig) -> PathBuf {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
-    link.secret_path(home.as_deref())
+    link.secret_path(super::home_dir().as_deref())
 }
 
 /// What `stacks` reports: its screens and every number it has.

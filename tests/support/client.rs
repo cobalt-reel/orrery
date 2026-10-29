@@ -283,6 +283,13 @@ impl Client {
         i
     }
 
+    /// A new title for window `i`, as a client sets it while running.
+    pub fn set_title(&mut self, i: usize, title: &str) {
+        let toplevel = self.state.windows[i].toplevel.as_ref().expect("live window");
+        toplevel.set_title(title.to_owned());
+        self.roundtrip();
+    }
+
     /// Unmaps by committing a null buffer; the window stays unmapped until `remap`.
     pub fn unmap(&mut self, i: usize) {
         let w = &mut self.state.windows[i];

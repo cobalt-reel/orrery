@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 use super::Orrery;
+use crate::NAME;
 use crate::placement::Launch;
 
 /// Where a launched program finds its xdg-activation token: the protocol's name, and the older startup-notification
@@ -18,8 +19,9 @@ use crate::placement::Launch;
 const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
 
 /// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
-/// toolkit falls back to the host's Xwayland) for the child only (orrery's
-/// own environment keeps the host's, which winit needs), `token` as its xdg-activation token under both names
+/// toolkit falls back to the host's Xwayland) for the child only (orrery's own environment keeps the host's, which
+/// winit needs), `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` saying where it runs (portals and toolkits read them),
+/// `token` as its xdg-activation token under both names
 /// toolkits read (removed without one: a token orrery was started with is not orrery's to hand on), no stdio, its
 /// own process group (a Ctrl+C in orrery's terminal does not reach it), and an empty signal mask. None for an
 /// empty argv.
@@ -27,7 +29,11 @@ const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
 pub fn command(argv: &[String], display: &OsStr, token: Option<&str>) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
-    cmd.args(args).env("WAYLAND_DISPLAY", display).env_remove("DISPLAY");
+    cmd.args(args)
+        .env("WAYLAND_DISPLAY", display)
+        .env_remove("DISPLAY")
+        .env("XDG_CURRENT_DESKTOP", NAME)
+        .env("XDG_SESSION_TYPE", "wayland");
     for name in TOKEN_VARS {
         match token {
             Some(t) => cmd.env(name, t),
@@ -157,6 +163,14 @@ mod tests {
         for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
             assert!(envs.contains(&(OsStr::new(name), None)), "{name}: {envs:?}");
         }
+    }
+
+    #[test]
+    fn the_child_learns_the_desktop_and_session_type() {
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("XDG_CURRENT_DESKTOP"), Some(OsStr::new(NAME)))));
+        assert!(envs.contains(&(OsStr::new("XDG_SESSION_TYPE"), Some(OsStr::new("wayland")))));
     }
 
     #[test]

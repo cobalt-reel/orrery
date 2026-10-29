@@ -393,3 +393,85 @@ fn the_first_good_config_after_a_broken_start_applies_monitor_rules() {
     assert_eq!(orrery.state()["monitors"][0]["layout"], "wall");
     assert!(orrery.stop().success());
 }
+
+/// Writes `text` to `path` in one step (aside, then renamed), so orrery never reads half of it.
+fn replace(path: &std::path::Path, text: &str) {
+    let tmp = path.with_extension("new");
+    std::fs::write(&tmp, text).expect("write");
+    std::fs::rename(&tmp, path).expect("rename into place");
+}
+
+#[test]
+fn included_files_are_read_and_watched() {
+    // The wall layout lives in an included file, which is not there yet: the built-in config, with the error.
+    let start = config::DEFAULT.find("layout \"wall\"").expect("wall");
+    let end = start + config::DEFAULT[start..].find("}\n").expect("wall ends") + 2;
+    let main = format!(
+        "{}include \"layouts/wall.kdl\"\n{}",
+        &config::DEFAULT[..start],
+        &config::DEFAULT[end..]
+    );
+    let orrery = Compositor::start(&main, SIZE);
+    let state = orrery.state();
+    let error = state["config_error"].as_str().expect("an error");
+    assert!(error.contains("cannot read") && error.contains("wall.kdl"), "{error}");
+    assert_eq!(slot_count(&state), 6, "the built-in wall");
+
+    // It appears: picked up by the watcher, and so is every change to it.
+    let dir = orrery.config_dir.path().join("layouts");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let wall = |cols: u32| {
+        let slots: String = (0..cols).map(|c| format!("    slot col={c} row=0\n")).collect();
+        format!("layout \"wall\" {{\n    grid cols={cols} rows=1\n{slots}}}\n")
+    };
+    replace(&dir.join("wall.kdl"), &wall(2));
+    let state = wait_state(&orrery, |s| s["config_error"].is_null());
+    assert_eq!(slot_count(&state), 2);
+    replace(&dir.join("wall.kdl"), &wall(3));
+    wait_state(&orrery, |s| slot_count(s) == 3);
+
+    // Broken: the error names the included file and the place in it.
+    replace(
+        &dir.join("wall.kdl"),
+        "\nlayout \"wall\" {\n    grid cols=0 rows=1\n}\n",
+    );
+    let state = wait_state(&orrery, |s| !s["config_error"].is_null());
+    let error = state["config_error"].as_str().expect("an error");
+    assert!(
+        error.starts_with(&format!("{}:2:1: ", dir.join("wall.kdl").display())),
+        "{error}"
+    );
+    assert_eq!(slot_count(&state), 3, "the last good config stays");
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn spawn_at_start_runs_once_with_the_session_environment() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = dir.path().join("started.sh");
+    let out = dir.path().join("started.txt");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"$XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE $WAYLAND_DISPLAY\" >> \"$1\"\n",
+    )
+    .expect("write the script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    let line = format!("spawn-at-start \"{}\" \"{}\"\n", script.display(), out.display());
+    let orrery = Compositor::start(&format!("{}{line}", config::DEFAULT), SIZE);
+    let lines = || std::fs::read_to_string(&out).unwrap_or_default();
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    while lines().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program never ran: {}",
+            orrery.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(lines(), format!("{NAME} wayland {}\n", orrery.display));
+    // Not on a reload.
+    orrery.msg_ok(&["reload"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(lines().lines().count(), 1, "{}", lines());
+    assert!(orrery.stop().success());
+}

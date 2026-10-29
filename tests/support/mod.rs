@@ -300,6 +300,90 @@ impl Compositor {
     }
 }
 
+/// `orrery msg subscribe` running against an orrery: its lines as they come, read on a thread of their own.
+pub struct Subscription {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Subscription {
+    /// The next line, as JSON, for which `want` holds (lines before it are skipped); panics after TIMEOUT.
+    pub fn wait_for(&self, what: &str, want: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    let v: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+                    if want(&v) {
+                        return v;
+                    }
+                }
+                Err(e) => panic!("no {what} event ({e})"),
+            }
+        }
+    }
+
+    /// The next event named `name`.
+    pub fn next(&self, name: &str) -> Value {
+        self.wait_for(name, |v| v["event"] == name)
+    }
+
+    /// Every line left until EOF, which must come within TIMEOUT; then the client's exit status.
+    pub fn rest(mut self) -> (Vec<String>, ExitStatus) {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut rest = Vec::new();
+        loop {
+            match self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => rest.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(e) => panic!("the stream did not end ({e})"),
+            }
+        }
+        (
+            rest,
+            wait_or_kill(&mut self.child, "msg subscribe kept running after EOF"),
+        )
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Compositor {
+    /// `orrery msg --socket <ours> subscribe`, running.
+    pub fn subscribe(&self) -> Subscription {
+        let mut child = Command::new(BIN)
+            .arg("msg")
+            .arg("--socket")
+            .arg(self.control_socket())
+            .arg("subscribe")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run orrery msg subscribe");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Subscription { child, lines }
+    }
+}
+
 /// Each slot's tabs, left to right, each its windows' app ids bottom to top, on the first monitor.
 pub fn tabs(state: &Value) -> Vec<Vec<Vec<String>>> {
     state["monitors"][0]["slots"]

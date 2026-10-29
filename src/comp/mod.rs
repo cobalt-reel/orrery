@@ -16,6 +16,7 @@ pub mod net;
 mod remote;
 mod render;
 mod spawn;
+mod subscribers;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -173,15 +174,38 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// How often the config file is looked at for changes.
 pub const CONFIG_POLL: Duration = Duration::from_secs(1);
 
-/// Reads and parses the config file at `path`; None when there is no file. The error names the file and lists
-/// every problem with its line:col.
-pub fn read_config_file(path: &Path) -> Result<Option<Config>, String> {
+/// The home directory, `$HOME`; None when unset or empty.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+/// The config file at `path`, read: the config (None when there is no file) or why it cannot be used, and the
+/// files it is made of (`config::FileConfig::files`; just `path` when it is missing or unreadable).
+#[derive(Debug)]
+pub struct ConfigRead {
+    pub config: Result<Option<Config>, String>,
+    pub files: Vec<PathBuf>,
+}
+
+/// Reads and parses the config file at `path` with what it includes. The error lists every problem as
+/// `FILE:LINE:COL: message`.
+pub fn read_config_file(path: &Path) -> ConfigRead {
     match std::fs::read_to_string(path) {
-        Ok(src) => config::parse(&src)
-            .map(Some)
-            .map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        Ok(src) => {
+            let read = config::parse_file(&src, path, home_dir().as_deref());
+            ConfigRead {
+                config: read.config.map(Some).map_err(|e| e.to_string()),
+                files: read.files,
+            }
+        }
+        Err(e) => ConfigRead {
+            config: match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(format!("cannot read {}: {e}", path.display())),
+            },
+            files: vec![path.to_owned()],
+        },
     }
 }
 
@@ -190,31 +214,36 @@ pub fn read_config(path: Option<&Path>) -> Result<Config, String> {
     let Some(path) = path else {
         return Ok(config::default_config());
     };
-    read_config_file(path).map(|c| c.unwrap_or_else(config::default_config))
+    read_config_file(path)
+        .config
+        .map(|c| c.unwrap_or_else(config::default_config))
 }
 
 /// The config to start with: the file's, or the built-in one when there is no file or it is broken (a broken
 /// or unreadable file must not stop orrery from starting). Also why the file was not used, when broken (shown
 /// in `state` and as the red bar), and whether this is the built-in fallback (`Loaded::fallback`).
 pub fn load_config(path: Option<&Path>) -> Loaded {
-    let fallback = |error| Loaded {
+    let fallback = |error, files| Loaded {
         config: config::default_config(),
         error,
         fallback: true,
+        files,
     };
     let Some(path) = path else {
-        return fallback(None);
+        return fallback(None, Vec::new());
     };
-    match read_config_file(path) {
+    let read = read_config_file(path);
+    match read.config {
         Ok(Some(config)) => Loaded {
             config,
             error: None,
             fallback: false,
+            files: read.files,
         },
-        Ok(None) => fallback(None),
+        Ok(None) => fallback(None, read.files),
         Err(msg) => {
             tracing::error!("{msg}; using the built-in config");
-            fallback(Some(msg))
+            fallback(Some(msg), read.files)
         }
     }
 }
@@ -226,12 +255,34 @@ pub struct Loaded {
     /// The built-in config stands in for a missing or broken file: the first good reload then also applies the
     /// file's monitor rules, as a start with that file would have.
     pub fallback: bool,
+    /// The files the config is made of, to watch (`ConfigRead::files`).
+    pub files: Vec<PathBuf>,
 }
 
-/// What the config watcher compares: modification time and size (no inotify). None when there is no file.
-pub fn config_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
-    let meta = std::fs::metadata(path?).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+/// A file as the config watcher compares it: modification time and size (no inotify); None when it is missing.
+pub type Stamp = Option<(SystemTime, u64)>;
+
+/// Each file with its stamp now.
+#[must_use]
+pub fn config_stamps(files: &[PathBuf]) -> Vec<(PathBuf, Stamp)> {
+    let stamp = |path: &Path| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    files.iter().map(|f| (f.clone(), stamp(f))).collect()
+}
+
+/// The stamps of `files`, read just now, to watch from here on: a file stamped `before` the read keeps that stamp,
+/// so an edit that landed while it was read is seen as a change; one new to the list is stamped now.
+#[must_use]
+pub fn restamp(before: &[(PathBuf, Stamp)], files: &[PathBuf]) -> Vec<(PathBuf, Stamp)> {
+    let fresh = config_stamps(files);
+    (fresh.into_iter())
+        .map(|(f, now)| match before.iter().find(|(b, _)| *b == f) {
+            Some((_, then)) => (f, *then),
+            None => (f, now),
+        })
+        .collect()
 }
 
 /// The first good config after a fallback start: each monitor takes the layout its monitor rule (or the first
@@ -404,10 +455,14 @@ pub struct Orrery {
     pub config_error: Option<String>,
     /// The file `reload` reads and the watcher watches; None when there is no path at all (the built-in config).
     config_path: Option<PathBuf>,
-    /// The config file as last seen by the watcher.
-    config_stamp: Option<(SystemTime, u64)>,
+    /// The config file and the files it includes, as last read (`restamp`): what the watcher watches.
+    config_stamps: Vec<(PathBuf, Stamp)>,
     /// The running config is the built-in stand-in for a missing or broken file (see `Loaded::fallback`).
     config_is_fallback: bool,
+    /// The config file reads since startup (reloads, good or not): each is a `config` event.
+    config_reads: u64,
+    /// The event stream's subscribers.
+    subscribers: subscribers::Subscribers,
     /// In opening order, which is not the monitors' (number) order: look monitors up by name, never by index.
     pub outputs: Vec<Output>,
     /// Each output's global, by output name, to take away with it.
@@ -456,12 +511,14 @@ impl Orrery {
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         // The stamp first: an edit landing while the file is read is then seen again by the watcher.
-        let config_stamp = config_stamp(config_path.as_deref());
+        let before = config_stamps(config_path.as_slice());
         let Loaded {
             config,
             error: config_error,
             fallback: config_is_fallback,
+            files,
         } = load_config(config_path.as_deref());
+        let config_stamps = restamp(&before, &files);
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
@@ -512,8 +569,10 @@ impl Orrery {
             config,
             config_error,
             config_path,
-            config_stamp,
+            config_stamps,
             config_is_fallback,
+            config_reads: 0,
+            subscribers: subscribers::Subscribers::default(),
             outputs: Vec::new(),
             output_globals: HashMap::new(),
             screens: None,
@@ -967,6 +1026,8 @@ impl Orrery {
                     .unwrap_or_else(Response::ok)
             }
             Request::State => Response::with_state(self.state_view()),
+            // The control socket hands its connection to `subscribe`: one here came another way.
+            Request::Subscribe => Response::error(crate::ipc::SUBSCRIBE_HERE),
             Request::Close => {
                 // A request to the client; the window leaves the stacks when it is destroyed or unmapped.
                 let toplevel = (self.stacks.focused_window())
@@ -1037,13 +1098,18 @@ impl Orrery {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());
         };
-        match read_config_file(&path) {
+        // Stamped before reading, so the watcher sees an edit landing meanwhile; the includes may have changed.
+        let before = config_stamps(&self.watched());
+        let read = read_config_file(&path);
+        self.config_stamps = restamp(&before, &read.files);
+        match read.config {
             Ok(None) => {
                 let msg = format!("{} is gone; keeping the current config", path.display());
                 tracing::warn!("{msg}");
                 Err(msg)
             }
             Ok(Some(config)) => {
+                self.config_reads += 1;
                 if std::mem::take(&mut self.config_is_fallback) {
                     apply_monitor_rules(&mut self.stacks, &config);
                 } else {
@@ -1072,6 +1138,7 @@ impl Orrery {
                 }
             }
             Err(e) => {
+                self.config_reads += 1;
                 tracing::error!("{e}; keeping the old config");
                 self.config_error = Some(e.clone());
                 Err(e)
@@ -1079,20 +1146,51 @@ impl Orrery {
         }
     }
 
-    /// The watcher's tick: reload when the file's stamp changed since last seen (a broken file is not retried
-    /// until it changes again).
+    /// The watcher's tick: reload when the stamp of the file or of one it includes changed since last read (a
+    /// broken file is not retried until one changes again).
     fn check_config_file(&mut self) {
-        let stamp = config_stamp(self.config_path.as_deref());
-        if stamp != self.config_stamp {
-            self.config_stamp = stamp;
-            // A failure is logged and kept in config_error by reload itself.
+        if config_stamps(&self.watched()) != self.config_stamps {
+            // A failure is logged and kept in config_error by reload itself, which stamps the files again.
             let _ = self.reload();
+        }
+    }
+
+    /// The files the watcher watches: the config file and what it included when last read.
+    fn watched(&self) -> Vec<PathBuf> {
+        self.config_stamps.iter().map(|(f, _)| f.clone()).collect()
+    }
+
+    /// Starts the config's `spawn-at-start` programs, once, as `spawn` does; one that cannot start is logged.
+    fn spawn_at_start(&mut self) {
+        for argv in self.config.spawn_at_start.clone() {
+            if let Err(e) = self.spawn(&argv) {
+                tracing::warn!("spawn-at-start: {e}");
+            }
         }
     }
 
     /// The `state` answer.
     pub fn state_view(&self) -> StateView {
-        let mut view = StateView::new(&self.stacks, self.stacking, self.config_error.clone(), |id| {
+        let mut view = self.summary_view();
+        view.frames = self.frames.view();
+        view.last_key = self.last_key.clone();
+        let now = Instant::now();
+        view.launches = (self.launches.all().iter())
+            .map(|l| LaunchView {
+                pid: l.pid,
+                token: l.token.clone(),
+                age_ms: u64::try_from(now.saturating_duration_since(l.at).as_millis()).unwrap_or(u64::MAX),
+                claimed: l.claimed,
+            })
+            .collect();
+        view
+    }
+
+    /// The state the event stream follows, taken every loop iteration while anyone subscribes: `state` without
+    /// `frames`, `launches` and `last_key`.
+    fn summary_view(&self) -> StateView {
+        let colors = &self.config.colors;
+        let mut view = StateView::new(&self.stacks, self.stacking, self.config_error.clone(), colors, |id| {
             self.windows
                 .get(&id)
                 .and_then(|w| w.toplevel())
@@ -1111,18 +1209,7 @@ impl Orrery {
         for monitor in &mut view.monitors {
             monitor.layers = self.layer_views(&monitor.name);
         }
-        view.frames = self.frames.view();
         view.session = self.session_view().map(Box::new);
-        view.last_key = self.last_key.clone();
-        let now = Instant::now();
-        view.launches = (self.launches.all().iter())
-            .map(|l| LaunchView {
-                pid: l.pid,
-                token: l.token.clone(),
-                age_ms: u64::try_from(now.saturating_duration_since(l.at).as_millis()).unwrap_or(u64::MAX),
-                claimed: l.claimed,
-            })
-            .collect();
         view
     }
 
@@ -1253,6 +1340,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
         Backend::Headless => backend_headless::init(&mut event_loop, &mut state, opts.size)?,
     }
     state.start_link();
+    state.spawn_at_start();
 
     let Some(name) = state.socket_name.to_str().map(str::to_owned) else {
         bail!("the Wayland socket name is not UTF-8");
@@ -1266,6 +1354,8 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     event_loop
         .run(None, &mut state, |state| {
             state.link_tick();
+            // What this iteration changed, to the event stream's subscribers.
+            state.publish_events();
             // Everything queued for clients during this iteration goes out now.
             if let Err(e) = state.display_handle.flush_clients() {
                 tracing::warn!("flushing clients: {e}");
@@ -1483,8 +1573,41 @@ mod tests {
         let broken = dir.path().join("broken.kdl");
         std::fs::write(&broken, "mod \"Alt\"\nbogus 1\n").unwrap();
         let err = read_config(Some(&broken)).unwrap_err();
-        assert!(err.starts_with(&format!("{}: ", broken.display())), "{err}");
-        assert!(err.contains("2:1"), "{err}");
+        assert!(
+            err.contains(&format!("{}:2:1: unknown node", broken.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_watcher_watches_included_files_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, inc, gone) = (
+            dir.path().join("c.kdl"),
+            dir.path().join("i.kdl"),
+            dir.path().join("g.kdl"),
+        );
+        std::fs::write(&main, format!("{}include \"i.kdl\"\n", config::DEFAULT)).unwrap();
+        std::fs::write(&inc, "spawn-at-start \"bar\"\n").unwrap();
+        let l = load_config(Some(&main));
+        assert_eq!(l.config.spawn_at_start, [vec!["bar".to_owned()]], "{:?}", l.error);
+        assert_eq!(l.files, [main.clone(), inc.clone()]);
+        // A missing include is watched for, so that creating it reloads.
+        std::fs::write(&main, format!("{}include \"g.kdl\"\n", config::DEFAULT)).unwrap();
+        let read = read_config_file(&main);
+        assert!(read.config.is_err_and(|e| e.contains("g.kdl")));
+        assert_eq!(read.files, [main.clone(), gone.clone()]);
+        // No file at all: the path alone.
+        assert_eq!(read_config_file(&gone).files, std::slice::from_ref(&gone));
+
+        // Stamps taken before a read stay; a file new to the list is stamped as it is now.
+        let before = config_stamps(&[main.clone(), gone.clone()]);
+        assert!(before[0].1.is_some() && before[1].1.is_none());
+        let then = (SystemTime::UNIX_EPOCH, 1);
+        let before = vec![(main.clone(), Some(then))];
+        let after = restamp(&before, &[main.clone(), inc.clone()]);
+        assert_eq!(after[0], (main, Some(then)));
+        assert_eq!(after[1], config_stamps(&[inc])[0]);
     }
 
     #[test]

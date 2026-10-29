@@ -102,6 +102,8 @@ pub struct Config {
     /// `name`: this machine's name in a session; None: its hostname.
     pub name: Option<String>,
     pub keyboard: Keyboard,
+    /// `spawn-at-start` lines, in order: programs run once when orrery starts (never on a reload).
+    pub spawn_at_start: Vec<Vec<String>>,
 }
 
 /// The `keyboard` block: the xkb names, each None for `XKB_DEFAULT_*` (xkbcommon reads them, else uses its own
@@ -227,9 +229,10 @@ pub struct MonitorRule {
     pub layout: String,
 }
 
-/// One problem in a config, 1-based line and column (in characters).
+/// One problem in a config, 1-based line and column (in characters), in `file` (None: text with no file).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
+    pub file: Option<PathBuf>,
     pub line: usize,
     pub col: usize,
     pub message: String,
@@ -244,6 +247,12 @@ pub struct ConfigError {
 impl Color {
     const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 0xff }
+    }
+
+    /// `#rrggbbaa`, as a config may write it.
+    #[must_use]
+    pub fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}{:02x}", self.r, self.g, self.b, self.a)
     }
 
     /// `#rrggbb` or `#rrggbbaa`.
@@ -310,31 +319,225 @@ const MAX_SOURCE: usize = 1 << 20;
 /// overflow the stack and abort the process, which no error handling can catch.
 const MAX_DEPTH: usize = 16;
 
-/// Parse a config. Every problem found is reported, each with its line and column.
+/// Includes nest at most this deep: the main file's own are depth 1.
+pub const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// Parse a config with no file behind it (so no `include`). Every problem found is reported, each with its line
+/// and column.
 pub fn parse(src: &str) -> Result<Config, ConfigError> {
-    precheck(src).map_err(|p| ConfigError { problems: vec![p] })?;
-    let doc = match KdlDocument::parse_v2(src) {
-        Ok(doc) => doc,
-        Err(e) => {
-            let problems = e
-                .diagnostics
-                .iter()
-                .map(|d| {
-                    let mut message = d.message.clone().unwrap_or_else(|| "syntax error".into());
-                    if let Some(help) = &d.help {
-                        message = format!("{message} ({help})");
-                    }
-                    // kdl 6.7.1 gives some errors (e.g. a missing property value) a span from the start of the
-                    // document to where it stopped; a span across lines marks its end, not its start.
-                    let (start, len) = (d.span.offset(), d.span.len());
-                    let spans_lines = src.get(start..start + len).is_some_and(|t| t.contains('\n'));
-                    Problem::at(src, if spans_lines { start + len } else { start }, message)
-                })
-                .collect();
-            return Err(ConfigError { problems });
-        }
+    let mut sources = Sources::default();
+    sources.read(None, src.to_owned(), &mut Vec::new());
+    sources.config()
+}
+
+/// A config file and what it includes, read: the config, or every problem (each naming its file); and every file
+/// read or tried, the main one first, so a watcher can look at them all (a missing include too, to see it appear).
+#[derive(Debug)]
+pub struct FileConfig {
+    pub config: Result<Config, ConfigError>,
+    pub files: Vec<PathBuf>,
+}
+
+/// Parses `src`, the text of the config file at `path`, with the files it includes (`~/` in their paths is `home`).
+pub fn parse_file(src: &str, path: &Path, home: Option<&Path>) -> FileConfig {
+    let mut sources = Sources {
+        home,
+        files: vec![path.to_owned()],
+        ..Sources::default()
     };
-    Parser { src, problems: vec![] }.config(&doc)
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    sources.read(
+        Some(path.to_owned()),
+        src.to_owned(),
+        &mut vec![(path.to_owned(), canonical)],
+    );
+    let config = sources.config();
+    FileConfig {
+        config,
+        files: sources.files,
+    }
+}
+
+/// The texts of a config, gathered by following its `include`s.
+#[derive(Default)]
+struct Sources<'h> {
+    home: Option<&'h Path>,
+    /// Each text read and the file it came from, in reading order (a file included twice is read twice).
+    texts: Vec<(Option<PathBuf>, String)>,
+    /// Each text's document, at the same index (empty for one that does not parse).
+    docs: Vec<KdlDocument>,
+    /// Every top-level node but the includes, as (text, node index), in the order read: an included file's nodes
+    /// stand where its `include` does.
+    order: Vec<(usize, usize)>,
+    /// Each with the index of its text, so they sort by file and then place.
+    problems: Vec<(usize, Problem)>,
+    files: Vec<PathBuf>,
+    /// Bytes read, every inclusion counted: at most `MAX_SOURCE`, so includes cannot multiply without bound.
+    bytes: usize,
+}
+
+impl Sources<'_> {
+    /// Reads `text` (from `file`) and, depth first, what it includes. `chain` is the files being read, outermost
+    /// first, each (path as resolved, canonical path), `file` last.
+    fn read(&mut self, file: Option<PathBuf>, text: String, chain: &mut Vec<(PathBuf, PathBuf)>) {
+        let at = self.texts.len();
+        self.bytes += text.len();
+        let doc = precheck(&text)
+            .map_err(|p| vec![p])
+            .and_then(|()| KdlDocument::parse_v2(&text).map_err(|e| syntax_problems(&text, &e)));
+        let doc = doc.unwrap_or_else(|problems| {
+            let problems = problems.into_iter().map(|p| Problem {
+                file: file.clone(),
+                ..p
+            });
+            self.problems.extend(problems.map(|p| (at, p)));
+            KdlDocument::new()
+        });
+        self.texts.push((file, text));
+        self.docs.push(doc);
+        for ni in 0..self.docs[at].nodes().len() {
+            let node = &self.docs[at].nodes()[ni];
+            if node.name().value() != "include" {
+                self.order.push((at, ni));
+                continue;
+            }
+            match include_target(node) {
+                Ok((target, offset)) => self.include(at, offset, &target, chain),
+                Err(problems) => {
+                    for (offset, message) in problems {
+                        self.problem(at, offset, message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An `include "TARGET"` of text `at`, its path at `offset`.
+    fn include(&mut self, at: usize, offset: usize, target: &str, chain: &mut Vec<(PathBuf, PathBuf)>) {
+        let Some(including) = self.texts[at].0.clone() else {
+            return self.problem(
+                at,
+                offset,
+                "`include` needs a config file (its paths are relative to it)".into(),
+            );
+        };
+        let path = match (target.strip_prefix("~/"), self.home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            (Some(_), None) => {
+                return self.problem(at, offset, "`~/` needs the home directory, and HOME is not set".into());
+            }
+            // An absolute target replaces the directory.
+            (None, _) => including.parent().unwrap_or(Path::new(".")).join(target),
+        };
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.problem(at, offset, format!("cannot read {}: {e}", path.display()));
+                self.files.push(path);
+                return;
+            }
+        };
+        if chain.iter().any(|(_, c)| *c == canonical) {
+            let names: Vec<String> = (chain.iter().map(|(p, _)| p))
+                .chain([&path])
+                .map(|p| p.display().to_string())
+                .collect();
+            return self.problem(at, offset, format!("include cycle: {}", names.join(" -> ")));
+        }
+        if chain.len() > MAX_INCLUDE_DEPTH {
+            let message = format!("includes nest deeper than {MAX_INCLUDE_DEPTH}");
+            return self.problem(at, offset, message);
+        }
+        self.files.push(path.clone());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => return self.problem(at, offset, format!("cannot read {}: {e}", path.display())),
+        };
+        if self.bytes + text.len() > MAX_SOURCE {
+            return self.problem(at, offset, "the config and its includes are larger than 1 MiB".into());
+        }
+        chain.push((path.clone(), canonical));
+        self.read(Some(path), text, chain);
+        chain.pop();
+    }
+
+    fn problem(&mut self, at: usize, offset: usize, message: String) {
+        let (file, text) = &self.texts[at];
+        let problem = Problem {
+            file: file.clone(),
+            ..Problem::at(text, offset, message)
+        };
+        self.problems.push((at, problem));
+    }
+
+    /// The config the texts make, or their problems: those found gathering them alone when there are any (with a
+    /// file missing or broken, more would mostly be its echoes), else every one the config has.
+    fn config(&mut self) -> Result<Config, ConfigError> {
+        if !self.problems.is_empty() {
+            return Err(sorted(std::mem::take(&mut self.problems)));
+        }
+        let parser = Parser {
+            texts: &self.texts,
+            at: 0,
+            problems: vec![],
+        };
+        parser.config(&self.docs, &self.order)
+    }
+}
+
+/// Problems by file (in reading order), then place; stable, so problems at one place keep the order found.
+fn sorted(mut problems: Vec<(usize, Problem)>) -> ConfigError {
+    problems.sort_by_key(|(at, p)| (*at, p.line, p.col));
+    ConfigError {
+        problems: problems.into_iter().map(|(_, p)| p).collect(),
+    }
+}
+
+/// An `include` node's path and where it is, or what is wrong with it as (offset, message).
+fn include_target(node: &KdlNode) -> Result<(String, usize), Vec<(usize, String)>> {
+    let mut problems = Vec::new();
+    if node.children().is_some() {
+        problems.push((node.span().offset(), "`include` takes no block".to_owned()));
+    }
+    for e in node.entries().iter() {
+        if let Some(key) = e.name() {
+            problems.push((
+                e.span().offset(),
+                format!("unknown property `{}` on `include`", key.value()),
+            ));
+        }
+    }
+    let target = match positional(node).as_slice() {
+        [e] => (e.value().as_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| (s.to_owned(), e.span().offset())),
+        _ => None,
+    };
+    if target.is_none() {
+        let msg = "`include` takes one path: relative to this file, absolute, or starting with ~/";
+        problems.push((node.span().offset(), msg.to_owned()));
+    }
+    match target {
+        Some(t) if problems.is_empty() => Ok(t),
+        _ => Err(problems),
+    }
+}
+
+/// kdl's syntax errors as problems in `src`.
+fn syntax_problems(src: &str, e: &kdl::KdlError) -> Vec<Problem> {
+    (e.diagnostics.iter())
+        .map(|d| {
+            let mut message = d.message.clone().unwrap_or_else(|| "syntax error".into());
+            if let Some(help) = &d.help {
+                message = format!("{message} ({help})");
+            }
+            // kdl 6.7.1 gives some errors (e.g. a missing property value) a span from the start of the
+            // document to where it stopped; a span across lines marks its end, not its start.
+            let (start, len) = (d.span.offset(), d.span.len());
+            let spans_lines = src.get(start..start + len).is_some_and(|t| t.contains('\n'));
+            Problem::at(src, if spans_lines { start + len } else { start }, message)
+        })
+        .collect()
 }
 
 /// Size and nesting limits, checked before kdl sees the source. Braces are counted naively (inside strings and
@@ -370,6 +573,9 @@ pub fn default_config() -> Config {
 
 impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(file) = &self.file {
+            write!(f, "{}:", file.display())?;
+        }
         write!(f, "{}:{}: {}", self.line, self.col, self.message)
     }
 }
@@ -379,13 +585,20 @@ impl Problem {
         let before = &src[..src.floor_char_boundary(offset)];
         let line = before.matches('\n').count() + 1;
         let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-        Problem { line, col, message }
+        Problem {
+            file: None,
+            line,
+            col,
+            message,
+        }
     }
 }
 
 /// A bind as written, before `Mod` is known (the `mod` node may come later in the file).
 struct RawBind<'a> {
     node: &'a KdlNode,
+    /// The text it is in.
+    at: usize,
     mods: Mods,
     uses_mod: bool,
     key: String,
@@ -397,14 +610,19 @@ struct RawBind<'a> {
 
 /// A `monitor` node, checked against the layouts once all are known.
 struct RawMonitor {
+    /// The text it is in.
+    at: usize,
     output: String,
     layout: String,
     layout_at: usize,
 }
 
 struct Parser<'a> {
-    src: &'a str,
-    problems: Vec<Problem>,
+    /// Each text and its file (`Sources::texts`).
+    texts: &'a [(Option<PathBuf>, String)],
+    /// The text whose nodes are being read: problems are placed in it.
+    at: usize,
+    problems: Vec<(usize, Problem)>,
 }
 
 impl<'a> Parser<'a> {
@@ -413,11 +631,20 @@ impl<'a> Parser<'a> {
     }
 
     fn err_at(&mut self, offset: usize, message: impl Into<String>) {
-        self.problems.push(Problem::at(self.src, offset, message.into()));
+        let (file, src) = &self.texts[self.at];
+        let problem = Problem {
+            file: file.clone(),
+            ..Problem::at(src, offset, message.into())
+        };
+        self.problems.push((self.at, problem));
     }
 
-    fn config(mut self, doc: &'a KdlDocument) -> Result<Config, ConfigError> {
-        self.no_type_annotations(doc);
+    /// The config from the top-level `nodes` of `docs` (`Sources::order`).
+    fn config(mut self, docs: &'a [KdlDocument], nodes: &[(usize, usize)]) -> Result<Config, ConfigError> {
+        for (at, doc) in docs.iter().enumerate() {
+            self.at = at;
+            self.no_type_annotations(doc);
+        }
         let mut modifier: Option<Mods> = None;
         let mut layouts = Vec::new();
         // Every declared layout name, valid or not, so a broken layout doesn't also flag its references.
@@ -426,14 +653,16 @@ impl<'a> Parser<'a> {
         let mut stacking: Option<bool> = None;
         let mut colors: Option<Colors> = None;
         let mut raw_binds: Vec<RawBind> = Vec::new();
-        let mut seen_binds = false;
         let mut link: Option<LinkConfig> = None;
         let mut seen_link: Option<&str> = None;
         let mut name: Option<String> = None;
         let mut seen_name = false;
         let mut keyboard: Option<Keyboard> = None;
+        let mut spawn_at_start = Vec::new();
 
-        for node in doc.nodes() {
+        for &(at, ni) in nodes {
+            self.at = at;
+            let node = &docs[at].nodes()[ni];
             match node.name().value() {
                 "mod" => {
                     if modifier.is_some() {
@@ -518,22 +747,33 @@ impl<'a> Parser<'a> {
                     }
                     keyboard = Some(self.keyboard(node));
                 }
-                "binds" => {
-                    if seen_binds {
-                        self.err(node, "`binds` is set twice");
+                // Any number of blocks, so an included file can bring binds of its own.
+                "binds" => self.binds(node, &mut raw_binds),
+                "spawn-at-start" => {
+                    self.no_children(node);
+                    self.props(node, &[]);
+                    let argv: Option<Vec<String>> = (positional(node).iter())
+                        .map(|e| e.value().as_string().filter(|a| !a.is_empty()).map(str::to_owned))
+                        .collect();
+                    match argv {
+                        Some(argv) if !argv.is_empty() => spawn_at_start.push(argv),
+                        _ => self.err(
+                            node,
+                            "`spawn-at-start` takes a program and its arguments, as non-empty strings",
+                        ),
                     }
-                    seen_binds = true;
-                    self.binds(node, &mut raw_binds);
                 }
                 other => self.err(node, format!("unknown node `{other}`")),
             }
         }
 
         if layout_names.is_empty() {
+            self.at = 0;
             self.err_at(0, "the config defines no layout");
         }
         for m in &monitors {
             if !layout_names.contains(&m.layout) {
+                self.at = m.at;
                 let msg = format!("monitor {:?} uses unknown layout {:?}", m.output, m.layout);
                 self.err_at(m.layout_at, msg);
             }
@@ -543,11 +783,7 @@ impl<'a> Parser<'a> {
         let binds = self.resolve_binds(raw_binds, modifier, &layout_names);
 
         if !self.problems.is_empty() {
-            // Stable sort: file order, with problems on one node kept in the order found.
-            self.problems.sort_by_key(|p| (p.line, p.col));
-            return Err(ConfigError {
-                problems: self.problems,
-            });
+            return Err(sorted(self.problems));
         }
         Ok(Config {
             modifier,
@@ -565,6 +801,7 @@ impl<'a> Parser<'a> {
             link,
             name,
             keyboard: keyboard.unwrap_or_default(),
+            spawn_at_start,
         })
     }
 
@@ -713,6 +950,7 @@ impl<'a> Parser<'a> {
         };
         let ((output, _), (layout, layout_at)) = (output?, layout?);
         Some(RawMonitor {
+            at: self.at,
             output,
             layout,
             layout_at,
@@ -732,6 +970,7 @@ impl<'a> Parser<'a> {
     fn resolve_binds(&mut self, raw_binds: Vec<RawBind>, modifier: Mods, layout_names: &[String]) -> Vec<Bind> {
         let mut binds: Vec<Bind> = Vec::new();
         for raw in raw_binds {
+            self.at = raw.at;
             if let Action::Layout(name) = &raw.action
                 && !layout_names.contains(name)
             {
@@ -993,6 +1232,7 @@ impl<'a> Parser<'a> {
             .map_or(node.span().offset(), |e| e.span().offset());
         Some(RawBind {
             node,
+            at: self.at,
             mods,
             uses_mod,
             key: (*key).to_owned(),
@@ -1406,6 +1646,7 @@ mod tests {
             link: None,
             name: None,
             keyboard: Keyboard::default(),
+            spawn_at_start: vec![],
         }
     }
 
@@ -1814,15 +2055,22 @@ mod tests {
     #[test]
     fn problems_display_as_line_col_message() {
         let p = Problem {
+            file: None,
             line: 5,
             col: 22,
             message: "boom".into(),
         };
         assert_eq!(p.to_string(), "5:22: boom");
         let e = ConfigError {
-            problems: vec![p.clone(), p],
+            problems: vec![p.clone(), p.clone()],
         };
         assert_eq!(e.to_string(), "5:22: boom\n5:22: boom");
+        // From a file: prefixed with it, as editors jump to.
+        let p = Problem {
+            file: Some(PathBuf::from("/c/inc.kdl")),
+            ..p
+        };
+        assert_eq!(p.to_string(), "/c/inc.kdl:5:22: boom");
     }
 
     #[test]
@@ -1845,8 +2093,6 @@ mod tests {
             n + 1,
             "twice",
         );
-        let n = line_of("binds {");
-        assert_problem(&with_line(n, "binds {\n}\nbinds {"), n + 2, "twice");
         let n = line_of("focus \"#ff7edb\"");
         assert_problem(
             &with_line(n, "    focus \"#ff7edb\"\n    focus \"#ff7edb\""),
@@ -2182,6 +2428,241 @@ mod tests {
             .find(|b| b.key == "F3" && b.mods == MOD_CTRL)
             .expect("the bind");
         assert_eq!(b.action, Action::Vt(12));
+    }
+
+    /// A one-layout config, enough to parse on its own.
+    const ONE: &str = "layout \"a\" {\n grid cols=1 rows=1\n slot col=0 row=0\n}\n";
+
+    /// Writes `files` (relative path, text) under a new temp dir, returned.
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    /// `parse_file` on `<dir>/main.kdl`, with `home` for `~/`.
+    fn parse_main(dir: &Path, home: Option<&Path>) -> FileConfig {
+        let main = dir.join("main.kdl");
+        parse_file(&std::fs::read_to_string(&main).unwrap(), &main, home)
+    }
+
+    #[test]
+    fn includes_are_read_relative_to_the_including_file() {
+        let dir = tree(&[
+            (
+                "main.kdl",
+                &format!("{ONE}include \"kitty/desk.kdl\"\nstacking #false\n"),
+            ),
+            (
+                "kitty/desk.kdl",
+                "binds {\n \"Mod+D\" spawn \"menu\"\n}\ninclude \"../colors.kdl\"\n",
+            ),
+            ("colors.kdl", "colors {\n focus \"#01020304\"\n}\n"),
+        ]);
+        let read = parse_main(dir.path(), None);
+        let c = read.config.expect("parses");
+        assert_eq!(c.binds[0].action, Action::Spawn(vec!["menu".into()]));
+        assert_eq!(c.colors.focus, Color { r: 1, g: 2, b: 3, a: 4 });
+        assert!(!c.stacking, "the main file's own nodes after the include count too");
+        let d = dir.path();
+        assert_eq!(
+            read.files,
+            [
+                d.join("main.kdl"),
+                d.join("kitty/desk.kdl"),
+                d.join("kitty/../colors.kdl")
+            ]
+        );
+    }
+
+    #[test]
+    fn includes_take_absolute_and_home_paths() {
+        let home = tree(&[("snippets/binds.kdl", "binds {\n \"Mod+D\" quit\n}\n")]);
+        let other = tree(&[("colors.kdl", "colors {\n badge \"#010203\"\n}\n")]);
+        let main = format!(
+            "{ONE}include \"~/snippets/binds.kdl\"\ninclude \"{}\"\n",
+            other.path().join("colors.kdl").display()
+        );
+        let dir = tree(&[("main.kdl", &main)]);
+        let c = parse_main(dir.path(), Some(home.path())).config.expect("parses");
+        assert_eq!(c.binds[0].action, Action::Quit);
+        assert_eq!(c.colors.badge, Color::rgb(1, 2, 3));
+        // Without a home directory, `~/` is a problem at the path.
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        assert_eq!((err.problems[0].line, err.problems[0].col), (5, 9), "{err}");
+        assert!(err.problems[0].message.contains("HOME"), "{err}");
+    }
+
+    #[test]
+    fn include_cycles_are_refused_with_the_chain() {
+        let dir = tree(&[
+            ("main.kdl", &format!("{ONE}include \"a.kdl\"\n")),
+            ("a.kdl", "include \"b.kdl\"\n"),
+            ("b.kdl", "// b\ninclude \"a.kdl\"\n"),
+        ]);
+        let read = parse_main(dir.path(), None);
+        let err = read.config.unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        let p = &err.problems[0];
+        assert_eq!(p.file.as_deref(), Some(dir.path().join("b.kdl").as_path()));
+        assert_eq!((p.line, p.col), (2, 9), "{err}");
+        let [main, a, b] = ["main.kdl", "a.kdl", "b.kdl"].map(|f| dir.path().join(f).display().to_string());
+        assert!(p.message.contains(&format!("{main} -> {a} -> {b} -> {a}")), "{err}");
+        // A file included twice side by side is no cycle (its layouts then clash as any duplicate would).
+        let dir = tree(&[
+            ("main.kdl", &format!("{ONE}include \"c.kdl\"\ninclude \"c.kdl\"\n")),
+            ("c.kdl", "spawn-at-start \"bar\"\n"),
+        ]);
+        let c = parse_main(dir.path(), None).config.expect("parses");
+        assert_eq!(c.spawn_at_start, [vec!["bar".to_owned()], vec!["bar".to_owned()]]);
+        // Nor is a file including itself through another name of it: the canonical path is compared.
+        let dir = tree(&[("main.kdl", &format!("{ONE}include \"./main.kdl\"\n"))]);
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        assert!(err.problems[0].message.contains("cycle"), "{err}");
+    }
+
+    #[test]
+    fn includes_nest_at_most_8_deep() {
+        let chain = |n: usize| {
+            let mut files: Vec<(String, String)> = vec![("main.kdl".into(), format!("{ONE}include \"1.kdl\"\n"))];
+            for i in 1..n {
+                files.push((format!("{i}.kdl"), format!("include \"{}.kdl\"\n", i + 1)));
+            }
+            files.push((format!("{n}.kdl"), "stacking #false\n".into()));
+            let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+            tree(&refs)
+        };
+        let deep = chain(MAX_INCLUDE_DEPTH);
+        assert!(!parse_main(deep.path(), None).config.expect("8 deep is fine").stacking);
+        let deeper = chain(MAX_INCLUDE_DEPTH + 1);
+        let read = parse_main(deeper.path(), None);
+        let err = read.config.unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].message.contains("deeper than 8"), "{err}");
+        assert_eq!(
+            err.problems[0].file.as_deref(),
+            Some(deeper.path().join("8.kdl").as_path())
+        );
+        assert_eq!(read.files.len(), MAX_INCLUDE_DEPTH + 1, "the 9th is never read");
+    }
+
+    #[test]
+    fn problems_in_an_included_file_name_it() {
+        let dir = tree(&[
+            ("main.kdl", &format!("{ONE}colors {{\n}}\ninclude \"inc.kdl\"\n")),
+            ("inc.kdl", "stacking #true\nbogus 1\ncolors {\n}\n"),
+        ]);
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        let inc = dir.path().join("inc.kdl");
+        let said: Vec<String> = err.problems.iter().map(Problem::to_string).collect();
+        assert_eq!(said.len(), 2, "{err}");
+        assert!(
+            said[0].starts_with(&format!("{}:2:1: unknown node", inc.display())),
+            "{err}"
+        );
+        assert!(
+            said[1].starts_with(&format!("{}:3:1: `colors` is set twice", inc.display())),
+            "{err}"
+        );
+        // A missing file is a problem at its include, and is still watched for.
+        let dir = tree(&[("main.kdl", &format!("{ONE}include \"gone.kdl\"\n"))]);
+        let read = parse_main(dir.path(), None);
+        let err = read.config.unwrap_err();
+        let main = dir.path().join("main.kdl");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("{}:5:9: cannot read", main.display())),
+            "{err}"
+        );
+        assert!(err.to_string().contains("gone.kdl"), "{err}");
+        assert_eq!(read.files, [main, dir.path().join("gone.kdl")]);
+        // A syntax error in an included file names it too.
+        let dir = tree(&[
+            ("main.kdl", &format!("{ONE}include \"inc.kdl\"\n")),
+            ("inc.kdl", "colors {\n"),
+        ]);
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        assert_eq!(
+            err.problems[0].file.as_deref(),
+            Some(dir.path().join("inc.kdl").as_path()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn include_is_strict() {
+        let dir = tree(&[("x.kdl", "")]);
+        let main = dir.path().join("main.kdl");
+        for (line, word) in [
+            ("include", "one path"),
+            ("include \"x.kdl\" \"y.kdl\"", "one path"),
+            ("include 1", "one path"),
+            ("include \"x.kdl\" optional=#true", "unknown property"),
+            ("include \"x.kdl\" {\n}", "no block"),
+            ("include \"\"", "one path"),
+        ] {
+            let src = format!("{ONE}{line}\n");
+            let err = parse_file(&src, &main, None).config.expect_err(line);
+            assert!(
+                err.problems.iter().any(|p| p.line == 5 && p.message.contains(word)),
+                "{line}: {err}"
+            );
+        }
+        // Text with no file behind it has nothing to be relative to.
+        assert_problem(&format!("{ONE}include \"/etc/x.kdl\"\n"), 5, "config file");
+    }
+
+    #[test]
+    fn included_files_count_towards_the_size_limit() {
+        let big = format!("// {}\n", "x".repeat(MAX_SOURCE / 2));
+        let dir = tree(&[
+            ("main.kdl", &format!("{ONE}include \"big.kdl\"\ninclude \"big.kdl\"\n")),
+            ("big.kdl", &big),
+        ]);
+        let err = parse_main(dir.path(), None).config.unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].message.contains("1 MiB"), "{err}");
+        assert_eq!(err.problems[0].line, 6, "at the include that went over: {err}");
+    }
+
+    #[test]
+    fn spawn_at_start_takes_argvs() {
+        let c = parse(&format!(
+            "{ONE}spawn-at-start \"bar\"\nspawn-at-start \"kitty\" \"--title\" \"x y\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            c.spawn_at_start,
+            [
+                vec!["bar".to_owned()],
+                vec!["kitty".into(), "--title".into(), "x y".into()]
+            ]
+        );
+        assert!(parse(ONE).unwrap().spawn_at_start.is_empty());
+        for (line, word) in [
+            ("spawn-at-start", "program"),
+            ("spawn-at-start \"\"", "program"),
+            ("spawn-at-start \"bar\" \"\"", "program"),
+            ("spawn-at-start \"bar\" 1", "program"),
+            ("spawn-at-start \"bar\" at=1", "unknown property"),
+            ("spawn-at-start \"bar\" {\n}", "no block"),
+        ] {
+            assert_problem(&format!("{ONE}{line}\n"), 5, word);
+        }
+    }
+
+    #[test]
+    fn binds_blocks_add_up() {
+        let src = format!("{ONE}binds {{\n \"Mod+Q\" quit\n}}\nbinds {{\n \"Mod+W\" close\n \"Mod+Q\" quit\n}}\n");
+        let c = parse(&src).expect("parses");
+        let actions: Vec<&Action> = c.binds.iter().map(|b| &b.action).collect();
+        assert_eq!(actions, [&Action::Quit, &Action::Close], "the same bind twice is one");
+        let clash = format!("{ONE}binds {{\n \"Mod+Q\" quit\n}}\nbinds {{\n \"Mod+Q\" close\n}}\n");
+        assert_problem(&clash, 9, "bound twice");
     }
 
     #[test]

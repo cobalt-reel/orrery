@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -168,7 +169,7 @@ fn check(path: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match config::parse(&src) {
+    match config::parse_file(&src, &path, comp::home_dir().as_deref()).config {
         Ok(config) => {
             let Some(link) = &config.link else {
                 println!("ok");
@@ -190,25 +191,33 @@ fn check(path: Option<PathBuf>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            // One line per problem, prefixed with the file so editors can jump to it.
+            // One line per problem, prefixed with its file (this one or one it includes) so editors can jump to it.
             for problem in &e.problems {
-                eprintln!("{}:{problem}", path.display());
+                eprintln!("{problem}");
             }
             ExitCode::FAILURE
         }
     }
 }
 
-/// `orrery msg`: one request (to `to`, when given), its answer as `print_answer` shows it.
-fn msg(socket: Option<PathBuf>, to: Option<String>, words: &[String]) -> ExitCode {
-    let request = match ipc::parse_words(words) {
-        Ok(r) => match to {
-            Some(machine) => Request::To {
-                machine,
-                request: Box::new(r),
-            },
-            None => r,
+/// The request `orrery msg` sends for `words`, run on machine `to` when given (never a `subscribe`).
+fn msg_request(to: Option<String>, words: &[String]) -> Result<Request, String> {
+    let request = ipc::parse_words(words)?;
+    Ok(match to {
+        Some(_) if request == Request::Subscribe => return Err(ipc::SUBSCRIBE_HERE.into()),
+        Some(machine) => Request::To {
+            machine,
+            request: Box::new(request),
         },
+        None => request,
+    })
+}
+
+/// `orrery msg`: one request (to `to`, when given), its answer as `print_answer` shows it; `subscribe` prints the
+/// stream's lines as they come, until it ends.
+fn msg(socket: Option<PathBuf>, to: Option<String>, words: &[String]) -> ExitCode {
+    let request = match msg_request(to, words) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("{NAME} msg: {e}");
             return ExitCode::FAILURE;
@@ -218,6 +227,25 @@ fn msg(socket: Option<PathBuf>, to: Option<String>, words: &[String]) -> ExitCod
         eprintln!("{NAME} msg: no control socket: pass --socket or set XDG_RUNTIME_DIR");
         return ExitCode::FAILURE;
     };
+    if request == Request::Subscribe {
+        // Line by line, flushed as each comes: a bar reads them live.
+        let print = |line: &str| {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{line}")?;
+            out.flush()
+        };
+        return match ipc_server::subscribe(&path, print) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => {
+                eprintln!("{NAME} msg: the subscription was refused");
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("{NAME} msg: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     print_answer("msg", ipc_server::send(&path, &request))
 }
 
@@ -306,6 +334,18 @@ mod tests {
             (to, argv),
             (Some("desk".into()), vec!["foot".into(), "--to".into(), "x".into()])
         );
+    }
+
+    #[test]
+    fn subscribe_never_goes_to_another_machine() {
+        let words = |w: &str| w.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(msg_request(None, &words("subscribe")), Ok(Request::Subscribe));
+        let refused = msg_request(Some("side".into()), &words("subscribe")).unwrap_err();
+        assert!(refused.contains("control socket only"), "{refused}");
+        assert!(matches!(
+            msg_request(Some("side".into()), &words("state")),
+            Ok(Request::To { .. })
+        ));
     }
 
     #[test]

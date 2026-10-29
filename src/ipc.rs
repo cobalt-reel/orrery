@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Cycle, parse_dir, workspace_number};
+use crate::config::{Colors, Config, Cycle, parse_dir, workspace_number};
 use crate::crossing::RawKey;
 use crate::layout::{Dir, Rect};
 use crate::link::{Message, ScrollSource};
@@ -14,6 +14,9 @@ use crate::stacks::{Stacks, WORKSPACES, WinId, Workspace};
 #[serde(tag = "cmd", rename_all = "kebab-case", try_from = "Wire")]
 pub enum Request {
     State,
+    /// The event stream: the connection stays open, and orrery writes a `state` event, then an event per change
+    /// (see `events`), one JSON object per line. Only on the control socket, never `to` another machine.
+    Subscribe,
     FocusSlot {
         dir: Dir,
     },
@@ -84,6 +87,7 @@ pub enum Request {
 #[serde(tag = "cmd", rename_all = "kebab-case", deny_unknown_fields)]
 enum Wire {
     State {},
+    Subscribe {},
     FocusSlot { dir: Dir },
     Move { dir: Dir },
     SwapSlot { dir: Dir },
@@ -113,6 +117,7 @@ impl TryFrom<Wire> for Request {
     fn try_from(w: Wire) -> Result<Self, String> {
         Ok(match w {
             Wire::State {} => Request::State,
+            Wire::Subscribe {} => Request::Subscribe,
             Wire::FocusSlot { dir } => Request::FocusSlot { dir },
             Wire::Move { dir } => Request::Move { dir },
             Wire::SwapSlot { dir } => Request::SwapSlot { dir },
@@ -141,6 +146,9 @@ impl TryFrom<Wire> for Request {
                 if matches!(*request, Request::To { .. }) {
                     return Err("`to` takes one machine: its request cannot be another `to`".into());
                 }
+                if matches!(*request, Request::Subscribe) {
+                    return Err(SUBSCRIBE_HERE.into());
+                }
                 Request::To { machine, request }
             }
             Wire::Inject { input } => Request::Inject {
@@ -161,6 +169,9 @@ impl TryFrom<Wire> for Request {
         })
     }
 }
+
+/// Why `subscribe` is refused anywhere but straight on the control socket.
+pub const SUBSCRIBE_HERE: &str = "`subscribe` is answered on the control socket only, never `to` another machine";
 
 /// An `inject` request's input: a key, motion, button or axis, as from a device.
 fn injected(input: Box<Message>) -> Result<Box<Message>, String> {
@@ -194,8 +205,9 @@ pub struct Response {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Boxed: a link message carries responses, and the state is big.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<StateView>,
+    pub state: Option<Box<StateView>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +232,28 @@ pub struct StateView {
     /// This machine's place in a session of linked orrerys; absent alone (no `listen` or `primary`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Box<SessionView>>,
+    /// The config's colours, for programs drawing in orrery's (a bar).
+    pub colors: ColorsView,
+}
+
+/// The config's `colors`, each `#rrggbbaa`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorsView {
+    pub focus: String,
+    pub badge: String,
+    pub attention: String,
+    pub background: String,
+}
+
+impl From<&Colors> for ColorsView {
+    fn from(c: &Colors) -> Self {
+        Self {
+            focus: c.focus.hex(),
+            badge: c.badge.hex(),
+            attention: c.attention.hex(),
+            background: c.background.hex(),
+        }
+    }
 }
 
 /// A machine in a session: who it is, where it links, and the machines it knows. The primary knows every machine
@@ -390,7 +424,7 @@ impl Response {
 
     pub fn with_state(state: StateView) -> Self {
         Self {
-            state: Some(state),
+            state: Some(Box::new(state)),
             ..Self::ok()
         }
     }
@@ -404,6 +438,7 @@ impl StateView {
         stacks: &Stacks,
         stacking: bool,
         config_error: Option<String>,
+        colors: &Colors,
         info: impl Fn(WinId) -> (Option<String>, Option<String>),
     ) -> Self {
         // A workspace's slots on its monitor's area; `focused` when it is the focused monitor's shown one.
@@ -472,6 +507,7 @@ impl StateView {
             last_key: None,
             launches: Vec::new(),
             session: None,
+            colors: colors.into(),
         }
     }
 }
@@ -516,6 +552,7 @@ impl Request {
                 stacks.move_to_workspace(*number);
             }
             Request::State
+            | Request::Subscribe
             | Request::Close
             | Request::Reload
             | Request::Quit
@@ -535,6 +572,7 @@ impl Request {
     pub(crate) fn verb(&self) -> &'static str {
         match self {
             Request::State => "state",
+            Request::Subscribe => "subscribe",
             Request::FocusSlot { .. } => "focus-slot",
             Request::Move { .. } => "move",
             Request::SwapSlot { .. } => "swap-slot",
@@ -588,6 +626,7 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
     };
     match verb.as_str() {
         "state" => none(Request::State),
+        "subscribe" => none(Request::Subscribe),
         "close" => none(Request::Close),
         "reload" => none(Request::Reload),
         "quit" => none(Request::Quit),
@@ -701,7 +740,7 @@ fn input_words(args: &[&str]) -> Result<Message, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_config;
+    use crate::config::{Color, default_config};
     use crate::crossing::{Edge, Entry, RawKey};
     use crate::link::{ScrollSource, Xkb};
 
@@ -736,10 +775,11 @@ mod tests {
             Request::To { machine, request } => (16, Wire::To { machine, request }),
             Request::Inject { input } => (17, Wire::Inject { input }),
             Request::InjectRemote { machine, message } => (18, Wire::InjectRemote { machine, message }),
+            Request::Subscribe => (19, Wire::Subscribe {}),
         }
     }
 
-    const VARIANTS: usize = 19;
+    const VARIANTS: usize = 20;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -757,6 +797,7 @@ mod tests {
     fn all_requests() -> Vec<Request> {
         vec![
             Request::State,
+            Request::Subscribe,
             Request::FocusSlot { dir: Dir::Left },
             Request::Move { dir: Dir::Right },
             Request::SwapSlot { dir: Dir::Up },
@@ -858,6 +899,7 @@ mod tests {
     fn requests_have_the_documented_shape() {
         let json = |r: &Request| serde_json::to_string(r).expect("serializes");
         assert_eq!(json(&Request::State), r#"{"cmd":"state"}"#);
+        assert_eq!(json(&Request::Subscribe), r#"{"cmd":"subscribe"}"#);
         assert_eq!(
             json(&Request::FocusSlot { dir: Dir::Down }),
             r#"{"cmd":"focus-slot","dir":"down"}"#
@@ -970,6 +1012,8 @@ mod tests {
             r#"{"cmd":"to","machine":"","request":{"cmd":"state"}}"#,
             r#"{"cmd":"to","machine":"desk","request":{"cmd":"bogus"}}"#,
             r#"{"cmd":"to","machine":"a","request":{"cmd":"to","machine":"b","request":{"cmd":"state"}}}"#,
+            r#"{"cmd":"to","machine":"a","request":{"cmd":"subscribe"}}"#,
+            r#"{"cmd":"subscribe","x":1}"#,
             r#"{"cmd":"inject"}"#,
             r#"{"cmd":"inject","input":{"msg":"release"}}"#,
             r#"{"cmd":"inject","input":{"msg":"ping","nonce":1}}"#,
@@ -1075,6 +1119,13 @@ mod tests {
                 foreign: vec![2],
                 error: None,
             })),
+            colors: ColorsView::from(&Colors {
+                background: Color {
+                    a: 0x80,
+                    ..Colors::default().background
+                },
+                ..Colors::default()
+            }),
         }
     }
 
@@ -1111,6 +1162,11 @@ mod tests {
         let layers =
             r#""layers":[{"namespace":"panel","layer":"top","rect":{"x":0,"y":0,"w":3840,"h":30},"keyboard":false}]"#;
         assert!(json(&r).contains(layers), "{}", json(&r));
+        let colors = concat!(
+            r##""colors":{"focus":"#ff7edbff","badge":"#ff7edbff","attention":"#ffb000ff","##,
+            r##""background":"#1a162580"}"##
+        );
+        assert!(json(&r).contains(colors), "{}", json(&r));
     }
 
     fn words(s: &str) -> Vec<String> {
@@ -1121,6 +1177,7 @@ mod tests {
     fn words_parse_for_every_verb() {
         let cases = [
             ("state", Request::State),
+            ("subscribe", Request::Subscribe),
             ("focus-slot left", Request::FocusSlot { dir: Dir::Left }),
             ("move right", Request::Move { dir: Dir::Right }),
             ("split", Request::Split),
@@ -1415,7 +1472,7 @@ mod tests {
         s.open_tab(3, None, None);
         s.mark(1);
         s.add_monitor("second", uhd, layout("halves"));
-        let v = StateView::new(&s, false, Some("broken".into()), |w| {
+        let v = StateView::new(&s, false, Some("broken".into()), &Colors::default(), |w| {
             (Some(format!("app{w}")), (w == 2).then(|| "two".into()))
         });
         assert_eq!(v.config_error.as_deref(), Some("broken"));
@@ -1491,7 +1548,7 @@ mod tests {
         s.focus_slot(Dir::Right);
         s.workspace(3);
         s.open_stacked(3);
-        let v = StateView::new(&s, true, None, |_| (None, None));
+        let v = StateView::new(&s, true, None, &Colors::default(), |_| (None, None));
         let shows: Vec<(&str, u8, u8, bool)> = (v.monitors.iter())
             .map(|m| (m.name.as_str(), m.number, m.workspace, m.focused))
             .collect();
