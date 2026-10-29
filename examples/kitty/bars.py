@@ -6,9 +6,11 @@
 The options go to each `kitten panel` (see `kitten panel --help`). Run once by `spawn-at-start` (orrery.kdl); the
 screens come from `orrery msg subscribe` ($ORRERY, else `orrery` on PATH). A bar that dies while its screen is there
 is started again, waiting longer each time it dies young; a screen that goes takes its bar. Without orrery for a
-minute (it has quit), the bars are stopped and this ends.
+minute (it has quit), the bars are stopped and this ends; so it does when another orrery has taken the socket's
+place (one started after this one's quit): that one runs its own. The bars die with this script.
 """
 
+import ctypes
 import os
 import selectors
 import signal
@@ -50,6 +52,15 @@ def panel_argv(screen, extra, bar_path=BAR, python=sys.executable):
     ]
 
 
+def die_with_parent():
+    """In a panel's child process before exec: SIGTERM when bars.py dies, however it dies (prctl's
+    PR_SET_PDEATHSIG; Linux only, elsewhere nothing)."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
 def restart_delay(deaths):
     """Seconds to wait before starting a bar again after `deaths` quick deaths in a row."""
     return 0 if deaths == 0 else min(2**deaths, 60)
@@ -81,7 +92,9 @@ class Panels:
             if not start or now < self.next_try.get(screen, 0):
                 continue
             try:
-                proc = subprocess.Popen(panel_argv(screen, self.extra), stdin=subprocess.DEVNULL)
+                proc = subprocess.Popen(
+                    panel_argv(screen, self.extra), stdin=subprocess.DEVNULL, preexec_fn=die_with_parent
+                )
             except OSError as e:
                 print(f"bars.py: cannot start kitten panel: {e}", file=sys.stderr)
                 self.deaths[screen] = self.deaths.get(screen, 0) + 1
@@ -110,7 +123,7 @@ def main(argv=None):
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))
     panels = Panels(extra)
-    backoff, lost_since = 0.5, None
+    backoff, lost_since, seen = 0.5, None, bar.Seen()
     try:
         while True:
             sub = bar.Subscription(bar.orrery_program())
@@ -119,13 +132,16 @@ def main(argv=None):
                 sel = selectors.DefaultSelector()
                 sel.register(sub.fileno(), selectors.EVENT_READ)
                 while True:
-                    panels.tend()
+                    panels.tend(start=connected)
                     if not sel.select(1.0):
                         continue
                     events = sub.read()
                     if events is None:
                         break
                     for ev in events:
+                        if ev.get("event") == "state" and not seen.same(bar.socket_identity(bar.socket_path())):
+                            sub.close()
+                            return 0  # another orrery: its own bars.py runs its bars (finally stops ours)
                         screens = screens_of(ev)
                         if screens is not None:
                             panels.want = screens

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use orrery_wm::config;
 use serde_json::Value;
-use support::client::Client;
+use support::client::{Client, LayerSpec};
 use support::{Compositor, TIMEOUT, WATCHDOG, attention, current_tabs, focused_slot, strs, tabs};
 
 const SIZE: (i32, i32) = (1280, 720);
@@ -142,8 +142,63 @@ fn a_launched_programs_window_finds_its_launch_by_pid() {
     assert!(orrery.stop().success());
 }
 
-/// Not a test of its own: `a_launched_programs_window_finds_its_launch_by_pid` runs this binary through orrery
-/// with `HELPER` set, and this maps one window with that app id and stays until orrery goes away.
+#[test]
+fn a_launched_programs_layer_surface_uses_its_launch_up() {
+    let (orrery, mut client) = start();
+    let a = client.create_window("a", "A");
+    assert!(client.wait_for(|s| s.windows[a].mapped()));
+    // The helper maps a bar (a layer surface), never a window, from a descendant of the launched pid.
+    let exe = std::env::current_exe().expect("the test binary");
+    let script = format!("{HELPER}={LAYER} \"$0\" --exact helper_client --quiet & wait");
+    orrery.msg_ok(&["spawn", "sh", "-c", &script, exe.to_str().expect("a UTF-8 path")]);
+    let state = wait_state(&orrery, |s| s["launches"][0]["claimed"] == true);
+    assert_eq!(state["launches"][0]["claimed"], true, "{state:#}");
+    assert_eq!(state["monitors"][0]["layers"][0]["namespace"], "bar", "{state:#}");
+    // Used up: the next stranger's window stacks, as with no launch at all.
+    let b = client.create_window("b", "B");
+    assert!(client.wait_for(|s| s.windows[b].mapped()));
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"])]);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_spawn_with_launch_false_records_no_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (key_file, start_file) = (dir.path().join("key"), dir.path().join("start"));
+    let config = format!(
+        "{}spawn-at-start \"touch\" \"{}\" launch=#false\nbinds {{\n    \"Mod+grave\" spawn \"touch\" \"{}\" launch=#false\n}}\n",
+        config::DEFAULT,
+        start_file.display(),
+        key_file.display()
+    );
+    let orrery = Compositor::start_with(&config, SIZE, &["--debug-inject"]);
+    // Super (133) held, grave (49) pressed and released.
+    for (code, dir) in [("133", "down"), ("49", "down"), ("49", "up"), ("133", "up")] {
+        orrery.msg_ok(&["inject", "key", code, dir]);
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    while !(key_file.exists() && start_file.exists()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(key_file.exists() && start_file.exists(), "both ran");
+    let state = orrery.state();
+    assert_eq!(state["launches"], serde_json::json!([]), "{state:#}");
+    // So a stranger's window right after goes by stacking.
+    let mut client = Client::new(orrery.connect());
+    let [a, b] = [client.create_window("a", "A"), client.create_window("b", "B")];
+    assert!(client.wait_for(|s| s.windows[b].mapped() && !s.windows[a].mapped()));
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"])]);
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+/// The helper's `HELPER` value for a bar (a layer surface) instead of a window.
+const LAYER: &str = "layer-surface";
+
+/// Not a test of its own: `a_launched_programs_window_finds_its_launch_by_pid` (and the layer surface test) run
+/// this binary through orrery with `HELPER` set, and this maps one window with that app id (or with `LAYER`, a bar)
+/// and stays until orrery goes away.
 #[test]
 fn helper_client() {
     let Some(app_id) = std::env::var(HELPER).ok() else {
@@ -151,8 +206,13 @@ fn helper_client() {
     };
     let conn = wayland_client::Connection::connect_to_env().expect("orrery's WAYLAND_DISPLAY");
     let mut client = Client::new(conn);
-    let w = client.create_window(&app_id, &app_id);
-    assert!(client.wait_for(|s| s.windows[w].mapped()));
+    if app_id == LAYER {
+        let bar = client.create_layer(&LayerSpec::bar(20));
+        assert!(client.wait_for(|s| s.layers[bar].attached.is_some()));
+    } else {
+        let w = client.create_window(&app_id, &app_id);
+        assert!(client.wait_for(|s| s.windows[w].mapped()));
+    }
     // Never outlive the harness's watchdog, whatever happens to orrery.
     let deadline = Instant::now() + WATCHDOG;
     while client.try_roundtrip().is_ok() && Instant::now() < deadline {

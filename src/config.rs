@@ -62,6 +62,9 @@ pub enum Action {
     /// 1..=WORKSPACES.
     MoveToWorkspace(u8),
     Spawn(Vec<String>),
+    /// `spawn ... launch=#false`: started as `Spawn` is, but recorded as no launch (for a program that opens no
+    /// window of its own, so it cannot hand its launch to another program's window). Keys only.
+    SpawnNoLaunch(Vec<String>),
     Close,
     ShowTabs,
     Quit,
@@ -74,6 +77,14 @@ pub enum Action {
 
 /// The highest console a `vt` bind can name.
 pub const CONSOLES: u8 = 12;
+
+/// A `spawn-at-start` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Start {
+    pub argv: Vec<String>,
+    /// Recorded as a launch (`launch=#true`, the default), so a window it opens lands where it was started.
+    pub launch: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
@@ -103,7 +114,7 @@ pub struct Config {
     pub name: Option<String>,
     pub keyboard: Keyboard,
     /// `spawn-at-start` lines, in order: programs run once when orrery starts (never on a reload).
-    pub spawn_at_start: Vec<Vec<String>>,
+    pub spawn_at_start: Vec<Start>,
 }
 
 /// The `keyboard` block: the xkb names, each None for `XKB_DEFAULT_*` (xkbcommon reads them, else uses its own
@@ -799,14 +810,19 @@ impl<'a> Parser<'a> {
                 "binds" => self.binds(node, &mut raw_binds),
                 "spawn-at-start" => {
                     self.no_children(node);
-                    self.props(node, &[]);
+                    let [launch] = self.props(node, &["launch"])[..] else {
+                        unreachable!("one property asked for")
+                    };
+                    let launch = launch.map_or(Some(true), |e| self.launch_value(e));
                     let argv: Option<Vec<String>> = (positional(node).iter())
                         .map(|e| e.value().as_string().filter(|a| !a.is_empty()).map(str::to_owned))
                         .collect();
                     match argv {
                         Some(mut argv) if !argv.is_empty() => {
                             argv[0] = self.program(&argv[0]);
-                            spawn_at_start.push(argv);
+                            if let Some(launch) = launch {
+                                spawn_at_start.push(Start { argv, launch });
+                            }
                         }
                         _ => self.err(
                             node,
@@ -1250,9 +1266,19 @@ impl<'a> Parser<'a> {
 
     fn bind(&mut self, node: &'a KdlNode) -> Option<RawBind<'a>> {
         self.no_children(node);
-        if let Some(e) = node.entries().iter().find(|e| e.name().is_some()) {
-            self.err_at(e.span().offset(), "binds take no properties");
-            return None;
+        // `launch=#true|#false`, `spawn`'s only property; other actions take none.
+        let mut launch: Option<(bool, usize)> = None;
+        for e in node.entries().iter().filter(|e| e.name().is_some()) {
+            let at = e.span().offset();
+            if e.name().is_some_and(|n| n.value() != "launch") {
+                self.err_at(at, "binds take no properties but `launch` (on `spawn`)");
+                return None;
+            }
+            if launch.is_some() {
+                self.err_at(at, "`launch` is set twice");
+                return None;
+            }
+            launch = Some((self.launch_value(e)?, at));
         }
         let combo = node.name().value();
         let parts: Vec<&str> = combo.split('+').collect();
@@ -1281,7 +1307,15 @@ impl<'a> Parser<'a> {
                 ok = false;
             }
         }
-        let action = self.action(node);
+        let action = match (self.action(node), launch) {
+            (Some(Action::Spawn(argv)), Some((false, _))) => Some(Action::SpawnNoLaunch(argv)),
+            (Some(Action::Spawn(argv)), _) => Some(Action::Spawn(argv)),
+            (Some(_), Some((_, at))) => {
+                self.err_at(at, "`launch` is only for `spawn`");
+                None
+            }
+            (action, _) => action,
+        };
         let target_at = positional(node)
             .get(1)
             .map_or(node.span().offset(), |e| e.span().offset());
@@ -1482,6 +1516,15 @@ impl<'a> Parser<'a> {
             }
         }
         out
+    }
+
+    /// A `launch` property's value, or None with the problem reported.
+    fn launch_value(&mut self, e: &KdlEntry) -> Option<bool> {
+        let value = e.value().as_bool();
+        if value.is_none() {
+            self.err_at(e.span().offset(), "`launch` takes #true or #false");
+        }
+        value
     }
 
     fn string_value(&mut self, e: &KdlEntry, key: &str) -> Option<String> {
@@ -1728,6 +1771,11 @@ mod tests {
     }
 
     /// The source with one line replaced, so a broken line keeps a known number.
+    /// The `spawn-at-start` argvs.
+    fn argvs(starts: &[Start]) -> Vec<Vec<String>> {
+        starts.iter().map(|s| s.argv.clone()).collect()
+    }
+
     fn with_line(n: usize, text: &str) -> String {
         DEFAULT
             .lines()
@@ -2578,7 +2626,10 @@ mod tests {
             ("c.kdl", "spawn-at-start \"bar\"\n"),
         ]);
         let c = parse_main(dir.path(), None).config.expect("parses");
-        assert_eq!(c.spawn_at_start, [vec!["bar".to_owned()], vec!["bar".to_owned()]]);
+        assert_eq!(
+            argvs(&c.spawn_at_start),
+            [vec!["bar".to_owned()], vec!["bar".to_owned()]]
+        );
         // Nor is a file including itself through another name of it: the canonical path is compared.
         let dir = tree(&[("main.kdl", &format!("{ONE}include \"./main.kdl\"\n"))]);
         let err = parse_main(dir.path(), None).config.unwrap_err();
@@ -2696,7 +2747,7 @@ mod tests {
         ))
         .expect("parses");
         assert_eq!(
-            c.spawn_at_start,
+            argvs(&c.spawn_at_start),
             [
                 vec!["bar".to_owned()],
                 vec!["kitty".into(), "--title".into(), "x y".into()]
@@ -2716,6 +2767,37 @@ mod tests {
     }
 
     #[test]
+    fn spawns_can_record_no_launch() {
+        let c = parse(&format!(
+            "{ONE}spawn-at-start \"a\" launch=#false\nspawn-at-start \"b\" launch=#true\nspawn-at-start \"c\"\nbinds {{\n \"Mod+D\" spawn \"menu\" \"-x\" launch=#false\n \"Mod+E\" spawn \"e\" launch=#true\n}}\n"
+        ))
+        .expect("parses");
+        let launches: Vec<(&str, bool)> = (c.spawn_at_start.iter())
+            .map(|s| (s.argv[0].as_str(), s.launch))
+            .collect();
+        assert_eq!(launches, [("a", false), ("b", true), ("c", true)]);
+        assert_eq!(
+            c.binds[0].action,
+            Action::SpawnNoLaunch(vec!["menu".into(), "-x".into()])
+        );
+        assert_eq!(c.binds[1].action, Action::Spawn(vec!["e".into()]));
+        let n = line_of("\"Mod+Return\"");
+        for (line, word) in [
+            ("    \"Mod+D\" spawn \"x\" launch=1", "#true or #false"),
+            ("    \"Mod+D\" spawn \"x\" launch=#false launch=#true", "set twice"),
+            ("    \"Mod+D\" close launch=#false", "only for `spawn`"),
+            ("    \"Mod+D\" spawn \"x\" other=#false", "no properties but"),
+        ] {
+            assert_problem(&with_line(n, line), n, word);
+        }
+        assert_problem(
+            &format!("{ONE}spawn-at-start \"a\" launch=\"no\"\n"),
+            5,
+            "#true or #false",
+        );
+    }
+
+    #[test]
     fn programs_starting_with_a_dot_are_relative_to_their_file() {
         let dir = tree(&[
             (
@@ -2731,7 +2813,7 @@ mod tests {
         let (d, k) = (dir.path().display(), dir.path().join("kitty"));
         let k = k.display();
         assert_eq!(
-            c.spawn_at_start,
+            argvs(&c.spawn_at_start),
             [
                 vec![format!("{k}/bars"), "x".into()],
                 vec!["bar".to_owned()],
@@ -2745,12 +2827,12 @@ mod tests {
         );
         // A config with no file behind it has nothing to be relative to: as written.
         let c = parse(&format!("{ONE}spawn-at-start \"./bars\"\n")).expect("parses");
-        assert_eq!(c.spawn_at_start, [vec!["./bars".to_owned()]]);
+        assert_eq!(argvs(&c.spawn_at_start), [vec!["./bars".to_owned()]]);
         // A config named without a directory is in the current one: never a bare name looked up on PATH.
         let src = format!("{ONE}spawn-at-start \"./bars\"\n");
         let c = parse_file(&src, Path::new("main.kdl"), None).config.expect("parses");
         let here = std::env::current_dir().unwrap().join("bars");
-        assert_eq!(c.spawn_at_start, [vec![here.display().to_string()]]);
+        assert_eq!(argvs(&c.spawn_at_start), [vec![here.display().to_string()]]);
     }
 
     #[test]

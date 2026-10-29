@@ -377,6 +377,14 @@ impl Client {
         self.roundtrip();
     }
 
+    /// xdg_activation_v1.activate for layer surface `i` with `token`.
+    pub fn activate_layer(&mut self, i: usize, token: &str) {
+        let surface = self.state.layers[i].surface.as_ref().expect("live layer surface");
+        let activation = self.state.activation.as_ref().expect("xdg_activation_v1");
+        activation.activate(token.to_owned(), surface);
+        self.roundtrip();
+    }
+
     /// A token of this client's own, from xdg_activation_v1.get_activation_token, with `serial` (an input event's,
     /// on this client's seat) if given; no surface.
     pub fn activation_token(&mut self, serial: Option<u32>) -> String {

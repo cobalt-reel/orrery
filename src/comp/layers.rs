@@ -25,7 +25,7 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive as _, Logical, Point, Rectangle};
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
 };
@@ -49,6 +49,8 @@ pub struct Layered {
     pub output: String,
     /// It has a buffer: drawn, hit, and able to take the keyboard.
     pub mapped: bool,
+    /// It has been mapped once: its client's launch, if any, was looked for then (`claim_launch_of`).
+    pub opened: bool,
 }
 
 /// Where the stacks' focus is (monitor, its shown workspace, that workspace's focused slot, the focused window): a
@@ -121,6 +123,7 @@ impl Orrery {
             surface: LayerSurface::new(surface, namespace),
             output,
             mapped: false,
+            opened: false,
         });
     }
 
@@ -180,6 +183,10 @@ impl Orrery {
             }
         }
         self.layers[i].mapped = has_buffer;
+        if has_buffer && !self.layers[i].opened {
+            self.layers[i].opened = true;
+            self.claim_launch_of(surface);
+        }
         if self.layers_arranged(&output) || has_buffer != was_mapped {
             self.arrange();
         } else {
@@ -187,6 +194,15 @@ impl Orrery {
             self.update_keyboard_focus();
             self.update_pointer_focus();
         }
+    }
+
+    /// Whether `surface` is a layer surface's own (or one of its subsurfaces).
+    pub(super) fn is_layer_surface(&self, surface: &WlSurface) -> bool {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        self.layers.iter().any(|l| *l.surface.wl_surface() == root)
     }
 
     /// A layer surface was destroyed (or its client went): out of its map, its zone given back.
@@ -632,6 +648,7 @@ mod tests {
             Action::ShowTabs,
             Action::Workspace(2),
             Action::Spawn(vec!["x".into()]),
+            Action::SpawnNoLaunch(vec!["x".into()]),
         ] {
             assert!(!runs_over_exclusive(&other), "{other:?}");
         }

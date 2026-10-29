@@ -49,12 +49,14 @@ fn the_snippets_programs_are_the_scripts_beside_it_and_executable() {
     let path = config_with_snippet(dir.path());
     let read = config::parse_file(&std::fs::read_to_string(&path).unwrap(), &path, None);
     let c = read.config.expect("parses");
-    let mut programs: Vec<String> = c.spawn_at_start.iter().map(|argv| argv[0].clone()).collect();
+    let starts: Vec<&config::Start> = c.spawn_at_start.iter().collect();
+    assert!(starts.iter().all(|s| !s.launch), "none opens a window: {starts:?}");
+    let mut programs: Vec<String> = starts.iter().map(|s| s.argv[0].clone()).collect();
     for b in &c.binds {
-        if let Action::Spawn(argv) = &b.action
-            && argv[0].contains('/')
-        {
-            programs.push(argv[0].clone());
+        match &b.action {
+            Action::SpawnNoLaunch(argv) => programs.push(argv[0].clone()),
+            Action::Spawn(argv) => assert!(!argv[0].contains('/'), "the snippet's binds record no launch"),
+            _ => {}
         }
     }
     let ours: Vec<&String> = programs.iter().filter(|p| p.contains('/')).collect();

@@ -169,8 +169,8 @@ pub fn find_bind(binds: &[Bind], mods: Mods, sym: Keysym) -> Option<&Bind> {
     binds.iter().find(|b| matches(b, mods, sym))
 }
 
-/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs, reclaim and vt are
-/// keys only.
+/// The control-socket request an action is, so keys and `orrery msg` take one path. Show-tabs, reclaim, vt and a
+/// spawn without a launch are keys only.
 #[must_use]
 pub fn action_request(action: &Action) -> Option<Request> {
     Some(match action {
@@ -189,7 +189,7 @@ pub fn action_request(action: &Action) -> Option<Request> {
         Action::MoveToWorkspace(number) => Request::MoveToWorkspace { number: *number },
         Action::Close => Request::Close,
         Action::Quit => Request::Quit,
-        Action::ShowTabs | Action::Reclaim | Action::Vt(_) => return None,
+        Action::ShowTabs | Action::Reclaim | Action::Vt(_) | Action::SpawnNoLaunch(_) => return None,
     })
 }
 
@@ -307,6 +307,12 @@ impl Orrery {
         match action {
             Action::Reclaim => return self.input_reclaim(),
             Action::Vt(vt) => return self.switch_vt(vt),
+            Action::SpawnNoLaunch(argv) => {
+                if let Err(e) = self.spawn_with(&argv, false) {
+                    tracing::warn!("spawn (no launch): {e}");
+                }
+                return;
+            }
             _ => {}
         }
         if let Some(request) = action_request(&action) {

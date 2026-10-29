@@ -743,17 +743,11 @@ impl Orrery {
         let parent_placed = parent.is_some_and(|p| self.stacks.where_is(p).is_some());
         let first_time = self.opened_before.insert(id);
         self.launches.expire(now);
-        // The client and /proc are asked only when a launch could match.
-        let pid = (first_time && self.launches.waiting())
-            .then(|| self.client_pid(toplevel.wl_surface()))
-            .flatten();
-        let chain = pid.map_or_else(Vec::new, |pid| {
-            placement::pid_chain(pid, |p| {
-                // The name in it may be any bytes; lossy keeps the fields after it readable.
-                let stat = std::fs::read(format!("/proc/{p}/stat")).ok()?;
-                Some(String::from_utf8_lossy(&stat).into_owned())
-            })
-        });
+        let chain = if first_time {
+            self.launch_pid_chain(toplevel.wl_surface())
+        } else {
+            Vec::new()
+        };
         let mut none = Launches::default();
         let launches = if first_time { &mut self.launches } else { &mut none };
         match placement::decide(parent, parent_placed, &chain, launches, now, self.stacking) {
@@ -773,6 +767,28 @@ impl Orrery {
         }
     }
 
+    /// The pid chain (`placement::pid_chain`) of `surface`'s client; empty when no launch waits, so the client and
+    /// /proc are asked only when a launch could match.
+    fn launch_pid_chain(&self, surface: &WlSurface) -> Vec<u32> {
+        let pid = self.launches.waiting().then(|| self.client_pid(surface)).flatten();
+        pid.map_or_else(Vec::new, |pid| {
+            placement::pid_chain(pid, |p| {
+                // The name in it may be any bytes; lossy keeps the fields after it readable.
+                let stat = std::fs::read(format!("/proc/{p}/stat")).ok()?;
+                Some(String::from_utf8_lossy(&stat).into_owned())
+            })
+        })
+    }
+
+    /// A layer surface mapped for the first time: a launch of its client (or an ancestor) is used up, as a window
+    /// would use it, though nothing is placed. Otherwise a launched panel or launcher, which opens no window, would
+    /// leave its launch waiting, and the 5 s fallback would hand it the next stranger's window.
+    pub(super) fn claim_launch_of(&mut self, surface: &WlSurface) {
+        self.launches.expire(Instant::now());
+        let chain = self.launch_pid_chain(surface);
+        self.launches.claim_by_pids(&chain);
+    }
+
     /// An xdg-activation request for the window of `surface` (its own, a subsurface's or a popup's) with `token`:
     /// - a placed window bringing the token of a launch still waiting (`Launches::claim_token`) moves to that
     ///   launch's target as a new tab, shown and focused, and the launch is claimed;
@@ -780,12 +796,18 @@ impl Orrery {
     ///   window's slot when the window is what it shows; the token is spent either way;
     /// - anything else (no such token, an old, spent or unbacked one, or a window beneath) only marks the window.
     ///
-    /// Nothing beneath is ever raised, and without input behind it no request takes focus.
+    /// Nothing beneath is ever raised, and without input behind it no request takes focus. A layer surface is never
+    /// placed or focused this way, but a launch's token it brings is spent (the launch claimed), for the reason
+    /// `claim_launch_of` gives.
     pub fn activation_requested(&mut self, token: &str, surface: &WlSurface) {
+        let now = Instant::now();
         let Some(id) = self.window_of(surface) else {
+            if self.is_layer_surface(surface) {
+                self.launches.expire(now);
+                self.launches.claim_token(token, now);
+            }
             return;
         };
-        let now = Instant::now();
         self.launches.expire(now);
         self.forget_old_tokens(now);
         let placed = self.stacks.where_is(id).is_some();
@@ -1169,8 +1191,8 @@ impl Orrery {
 
     /// Starts the config's `spawn-at-start` programs, once, as `spawn` does; one that cannot start is logged.
     fn spawn_at_start(&mut self) {
-        for argv in self.config.spawn_at_start.clone() {
-            if let Err(e) = self.spawn(&argv) {
+        for start in self.config.spawn_at_start.clone() {
+            if let Err(e) = self.spawn_with(&start.argv, start.launch) {
                 tracing::warn!("spawn-at-start: {e}");
             }
         }
@@ -1614,7 +1636,7 @@ mod tests {
         std::fs::write(&main, format!("{}include \"i.kdl\"\n", config::DEFAULT)).unwrap();
         std::fs::write(&inc, "spawn-at-start \"bar\"\n").unwrap();
         let l = load_config(Some(&main));
-        assert_eq!(l.config.spawn_at_start, [vec!["bar".to_owned()]], "{:?}", l.error);
+        assert_eq!(l.config.spawn_at_start[0].argv, ["bar"], "{:?}", l.error);
         assert_eq!(l.files, [main.clone(), inc.clone()]);
         // A missing include is watched for, so that creating it reloads.
         std::fs::write(&main, format!("{}include \"g.kdl\"\n", config::DEFAULT)).unwrap();

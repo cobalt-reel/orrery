@@ -123,7 +123,7 @@ such as kitty or foot) or with `orrery msg spawn`.
 - No seat, no GPU or no connected monitor: orrery says which and exits non-zero.
 - Limits: one GPU (the boot one); no Xwayland; no hardware cursor (the pointer is drawn into each frame); no
   linux-dmabuf yet, so OpenGL clients render in software (shared memory) and Vulkan clients fail to start; scale 1,
-  each monitor at its preferred mode; no layer-shell (bars, launchers), lock or idle; touchpads keep libinput's
+  each monitor at its preferred mode; no lock or idle; touchpads keep libinput's
   defaults (no tap-to-click, no natural scrolling); keyboard LEDs (Caps Lock, Num Lock) do not light; touch and
   tablet tools are ignored, and absolute pointers (a virtual machine's, say) map onto the screen the pointer is on.
 - A monitor the kernel keeps refusing (after one reset of every output) is closed as if unplugged and stays dark
@@ -269,6 +269,13 @@ its window opens where it was started. A program written in the config starting 
 directory of the config file it is written in (so an included snippet can start the scripts beside it, see
 [A kitty desktop](#a-kitty-desktop)); its arguments are passed as written.
 
+Every start is recorded as a **launch** waiting up to 5 s for its window, and a window that cannot be matched to a
+launch by process takes the oldest waiting one. A launched program's layer surface (a panel, a launcher) uses its
+launch up when it first maps, as does a layer surface activating with a launch's token, though nothing is placed. A
+program that opens no surface at all (a toggle that signals another process and exits, say) would leave its launch
+waiting for a stranger's window: start it with `launch=#false` (on a `spawn` bind or `spawn-at-start`), which records
+no launch and hands it no token.
+
 ## The config, its reload and `orrery check`
 
 orrery looks at its config file and the files it includes once a second (modification time and size) and reloads it when
@@ -350,7 +357,8 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
 - `spawn-at-start "PROGRAM" ["ARG"...]`: run once when orrery starts, with its screens and control socket up, as a
   `spawn` bind runs it (see [Programs orrery starts](#programs-orrery-starts)); any number, in order. A `PROGRAM`
   starting with `./` or `../` (here and in `spawn` binds) is relative to the file the line is in. Never again on
-  a reload (nor when a config broken at startup is fixed by one).
+  a reload (nor when a config broken at startup is fixed by one). `launch=#false` after the arguments records no
+  launch for it (see [Programs orrery starts](#programs-orrery-starts)).
 - `binds { "COMBO" ACTION [ARGS...] }`: `COMBO` is modifiers and one key joined by `+`, e.g. `"Mod+Shift+H"`:
   modifiers `Mod`, `Alt`, `Ctrl`/`Control`, `Shift`, `Super`/`Logo`; the key is an xkb keysym name, any case
   (`H`, `Return`, `Tab`, `Space`, `1`, `F5`); the `+` key is written `plus` (`"Mod+plus"`). Write the unshifted key
@@ -369,7 +377,7 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   | `layout` | a layout name | switch the layout of the focused screen's workspace (fewer slots: the extra slots' tabs join the last) |
   | `workspace` | a number, 1 to 10 (`workspace 3`, not `"3"`) | show that workspace on its screen and focus it (made on the focused screen if new) |
   | `move-to-workspace` | a number, 1 to 10 | move the focused slot's current tab, its whole stack, to that workspace as a new tab (focus stays) |
-  | `spawn` | program, then its arguments | run it (no shell; see [Programs orrery starts](#programs-orrery-starts)) |
+  | `spawn` | program, then its arguments; optionally `launch=#false` | run it (no shell; see [Programs orrery starts](#programs-orrery-starts)); `launch=#false`: record no launch for it, the one property a bind takes |
   | `close` | | ask the focused window to close |
   | `show-tabs` | | while held: the tab strips |
   | `quit` | | stop orrery |
@@ -629,7 +637,8 @@ script or a kitty kitten driven by `orrery msg`:
   focused slot of this screen's workspace (the current one bright, titles cut to fit), right the session's machines
   (only in a session; where input is in the focus colour, one whose link is down dim) and the time. It follows
   `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
-  ends; without orrery for a minute it stops. Its panel reserves its line, so the slots start below it.
+  ends; without orrery for a minute it stops, and so it does at once when the orrery it reconnects to is another
+  one (started at the same socket after its own quit), which runs its own bars. The bars die with `bars.py`. Its panel reserves its line, so the slots start below it.
 - **A drop-down terminal** on `Mod+grave` (`dropdown`): kitty's quick-access terminal, shown and hidden by the key;
   set it up in `~/.config/kitty/quick-access-terminal.conf`.
 - **A launcher** on `Mod+D` (`launcher.sh`): fzf in a kitty panel over everything, over the desktop applications
@@ -637,7 +646,8 @@ script or a kitty kitten driven by `orrery msg`:
   Enter starts the choice through `orrery msg spawn`, so it opens as a new tab in the focused slot; Escape closes it.
   `launcher.sh --list` prints what it offers.
 - **File chooser and light/dark** through the desktop-ui kitten (below).
-- **`orrery.kdl`**, the snippet that brings it in: the two binds, the bars as `spawn-at-start`, and a
+- **`orrery.kdl`**, the snippet that brings it in: the two binds, the bars as `spawn-at-start` (each with
+  `launch=#false`: none of them opens a window), and a
   `spawn-at-start "dbus-update-activation-environment" ...` so programs D-Bus starts (portals, the kitten) see
   orrery's `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` and `ORRERY_SOCKET`.
 
@@ -655,11 +665,11 @@ include "/path/to/orrery/examples/kitty/orrery.kdl"
 The snippet's programs are written `./bars.py`, `./dropdown` and `./launcher.sh`, which orrery takes from the
 snippet's own directory (see [Programs orrery starts](#programs-orrery-starts)), so nothing goes on `PATH` and the
 scripts can stay where they are (or be copied together, snippet included, anywhere). Options for the bars' panels
-go after `./bars.py` (`spawn-at-start "./bars.py" "-o" "font_size=10"`), but a snippet line cannot be changed from
-your config: to change the snippet, copy `examples/kitty/` and include your copy. Its binds clash with yours on the
-same keys (an error naming both places); take such a bind out of your copy. `spawn-at-start` runs at startup only,
-so a newly included snippet's bars come with the next start (or run `./bars.py` from a terminal in orrery once).
-The scripts find orrery as `orrery` on `PATH`, or as `$ORRERY`.
+go after `./bars.py` (`spawn-at-start "./bars.py" "-o" "font_size=10" launch=#false`), but a snippet line cannot
+be changed from your config: to change the snippet, copy `examples/kitty/` and include your copy. Its binds clash
+with yours on the same keys (an error naming both places); take such a bind out of your copy. `spawn-at-start`
+runs at startup only, so a newly included snippet's bars come with the next start (or run `./bars.py` from a
+terminal in orrery once). The scripts find orrery as `orrery` on `PATH`, or as `$ORRERY`.
 
 ### The file chooser and light/dark: the desktop-ui kitten
 
@@ -673,16 +683,17 @@ xdg-desktop-portal installed:
    `<desktop>-portals.conf` for `XDG_CURRENT_DESKTOP=orrery` (see `man portals.conf`; with several desktop names,
    the first that has a file wins).
 2. Start the kitten's server early, before other programs, from your config (after the environment line, which the
-   snippet's include brings): `spawn-at-start "kitten" "desktop-ui" "run-server"`.
+   snippet's include brings): `spawn-at-start "kitten" "desktop-ui" "run-server" launch=#false`.
 3. Have toolkits use the portal: `GTK_USE_PORTAL=1` and `QT_QPA_PLATFORMTHEME=xdgdesktopportal` in the environment
    orrery starts with (your login's profile or `/etc/environment`), so every program it starts has them.
 4. Start orrery again (a new session, so D-Bus and the portal start with the new environment).
 
 Then `kitten desktop-ui set-color-scheme dark` (or `light`, `no-preference`, `toggle`) switches every program that
-follows the portal's colour scheme; bind it if you like (`"Mod+F10" spawn "kitten" "desktop-ui"
-"set-color-scheme" "toggle"`). Its starting values (colour scheme, accent colour, the chooser's size and kitty
-options) are in `~/.config/kitty/desktop-ui-portal.conf`. `/usr/lib/xdg-desktop-portal -r -v` (the path varies by
-distribution) logs which backend the portal picks for what, and why.
+follows the portal's colour scheme; bind it if you like:
+`"Mod+F10" spawn "kitten" "desktop-ui" "set-color-scheme" "toggle" launch=#false`. Its starting values (colour
+scheme, accent colour, the chooser's size and kitty options) are in `~/.config/kitty/desktop-ui-portal.conf`.
+`/usr/lib/xdg-desktop-portal -r -v` (the path varies by distribution) logs which backend the portal picks for what,
+and why.
 
 ## Limits
 
@@ -694,8 +705,7 @@ distribution) logs which backend the portal picks for what, and why.
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
-- Nested, one output per window, scale 1; no layer-shell, no Xwayland, no touch input (bare metal: see its
-  section).
+- Nested, one output per window, scale 1; no Xwayland, no touch input (bare metal: see its section).
 - Nested, `open-screen` holds orrery until the host has configured the new window (milliseconds).
 - Input crossing: a keyboard layout switched while input is on a satellite (a group toggle key, say) switches only
   there; the primary comes home on the layout it was on, and the next handoff sends that one.

@@ -6,7 +6,7 @@ mod support;
 
 use orrery_wm::config;
 use serde_json::Value;
-use support::client::Client;
+use support::client::{Client, LayerSpec};
 use support::{Compositor, attention, current_tabs, focused_slot, strs, tabs};
 
 const SIZE: (i32, i32) = (1280, 720);
@@ -143,6 +143,30 @@ fn a_popup_asks_for_its_toplevel() {
     let state = orrery.state();
     assert_eq!(tabs(&state)[0], [strs(&["a", "b"])]);
     assert_eq!(attention(&state)[0], [true], "{state:#}");
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
+fn a_layer_surface_with_a_launch_token_uses_the_launch_up() {
+    let (orrery, mut client) = start();
+    let a = client.create_window("a", "A");
+    assert!(client.wait_for(|s| s.windows[a].mapped()));
+    orrery.msg_ok(&["spawn", "true"]);
+    let token = launches(&orrery.state())[0]["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+    // A panel (the launch's program, say) activating with the token: nothing to move, but the launch is spent.
+    let bar = client.create_layer(&LayerSpec::bar(20));
+    assert!(client.wait_for(|s| s.layers[bar].attached.is_some()));
+    client.activate_layer(bar, &token);
+    let state = orrery.state();
+    assert_eq!(launches(&state)[0]["claimed"], true, "{state:#}");
+    // So the next stranger's window stacks instead of opening as the launch's tab.
+    let b = client.create_window("b", "B");
+    assert!(client.wait_for(|s| s.windows[b].mapped()));
+    assert_eq!(tabs(&orrery.state())[0], [strs(&["a", "b"])]);
     drop(client);
     assert!(orrery.stop().success());
 }

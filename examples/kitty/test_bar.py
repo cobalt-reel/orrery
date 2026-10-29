@@ -5,8 +5,11 @@ Pure functions only, plus a stand-in `orrery` script in a temp dir: no orrery, n
 
 import os
 import re
+import shutil
 import stat
+import subprocess
 import tempfile
+import time
 import unittest
 
 import bar
@@ -76,7 +79,14 @@ class Text(unittest.TestCase):
     def test_widths_count_cells(self):
         self.assertEqual(bar.cell_width("abc"), 3)
         self.assertEqual(bar.cell_width("日本"), 4)
-        self.assertEqual(bar.cell_width("é"), 1, "a combining accent takes no cell")
+        self.assertEqual(bar.cell_width("e\u0301"), 1, "a combining accent takes no cell")
+        self.assertEqual(bar.cell_width("a\u20dd"), 1, "nor an enclosing mark")
+        # An emoji selector after a narrow base makes it an emoji, two cells, as kitty draws it; after a wide one,
+        # nothing.
+        self.assertEqual(bar.cell_width("\u2764\ufe0f"), 2)
+        self.assertEqual(bar.cell_width("\U0001f600\ufe0f"), 2)
+        self.assertEqual(bar.cell_width("x\u2764\ufe0fy"), 4)
+        self.assertEqual(bar.truncate("\u2764\ufe0fabc", 3), "\u2764\ufe0f…")
 
     def test_truncation_ends_in_an_ellipsis_and_never_overflows(self):
         self.assertEqual(bar.truncate("hello", 5), "hello")
@@ -259,6 +269,88 @@ class Subscription(unittest.TestCase):
             self.assertNotEqual(sub.close(), 0)
 
 
+class Identity(unittest.TestCase):
+    def test_the_socket_is_orrery_socket_else_the_default(self):
+        self.assertEqual(bar.socket_path({"ORRERY_SOCKET": "/s/o.sock", "XDG_RUNTIME_DIR": "/r"}), "/s/o.sock")
+        self.assertEqual(bar.socket_path({"XDG_RUNTIME_DIR": "/r"}), "/r/orrery.sock")
+        self.assertIsNone(bar.socket_path({}))
+
+    def test_a_socket_made_again_is_another_orrery(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "orrery.sock")
+            self.assertIsNone(bar.socket_identity(path))
+            open(path, "w").close()
+            first = bar.socket_identity(path)
+            self.assertEqual(bar.socket_identity(path), first)
+            os.remove(path)
+            time.sleep(0.01)
+            open(path, "w").close()
+            self.assertNotEqual(bar.socket_identity(path), first)
+
+    def test_the_first_orrery_is_kept_and_another_is_noticed(self):
+        seen = bar.Seen()
+        self.assertTrue(seen.same((1, 2, 3)), "the first one is taken")
+        self.assertTrue(seen.same((1, 2, 3)))
+        self.assertTrue(seen.same(None), "unknown: no reason to stop")
+        self.assertFalse(seen.same((1, 2, 4)))
+        unknown = bar.Seen()
+        self.assertTrue(unknown.same(None))
+        self.assertTrue(unknown.same((1, 2, 3)), "the first known one is taken")
+
+
+class Launcher(unittest.TestCase):
+    """`launcher.sh --list` on desktop entries in a temp dir, with only the tools it needs on PATH."""
+
+    def entries(self, files):
+        with tempfile.TemporaryDirectory() as d:
+            apps = os.path.join(d, "data", "applications")
+            os.makedirs(apps)
+            for name, text in files.items():
+                with open(os.path.join(apps, name), "w") as f:
+                    f.write("[Desktop Entry]\n" + text)
+            tools = os.path.join(d, "bin")
+            os.mkdir(tools)
+            for tool in ("find", "sort", "awk", "sed", "sh"):
+                os.symlink(shutil.which(tool), os.path.join(tools, tool))
+            env = {
+                "PATH": tools,
+                "HOME": d,
+                "XDG_DATA_HOME": os.path.join(d, "data"),
+                "XDG_DATA_DIRS": os.path.join(d, "none"),
+                "XDG_CURRENT_DESKTOP": "orrery",
+            }
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh")
+            out = subprocess.run([shutil.which("sh"), script, "--list"], env=env, capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return [tuple(line.split("\t")) for line in out.stdout.splitlines() if "\tcmd\t" not in line]
+
+    def test_exec_lines_are_unescaped_and_lose_their_field_codes(self):
+        got = self.entries({
+            "a.desktop": 'Type=Application\nName=A\nExec=a --x "%u" %F 100%%\n',
+            # \s is a space and \\ a backslash (the desktop file's own escapes), then sh's quoting stays as it is.
+            "b.desktop": 'Name=B\nExec=b\\sc \\\\\\\\ "q\\\\\\\\$x"\nTerminal=true\n',
+            "c.desktop": "Name=C\nExec=c\n[Desktop Action new]\nName=Other\nExec=other\n",
+        })
+        self.assertEqual(got, [
+            ("A", "app", "a --x 100%"),
+            ("B", "term", 'b c \\\\ "q\\\\$x"'),
+            ("C", "app", "c"),
+        ])
+
+    def test_hidden_missing_and_other_desktops_entries_are_left_out(self):
+        got = self.entries({
+            "hidden.desktop": "Name=H\nExec=h\nNoDisplay=true\n",
+            "gone.desktop": "Name=G\nExec=g\nTryExec=no-such-program-here\n",
+            "gone-path.desktop": "Name=P\nExec=p\nTryExec=/no/such/program\n",
+            "there.desktop": "Name=T\nExec=t\nTryExec=awk\n",
+            "only.desktop": "Name=O\nExec=o\nOnlyShowIn=GNOME;KDE;\n",
+            "ours.desktop": "Name=U\nExec=u\nOnlyShowIn=GNOME;orrery;\n",
+            "not.desktop": "Name=N\nExec=n\nNotShowIn=orrery;\n",
+            "link.desktop": "Type=Link\nName=L\nURL=x\nExec=l\n",
+        })
+        self.assertEqual([g[0] for g in got], ["T", "U"])
+
+
 class Bars(unittest.TestCase):
     def test_screens_come_from_the_snapshot_and_workspace_and_layout_events(self):
         self.assertEqual(bars.screens_of(snapshot()), {"A", "B"})
@@ -272,6 +364,10 @@ class Bars(unittest.TestCase):
         self.assertIn("--output-name=DP-1", argv)
         self.assertIn("--edge=top", argv)
         self.assertEqual(argv[-6:], ["-o", "font_size=10", "py", "/x/bar.py", "--screen", "DP-1"])
+
+    def test_panels_are_asked_to_die_with_bars_py(self):
+        # The panel's preexec_fn: the parent-death signal (prctl, Linux; elsewhere it does nothing).
+        self.assertTrue(callable(bars.die_with_parent))
 
     def test_restarts_back_off(self):
         self.assertEqual([bars.restart_delay(n) for n in (0, 1, 2, 3, 10)], [0, 2, 4, 8, 60])

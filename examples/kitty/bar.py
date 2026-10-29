@@ -33,6 +33,39 @@ def orrery_program():
     return os.environ.get("ORRERY") or "orrery"
 
 
+def socket_path(env=os.environ):
+    """orrery's control socket, as `orrery msg` finds it: $ORRERY_SOCKET, else $XDG_RUNTIME_DIR/orrery.sock."""
+    if env.get("ORRERY_SOCKET"):
+        return env["ORRERY_SOCKET"]
+    if env.get("XDG_RUNTIME_DIR"):
+        return os.path.join(env["XDG_RUNTIME_DIR"], "orrery.sock")
+    return None
+
+
+def socket_identity(path):
+    """Which socket file `path` is now (a new orrery makes a new one at the same path), or None."""
+    try:
+        st = os.stat(path) if path else None
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_ctime_ns) if st else None
+
+
+class Seen:
+    """The orrery first connected to, by its socket's identity: a later connection to another one (started at the
+    same path after this one quit) is not ours to follow."""
+
+    def __init__(self):
+        self.first = None
+
+    def same(self, identity):
+        if identity is None:
+            return True
+        if self.first is None:
+            self.first = identity
+        return identity == self.first
+
+
 # --- text -----------------------------------------------------------------------------------------------------------
 
 
@@ -54,28 +87,49 @@ def bg(rgb):
     return f"\x1b[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m" if rgb else ""
 
 
-def char_width(c):
-    if unicodedata.combining(c):
-        return 0
-    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+EMOJI_PRESENTATION = "\ufe0f"
+
+
+def char_widths(s):
+    """Each character of `s` with the cells it takes: marks none, wide characters two, and an emoji selector one
+    more after a narrow base (it turns the base into a two-cell emoji, as kitty draws it)."""
+    out, base = [], 0  # the width of the last base character, while a selector may still widen it
+    for c in s:
+        if c == EMOJI_PRESENTATION:
+            w, base = (1 if base == 1 else 0), 0
+        elif unicodedata.category(c) in ("Mn", "Me"):
+            w = 0
+        else:
+            w = base = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        out.append((c, w))
+    return out
 
 
 def cell_width(s):
-    return sum(char_width(c) for c in s)
+    return sum(w for _, w in char_widths(s))
 
 
 def truncate(s, cells):
-    """`s` in at most `cells` cells, ending in "…" when cut."""
+    """`s` in at most `cells` cells, ending in "…" when cut (never between a character and its marks)."""
     if cell_width(s) <= cells:
         return s
     if cells <= 0:
         return ""
+    widths = char_widths(s)
     out, used = [], 0
-    for c in s:
-        w = char_width(c)
+    for i, (c, w) in enumerate(widths):
+        # A character goes with the zero-width marks after it, and with an emoji selector's extra cell.
+        if w == 0 or c == EMOJI_PRESENTATION:
+            continue
+        group = [c]
+        for c2, w2 in widths[i + 1 :]:
+            if w2 and c2 != EMOJI_PRESENTATION:
+                break
+            group.append(c2)
+            w += w2
         if used + w > cells - 1:
             break
-        out.append(c)
+        out += group
         used += w
     return "".join(out) + "…"
 
@@ -411,7 +465,7 @@ def main(argv=None):
         out.write("\r\x1b[2K" + render(model, args.screen, terminal_width(out), time.strftime("%H:%M")))
         out.flush()
 
-    backoff, lost_since = 0.5, None
+    backoff, lost_since, seen = 0.5, None, Seen()
     try:
         while True:
             sub = Subscription(orrery_program())
@@ -436,6 +490,9 @@ def main(argv=None):
                     if events is None:
                         break
                     for ev in events:
+                        if ev.get("event") == "state" and not seen.same(socket_identity(socket_path())):
+                            sub.close()
+                            return 0  # another orrery: this bar's has gone
                         model = apply(model, ev)
                         connected = connected or ev.get("event") == "state"
             sel.close()
@@ -449,8 +506,11 @@ def main(argv=None):
             time.sleep(backoff)
             backoff = min(backoff * 2, 5.0)
     finally:
-        out.write(RESET + "\x1b[?7h\x1b[?25h")
-        out.flush()
+        try:
+            out.write(RESET + "\x1b[?7h\x1b[?25h")
+            out.flush()
+        except OSError:
+            pass  # the terminal is gone
 
 
 if __name__ == "__main__":

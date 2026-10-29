@@ -1,18 +1,19 @@
 // A kitty desktop: a bar on every screen, a drop-down terminal and a launcher. Add it to your config with
 //     include "/path/to/orrery/examples/kitty/orrery.kdl"
-// Programs starting with ./ are taken from this file's directory. Needs kitty 0.43 or later, python3, and fzf for
+// Programs starting with ./ are taken from this file's directory. None of the programs here opens a window, so none
+// is recorded as a launch (launch=#false) that would wait for one. Needs kitty 0.43 or later, python3, and fzf for
 // the launcher; see "A kitty desktop" in the README.
 
 // D-Bus-started programs (portals, the desktop-ui kitten) get the session's display and desktop name. Comes with
 // D-Bus; needs a session bus (one is there when orrery runs under `dbus-run-session`).
 spawn-at-start "dbus-update-activation-environment" \
-    "WAYLAND_DISPLAY" "XDG_CURRENT_DESKTOP" "XDG_SESSION_TYPE" "ORRERY_SOCKET"
+    "WAYLAND_DISPLAY" "XDG_CURRENT_DESKTOP" "XDG_SESSION_TYPE" "ORRERY_SOCKET" launch=#false
 
 // A bar along the top of each screen, kept as screens come and go. Options after it go to `kitten panel`, e.g.
-// spawn-at-start "./bars.py" "-o" "font_size=10"
-spawn-at-start "./bars.py"
+// spawn-at-start "./bars.py" "-o" "font_size=10" launch=#false
+spawn-at-start "./bars.py" launch=#false
 
 binds {
-    "Mod+grave" spawn "./dropdown"      // kitty's quick-access terminal: shows or hides it
-    "Mod+D" spawn "./launcher.sh"       // applications and commands, through fzf
+    "Mod+grave" spawn "./dropdown" launch=#false      // kitty's quick-access terminal: shows or hides it
+    "Mod+D" spawn "./launcher.sh" launch=#false       // applications and commands, through fzf
 }

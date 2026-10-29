@@ -73,18 +73,30 @@ impl Orrery {
     /// Starts `argv` (see `command`) with a fresh xdg-activation token and records it as a launch aimed at the
     /// focused slot; the error says why it could not be started (a key logs it, `msg` answers it).
     pub fn spawn(&mut self, argv: &[String]) -> Result<(), String> {
+        self.spawn_with(argv, true)
+    }
+
+    /// `spawn`, or with `launch` false a start that records no launch and hands no token: for a program that
+    /// opens no window of its own (a toggle, a layer surface's helper), whose launch would otherwise wait for one
+    /// and take the next stranger's window.
+    pub fn spawn_with(&mut self, argv: &[String], launch: bool) -> Result<(), String> {
         // Smithay mints it; the launch keeps it. Smithay's pool holds only the client tokens orrery keeps (see
         // `token_created`), whose rules are not a launch's, so it is taken out again.
-        let token = self.xdg_activation_state.create_external_token(None).0.clone();
-        self.xdg_activation_state.remove_token(&token);
-        let token = String::from(token);
-        let Some(mut cmd) = command(argv, &self.socket_name, self.control_socket.as_deref(), Some(&token)) else {
+        let token = launch.then(|| {
+            let token = self.xdg_activation_state.create_external_token(None).0.clone();
+            self.xdg_activation_state.remove_token(&token);
+            String::from(token)
+        });
+        let control = self.control_socket.as_deref();
+        let Some(mut cmd) = command(argv, &self.socket_name, control, token.as_deref()) else {
             return Err("nothing to spawn: the argv is empty".into());
         };
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!("spawned {argv:?} (pid {})", child.id());
-                self.record_launch(child.id(), token);
+                if let Some(token) = token {
+                    self.record_launch(child.id(), token);
+                }
                 self.children.push(child);
                 Ok(())
             }
