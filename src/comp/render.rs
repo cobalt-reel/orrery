@@ -1,8 +1,10 @@
 //! Drawing one output. `scene` decides what is drawn, purely from the stacks: the top window of each slot,
 //! clipped to its slot, and the decorations (focus border, tab badges, held tab strips). `output_elements` turns
-//! that into render elements for the GL renderer, with the pointer in front where orrery draws it (`cursor_draw`):
-//! while input from the primary moves it, and on bare metal, where no host cursor stands for this machine's own.
-//! `render_output` draws them into a framebuffer (nested); bare metal hands them to its `DrmCompositor`.
+//! that into render elements for the GL renderer, between the screen's layer surfaces (background and bottom
+//! behind, top and overlay in front), with the pointer in front of everything where orrery draws it
+//! (`cursor_draw`): while input from the primary moves it, and on bare metal, where no host cursor stands for this
+//! machine's own. `render_output` draws them into a framebuffer (nested); bare metal hands them to its
+//! `DrmCompositor`.
 
 use std::rc::Rc;
 
@@ -16,13 +18,17 @@ use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, 
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind, render_elements};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::wlr_layer::Layer;
 
 use super::Orrery;
 use super::cursor_theme::Image;
+use super::layers::{ABOVE, BELOW, layer_origin};
 use crate::config::{Color, Colors};
 use crate::layout::Rect;
 use crate::stacks::{Stacks, WinId};
@@ -88,12 +94,22 @@ pub struct Scene {
     pub windows: Vec<(WinId, Rect)>,
     /// Decorations, front to back; all drawn over the windows.
     pub solids: Vec<Solid>,
+    /// The red bar of a broken config, in front of everything (layer surfaces too).
+    pub bar: Option<Solid>,
 }
 
-/// The scene for the monitor named `monitor`, its shown workspace (empty when there is none). `config_error` adds
-/// the red bar, in front of everything.
+/// The scene for the monitor named `monitor`, its shown workspace (empty when there is none), on its screen
+/// `screen` (global; the monitor's area is only what its layout divides). `config_error` adds the red bar along the
+/// screen's top.
 #[must_use]
-pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, config_error: bool) -> Scene {
+pub fn scene(
+    stacks: &Stacks,
+    monitor: &str,
+    screen: Rect,
+    colors: &Colors,
+    show_tabs: bool,
+    config_error: bool,
+) -> Scene {
     let mut out = Scene::default();
     let Some((mi, mon)) = stacks.monitors().iter().enumerate().find(|(_, m)| m.name() == monitor) else {
         return out;
@@ -101,13 +117,12 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
     let Some(ws) = stacks.shown(mi) else {
         return out;
     };
-    let area = mon.area();
     let local = |r: Rect| Rect {
-        x: r.x - area.x,
-        y: r.y - area.y,
+        x: r.x - screen.x,
+        y: r.y - screen.y,
         ..r
     };
-    let rects = ws.layout().rects(area);
+    let rects = ws.layout().rects(mon.area());
     let mut borders = Vec::new();
     let mut badges = Vec::new();
     let mut strips = Vec::new();
@@ -137,18 +152,18 @@ pub fn scene(stacks: &Stacks, monitor: &str, colors: &Colors, show_tabs: bool, c
             strips.extend(strip(rect, &tabs, slot.current(), colors));
         }
     }
-    let bar = config_error
+    out.bar = config_error
         .then(|| {
             non_empty(Rect {
                 x: 0,
                 y: 0,
-                w: area.w,
-                h: ERROR_BAR.min(area.h),
+                w: screen.w,
+                h: ERROR_BAR.min(screen.h),
             })
         })
         .flatten()
         .map(|rect| Solid { rect, color: ERROR_RED });
-    out.solids = [bar.into_iter().collect(), borders, badges, strips].concat();
+    out.solids = [borders, badges, strips].concat();
     out
 }
 
@@ -329,7 +344,8 @@ pub fn cursor_draw(drawn: bool, image: &CursorImageStatus) -> CursorDraw {
 render_elements! {
     pub OrreryElement<=GlesRenderer>;
     Window=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
-    Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
+    /// Surfaces drawn whole: the cursor's, layer surfaces' (and their popups).
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
     Image=MemoryRenderBufferRenderElement<GlesRenderer>,
     Solid=SolidColorRenderElement,
 }
@@ -339,6 +355,7 @@ render_elements! {
 #[derive(Default)]
 pub struct Decorations {
     buffers: Vec<SolidColorBuffer>,
+    bar: Vec<SolidColorBuffer>,
     cursor: Vec<SolidColorBuffer>,
     cursor_image: Option<(Rc<Image>, MemoryRenderBuffer)>,
 }
@@ -439,29 +456,59 @@ fn cursor_elements(
             let scale = Scale::from(1.0);
             render_elements_from_surface_tree(renderer, &surface, at, scale, 1.0, Kind::Cursor)
                 .into_iter()
-                .map(OrreryElement::Cursor)
+                .map(OrreryElement::Surface)
                 .collect()
         }
     }
 }
 
+/// The layer surfaces of `output` on `layers` (front to back), front to back, each with its popups in front.
+fn layer_elements(output: &Output, layers: &[Layer], renderer: &mut GlesRenderer) -> Vec<OrreryElement> {
+    let map = layer_map_for_output(output);
+    let mut out = Vec::new();
+    for &layer in layers {
+        for surface in map.layers_on(layer).rev() {
+            let Some(at) = layer_origin(&map, surface) else {
+                continue;
+            };
+            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                surface.render_elements(renderer, at.to_physical(1), Scale::from(1.0), 1.0);
+            out.extend(elements.into_iter().map(OrreryElement::Surface));
+        }
+    }
+    out
+}
+
 /// What the monitor named after `output` shows (scale 1, output-local coordinates), front to back: the pointer,
-/// decorations, then windows.
+/// the red bar, overlay and top layer surfaces, decorations, windows, bottom and background layer surfaces.
 pub fn output_elements(
     output: &str,
     state: &Orrery,
     renderer: &mut GlesRenderer,
     decorations: &mut Decorations,
 ) -> Vec<OrreryElement> {
+    let screen = state.output_named(output);
+    let geometry = screen.as_ref().and_then(|o| state.space.output_geometry(o));
+    let screen_rect = geometry.map_or_else(Rect::default, |g| Rect {
+        x: g.loc.x,
+        y: g.loc.y,
+        w: g.size.w,
+        h: g.size.h,
+    });
     let scene = scene(
         &state.stacks,
         output,
+        screen_rect,
         &state.config.colors,
         state.held.show_tabs.is_some(),
         state.config_error.is_some(),
     );
     let scale = Scale::from(1.0);
     let mut elements = cursor_elements(output, state, renderer, decorations);
+    elements.extend(solid_elements(&mut decorations.bar, scene.bar.as_slice()));
+    if let Some(screen) = &screen {
+        elements.extend(layer_elements(screen, &ABOVE, renderer));
+    }
     elements.extend(solid_elements(&mut decorations.buffers, &scene.solids));
 
     for (id, slot) in &scene.windows {
@@ -479,6 +526,9 @@ pub fn output_elements(
                 .filter_map(|e| CropRenderElement::from_element(e, scale, physical(*slot)))
                 .map(OrreryElement::from),
         );
+    }
+    if let Some(screen) = &screen {
+        elements.extend(layer_elements(screen, &BELOW, renderer));
     }
     elements
 }
@@ -629,7 +679,7 @@ mod tests {
     #[test]
     fn empty_wall_outlines_the_focused_slot_only() {
         let (s, rects, colors) = wall();
-        let scene = scene(&s, "m", &colors, true, false);
+        let scene = scene(&s, "m", AREA, &colors, true, false);
         assert!(scene.windows.is_empty());
         let r = rects[0];
         let mut edges = of_color(&scene, colors.focus);
@@ -665,10 +715,10 @@ mod tests {
         );
         assert_eq!(
             scene,
-            super::scene(&s, "m", &colors, false, false),
+            super::scene(&s, "m", AREA, &colors, false, false),
             "no strips without tabs"
         );
-        assert_eq!(super::scene(&s, "nope", &colors, true, false), Scene::default());
+        assert_eq!(super::scene(&s, "nope", AREA, &colors, true, false), Scene::default());
     }
 
     #[test]
@@ -679,7 +729,7 @@ mod tests {
         }
         s.focus_slot(crate::layout::Dir::Right);
         s.open_stacked(4);
-        let scene = scene(&s, "m", &colors, false, false);
+        let scene = scene(&s, "m", AREA, &colors, false, false);
         assert_eq!(scene.windows, [(3, rects[0]), (4, rects[3])]);
         // The border moved to the hero; slot 0 (three windows) has a badge, the hero (one) none.
         let border = of_color(&scene, colors.focus);
@@ -704,7 +754,7 @@ mod tests {
         s.workspace(2);
         s.focus_slot(crate::layout::Dir::Right);
         s.open_stacked(2);
-        let scene = scene(&s, "m", &colors, false, false);
+        let scene = scene(&s, "m", AREA, &colors, false, false);
         assert_eq!(scene.windows, [(2, rects[3])]);
         assert!(of_color(&scene, colors.focus).iter().all(|e| inside(*e, rects[3])));
     }
@@ -718,7 +768,7 @@ mod tests {
         s.open_tab(4, None, None);
         s.cycle_tab(crate::config::Cycle::Next);
         // Tabs [1, 2], [3], [4], the first current: one segment per tab, not per window.
-        let scene = scene(&s, "m", &colors, true, false);
+        let scene = scene(&s, "m", AREA, &colors, true, false);
         let r = rects[0];
         let dim = Color {
             a: (u16::from(colors.badge.a) * 2 / 5) as u8,
@@ -769,7 +819,7 @@ mod tests {
         for id in [1, 2, 3] {
             s.open_stacked(id);
         }
-        let scene = scene(&s, "m", &colors, true, false);
+        let scene = scene(&s, "m", AREA, &colors, true, false);
         let r = rects[0];
         assert_eq!(
             segments(&scene),
@@ -802,7 +852,7 @@ mod tests {
         let segment = scene.solids.iter().position(|s| s.rect.h == STRIP).expect("segment");
         assert!(first_pip < segment, "pips in front of their segment");
 
-        let hidden = super::scene(&s, "m", &colors, false, false);
+        let hidden = super::scene(&s, "m", AREA, &colors, false, false);
         assert!(of_color(&hidden, colors.background).is_empty(), "no strip, no pips");
     }
 
@@ -877,11 +927,11 @@ mod tests {
             w: 8,
             h: 8,
         };
-        let plain = scene(&s, "m", &colors, false, false);
+        let plain = scene(&s, "m", AREA, &colors, false, false);
         assert_eq!(of_color(&plain, colors.attention), [badge]);
         assert!(of_color(&plain, colors.badge).is_empty());
 
-        let held = scene(&s, "m", &colors, true, false);
+        let held = scene(&s, "m", AREA, &colors, true, false);
         let waiting = Color {
             a: (u16::from(colors.attention.a) * 7 / 10) as u8,
             ..colors.attention
@@ -898,7 +948,7 @@ mod tests {
         s.cycle_tab(crate::config::Cycle::Prev);
         s.cycle_tab(crate::config::Cycle::Next);
         s.close(2);
-        let after = scene(&s, "m", &colors, true, false);
+        let after = scene(&s, "m", AREA, &colors, true, false);
         assert!(of_color(&after, colors.attention).is_empty());
         assert!(of_color(&after, waiting).is_empty());
     }
@@ -917,7 +967,7 @@ mod tests {
             w: 8,
             h: 8,
         };
-        let held = scene(&s, "m", &colors, true, false);
+        let held = scene(&s, "m", AREA, &colors, true, false);
         assert_eq!(
             of_color(&held, colors.attention),
             [badge],
@@ -931,11 +981,11 @@ mod tests {
         let (mut s, _, colors) = wall();
         s.open_stacked(1);
         s.open_stacked(2);
-        let plain = scene(&s, "m", &colors, true, false);
-        let flagged = scene(&s, "m", &colors, true, true);
+        let plain = scene(&s, "m", AREA, &colors, true, false);
+        let flagged = scene(&s, "m", AREA, &colors, true, true);
         assert_eq!(
-            flagged.solids[0],
-            Solid {
+            flagged.bar,
+            Some(Solid {
                 rect: Rect {
                     x: 0,
                     y: 0,
@@ -943,16 +993,35 @@ mod tests {
                     h: ERROR_BAR
                 },
                 color: ERROR_RED
-            },
-            "frontmost, the output's whole width"
+            }),
+            "the output's whole width"
         );
-        assert_eq!(flagged.solids[1..], plain.solids[..], "everything else unchanged");
+        assert_eq!(plain.bar, None);
+        assert_eq!(flagged.solids, plain.solids, "everything else unchanged");
         assert_eq!(flagged.windows, plain.windows);
         assert_eq!(
-            scene(&s, "nope", &colors, false, true),
+            scene(&s, "nope", AREA, &colors, false, true),
             Scene::default(),
             "no monitor, no area"
         );
+    }
+
+    #[test]
+    fn slots_shrunk_by_layer_zones_stay_where_they_are_on_the_screen_and_the_bar_tops_the_screen() {
+        let (mut s, _, colors) = wall();
+        s.open_stacked(1);
+        let usable = Rect {
+            y: 30,
+            h: AREA.h - 30,
+            ..AREA
+        };
+        s.set_area("m", usable);
+        let scene = scene(&s, "m", AREA, &colors, false, true);
+        let first = wall().0.shown(0).unwrap().layout().rects(usable)[0];
+        assert_eq!(scene.windows, [(1, first)], "screen-local, which here is global");
+        assert_eq!(scene.windows[0].1.y, 30);
+        assert!(of_color(&scene, colors.focus).iter().all(|e| inside(*e, first)));
+        assert_eq!(scene.bar.map(|b| (b.rect.y, b.rect.w)), Some((0, AREA.w)));
     }
 
     #[test]
@@ -968,7 +1037,7 @@ mod tests {
         };
         s.add_monitor("right", area, halves);
         s.open_stacked(9);
-        let scene = scene(&s, "right", &c.colors, false, false);
+        let scene = scene(&s, "right", area, &c.colors, false, false);
         assert_eq!(
             scene.windows,
             [(

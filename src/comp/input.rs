@@ -1,12 +1,13 @@
 //! Input from a backend that has some (winit): a key press matching a bind runs its action (neither the press
-//! nor its release reaches a client), other keys go to the focused window, the pointer to the surface under it,
-//! and a click focuses the slot under it.
+//! nor its release reaches a client), other keys go to the focused window (or the layer surface holding the
+//! keyboard), the pointer to the surface under it (overlay, top, the slots' windows, bottom, background), and a
+//! click focuses the slot under it, unless it lands on a layer surface over the slots.
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
     PointerAxisEvent, PointerButtonEvent,
 };
-use smithay::desktop::WindowSurfaceType;
+use smithay::desktop::{LayerSurface, WindowSurfaceType};
 use std::collections::HashSet;
 use std::sync::PoisonError;
 
@@ -16,6 +17,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::Orrery;
+use super::layers::{ABOVE, BELOW, runs_over_exclusive};
 use crate::config::{Action, Bind, Keyboard, Mods};
 use crate::ipc::{KeyView, Request};
 use crate::layout::Rect;
@@ -225,10 +227,41 @@ pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
     Some((top, rect))
 }
 
+/// What the pointer is over: a surface, its origin (global), and the layer surface it belongs to, if any.
+pub struct Under {
+    pub surface: WlSurface,
+    pub origin: Point<f64, Logical>,
+    pub layer: Option<LayerSurface>,
+}
+
 impl Orrery {
-    /// The surface under `pos`, as drawn: only the top window of the slot holding `pos`, and only its parts
-    /// inside that slot (render clips everything, popups included, to the slot).
+    /// The surface under `pos`, as drawn (`under`).
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.under(pos).map(|u| (u.surface, u.origin))
+    }
+
+    /// What is under `pos`, as drawn, front to back: overlay and top layer surfaces, the slots' windows
+    /// (`window_under`), bottom and background layer surfaces.
+    pub fn under(&self, pos: Point<f64, Logical>) -> Option<Under> {
+        let layer = |(layer, surface, origin)| Under {
+            surface,
+            origin,
+            layer: Some(layer),
+        };
+        (self.layer_under(&ABOVE, pos).map(layer))
+            .or_else(|| {
+                (self.window_under(pos)).map(|(surface, origin)| Under {
+                    surface,
+                    origin,
+                    layer: None,
+                })
+            })
+            .or_else(|| self.layer_under(&BELOW, pos).map(layer))
+    }
+
+    /// The window surface under `pos`: only the top window of the slot holding `pos`, and only its parts inside
+    /// that slot (render clips everything, popups included, to the slot).
+    fn window_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
         let (id, slot) = top_at(&self.stacks, pos.x.floor() as i32, pos.y.floor() as i32)?;
         let window = self.windows.get(&id)?;
         // Where render puts the window's surfaces: its geometry origin at the slot's.
@@ -238,7 +271,8 @@ impl Orrery {
             .map(|(s, p)| (s, (p + origin).to_f64()))
     }
 
-    /// Decides a key's fate (see `Held`).
+    /// Decides a key's fate (see `Held`). While an `exclusive` layer surface has the keyboard, only the binds
+    /// `runs_over_exclusive` names match; every other key is the surface's.
     fn filter_key(
         &mut self,
         key_state: KeyState,
@@ -248,7 +282,9 @@ impl Orrery {
     ) -> FilterResult<Option<Action>> {
         match key_state {
             KeyState::Pressed => {
-                let bind = sym.and_then(|sym| find_bind(&self.config.binds, mods_of(mods), sym));
+                let bind = sym
+                    .and_then(|sym| find_bind(&self.config.binds, mods_of(mods), sym))
+                    .filter(|b| !self.keyboard_exclusive || runs_over_exclusive(&b.action));
                 self.last_key = Some(key_note(mods_of(mods), sym, bind.map(|b| &b.action)));
                 self.held.press(code, bind.map(|b| &b.action))
             }
@@ -399,7 +435,8 @@ impl Orrery {
     }
 
     /// A pointer button went down or up: a press first focuses the slot under the pointer (empty or not), through
-    /// the stacks; then it goes to the surface under the pointer.
+    /// the stacks, unless a layer surface over the slots is hit; a layer surface hit that takes the keyboard on demand
+    /// gets it (`layer_clicked`). Then it goes to the surface under the pointer.
     pub fn button_input(&mut self, button: u32, state: ButtonState, time: u32) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
@@ -407,8 +444,19 @@ impl Orrery {
         let serial = SERIAL_COUNTER.next_serial();
         if state == ButtonState::Pressed && !pointer.is_grabbed() {
             let at = pointer.current_location();
-            if let Some((monitor, slot)) = slot_at(&self.stacks, at.x as i32, at.y as i32) {
-                self.stacks.focus_at(&monitor, slot);
+            let layer = self.under(at).and_then(|u| u.layer);
+            let over_slots = layer.as_ref().is_some_and(|l| ABOVE.contains(&l.layer()));
+            let slot = (!over_slots)
+                .then(|| slot_at(&self.stacks, at.x as i32, at.y as i32))
+                .flatten();
+            if let Some((monitor, slot)) = &slot {
+                self.stacks.focus_at(monitor, *slot);
+                self.layer_focus = None;
+            }
+            if let Some(layer) = &layer {
+                self.layer_clicked(layer);
+            }
+            if slot.is_some() || layer.is_some() {
                 self.arrange();
             }
         }

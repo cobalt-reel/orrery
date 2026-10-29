@@ -15,7 +15,7 @@ in `examples/kitty/`. Agreed 2026-10-29. Notifications, lock and idle stay later
 - **Keyboard:** `exclusive` takes the keyboard while the surface is mapped on the top or overlay layer (a drop-down,
   a file chooser), and gives it back to the focused window when it goes; `on_demand` takes it on click; `none` never.
   Binds still work while a layer surface has the keyboard, except that `exclusive` overlays get every key but the
-  escape and quit binds.
+  escape, quit and console (`vt`) binds.
 - **Pointer:** hit-testing goes overlay → top → slots → bottom → background.
 - Popups of layer surfaces (menus) work as for windows. Layer surfaces never enter stacks, tabs or workspaces.
 - Bare metal, nested and headless alike; a removed screen closes its layer surfaces (the protocol's `closed`).

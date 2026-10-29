@@ -95,9 +95,18 @@ pub(super) fn remote_stops(source: ScrollSource, (h, v): (f64, f64)) -> (bool, b
 }
 
 impl Orrery {
-    /// This machine's screens, as global rectangles.
+    /// This machine's screens, as global rectangles: whole, layer surfaces' zones included (a monitor's area is only
+    /// what its layout divides).
     pub(super) fn screen_rects(&self) -> Vec<Rect> {
-        self.stacks.monitors().iter().map(|m| m.area()).collect()
+        (self.stacks.monitors().iter())
+            .filter_map(|m| self.space.output_geometry(&self.output_named(m.name())?))
+            .map(|g| Rect {
+                x: g.loc.x,
+                y: g.loc.y,
+                w: g.size.w,
+                h: g.size.h,
+            })
+            .collect()
     }
 
     /// An input message from the primary (`Message::is_input`): Ok with the message to answer (an InputExit), or

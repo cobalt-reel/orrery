@@ -1,5 +1,6 @@
-//! Protocol handlers: compositor, shm, xdg-shell, xdg-decoration, xdg-activation, seat, data device, output. They
-//! translate events into `Orrery` calls; placement is `Orrery::arrange`'s alone.
+//! Protocol handlers: compositor, shm, xdg-shell, xdg-decoration, xdg-activation, layer-shell, seat, data device,
+//! output. They translate events into `Orrery` calls; placement is `Orrery::arrange`'s alone (and Smithay's
+//! `LayerMap`'s for layer surfaces, see `layers`).
 
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
 use smithay::desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords};
@@ -20,6 +21,9 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
 };
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
@@ -27,8 +31,8 @@ use smithay::wayland::xdg_activation::{
     ActivationTokenData, XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration,
-    delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use super::{ClientState, Orrery};
@@ -67,6 +71,8 @@ impl CompositorHandler for Orrery {
             let has_buffer = with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
             self.toplevel_committed(id, has_buffer);
         }
+        // A layer surface's own: placed, configured, mapped or unmapped.
+        self.layer_committed(surface);
 
         self.popups.commit(surface);
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
@@ -154,21 +160,48 @@ fn answer_state_request(surface: &ToplevelSurface) {
 
 impl Orrery {
     /// Keeps a popup inside its toplevel's slot (the slot it waits for, if hidden), so menus never cover a
-    /// neighbouring tile.
+    /// neighbouring tile; a layer surface's popup inside its screen. Without a parent yet (a layer surface's popup
+    /// before `get_popup`) there is nothing to do.
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(rect) = self.id_of_surface(&root).and_then(|id| self.slot_rect_of(id)) else {
+        // The positioner wants the target relative to the parent. A toplevel sits at its slot's origin: the slot,
+        // seen from it, starts at 0,0; a layer surface's screen starts at minus its place. Less the chain's offset.
+        let slot = (self.id_of_surface(&root).and_then(|id| self.slot_rect_of(id)))
+            .map(|rect| Rectangle::new((0, 0).into(), (rect.w, rect.h).into()));
+        let Some(mut target) = slot.or_else(|| self.layer_screen_from(&root)) else {
             return;
         };
-        // The toplevel sits at its slot's origin, and the positioner wants the target relative to the parent:
-        // the slot, seen from the toplevel, starts at 0,0, less the popup chain's offset.
-        let mut target = Rectangle::new((0, 0).into(), (rect.w, rect.h).into());
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+}
+
+impl WlrLayerShellHandler for Orrery {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        output: Option<wl_output::WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        self.new_layer(surface, output, namespace);
+    }
+
+    // The popup was tracked by xdg-shell's new_popup, without a parent; now it has one, it can be kept on screen.
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
+        self.unconstrain_popup(&popup);
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        self.forget_layer(surface.wl_surface());
     }
 }
 
@@ -279,6 +312,7 @@ delegate_compositor!(Orrery);
 delegate_shm!(Orrery);
 delegate_xdg_shell!(Orrery);
 delegate_xdg_decoration!(Orrery);
+delegate_layer_shell!(Orrery);
 delegate_seat!(Orrery);
 delegate_data_device!(Orrery);
 delegate_output!(Orrery);

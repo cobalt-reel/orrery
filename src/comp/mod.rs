@@ -11,6 +11,7 @@ mod frames;
 mod handlers;
 mod input;
 pub mod ipc_server;
+mod layers;
 pub mod net;
 mod remote;
 mod render;
@@ -41,6 +42,7 @@ use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, get_parent, with_states};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState, XdgToplevelSurfaceData};
 use smithay::wayland::shm::ShmState;
@@ -362,6 +364,12 @@ pub struct Orrery {
     pub windows: HashMap<WinId, Window>,
     /// Toplevel surface -> id, so commits find their window without a scan.
     surfaces: HashMap<WlSurface, WinId>,
+    /// Every layer surface, in mapping order (the most recently mapped last); see `layers`.
+    layers: Vec<layers::Layered>,
+    /// The layer surface a click gave the keyboard, and where the stacks' focus was then (`Orrery::layer_keyboard`).
+    layer_focus: Option<(WlSurface, layers::FocusKey)>,
+    /// An `exclusive` layer surface has the keyboard: binds other than quit, reclaim and vt do not run.
+    keyboard_exclusive: bool,
     /// Windows that have committed a buffer and so are in the stacks. The rest wait, configured to the slot they
     /// would open into, without hiding anything or taking focus.
     opened: HashSet<WinId>,
@@ -421,6 +429,7 @@ pub struct Orrery {
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
     pub xdg_activation_state: XdgActivationState,
+    pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Orrery>,
@@ -457,6 +466,7 @@ impl Orrery {
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
@@ -484,6 +494,9 @@ impl Orrery {
             popups: PopupManager::default(),
             windows: HashMap::new(),
             surfaces: HashMap::new(),
+            layers: Vec::new(),
+            layer_focus: None,
+            keyboard_exclusive: false,
             opened: HashSet::new(),
             opened_before: HashSet::new(),
             pointer_seen: false,
@@ -515,6 +528,7 @@ impl Orrery {
             xdg_shell_state,
             xdg_decoration_state,
             xdg_activation_state,
+            layer_shell_state,
             shm_state,
             output_manager_state,
             seat_state,
@@ -524,26 +538,29 @@ impl Orrery {
     }
 
     /// Announces an output to clients, puts it in the space at `area` and gives it a monitor in the stacks (the
-    /// screen numbered `Stacks::next_screen_number`).
+    /// screen numbered `Stacks::next_screen_number`), whose layout divides what layer surfaces leave of it.
     pub fn add_output(&mut self, output: Output, area: Rect) {
         let global = output.create_global::<Orrery>(&self.display_handle);
         let replaced = self.output_globals.insert(output.name(), global);
         debug_assert!(replaced.is_none(), "two outputs named {}", output.name());
         self.space.map_output(&output, (area.x, area.y));
         if let Some(layout) = layout_for_output(&self.config, &output.name()) {
-            self.stacks.add_monitor(&output.name(), area, layout);
+            let usable = self.usable_area_of(&output, area);
+            self.stacks.add_monitor(&output.name(), usable, layout);
         }
         self.outputs.push(output);
         self.arrange();
     }
 
-    /// Takes an output away: its global goes (disabled now, destroyed after `GLOBAL_GRACE`), and its monitor's
-    /// workspaces move as `Stacks::remove_monitor` says. False when there is no such output.
+    /// Takes an output away: its layer surfaces are closed, its global goes (disabled now, destroyed after
+    /// `GLOBAL_GRACE`), and its monitor's workspaces move as `Stacks::remove_monitor` says. False when there is no
+    /// such output.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(i) = self.outputs.iter().position(|o| o.name() == name) else {
             return false;
         };
         let output = self.outputs.remove(i);
+        self.close_layers(&output);
         self.space.unmap_output(&output);
         if let Some(global) = self.output_globals.remove(name) {
             self.display_handle.disable_global::<Orrery>(global.clone());
@@ -609,9 +626,11 @@ impl Orrery {
         }
     }
 
-    /// An output changed size: the monitor's slots follow.
+    /// An output changed size (or place): its layer surfaces are arranged again, and the monitor's slots follow what
+    /// they leave of `area`.
     pub fn resize_output(&mut self, name: &str, area: Rect) {
-        self.stacks.set_area(name, area);
+        let usable = self.output_named(name).map_or(area, |o| self.usable_area_of(&o, area));
+        self.stacks.set_area(name, usable);
         self.arrange();
     }
 
@@ -838,14 +857,19 @@ impl Orrery {
         self.update_pointer_focus();
     }
 
+    /// The keyboard to the layer surface that should have it (`layer_keyboard`), else the focused window.
     fn update_keyboard_focus(&mut self) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
-        let want = (self.stacks.focused_window())
-            .and_then(|id| self.windows.get(&id))
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
+        let layer = self.layer_keyboard();
+        self.keyboard_exclusive = layer.as_ref().is_some_and(|(_, exclusive)| *exclusive);
+        let want = layer.map(|(surface, _)| surface).or_else(|| {
+            (self.stacks.focused_window())
+                .and_then(|id| self.windows.get(&id))
+                .and_then(|w| w.toplevel())
+                .map(|t| t.wl_surface().clone())
+        });
         if keyboard.current_focus() != want {
             keyboard.set_focus(self, want, SERIAL_COUNTER.next_serial());
         }
@@ -881,8 +905,8 @@ impl Orrery {
         pointer.frame(self);
     }
 
-    /// Per-frame housekeeping shared by the backends: forget dead windows (arranging once), refresh the space
-    /// (output enter and leave), clean popups.
+    /// Per-frame housekeeping shared by the backends: forget dead windows and layer surfaces (arranging once),
+    /// refresh the space (output enter and leave), clean popups.
     pub fn refresh(&mut self) {
         let dead: Vec<WinId> = self
             .windows
@@ -890,7 +914,8 @@ impl Orrery {
             .filter(|(_, w)| !w.alive())
             .map(|(&id, _)| id)
             .collect();
-        if !dead.is_empty() {
+        let dead_layers = self.forget_dead_layers();
+        if !dead.is_empty() || dead_layers {
             for id in dead {
                 self.forget_window(id);
             }
@@ -907,14 +932,17 @@ impl Orrery {
         self.remote_input_active() || (self.draws_pointer && !self.input_away())
     }
 
-    /// Frame callbacks for every window on `output`, and the cursor surface while it is drawn, so clients keep
-    /// drawing.
+    /// Frame callbacks for every window and layer surface on `output`, and the cursor surface while it is drawn, so
+    /// clients keep drawing.
     pub fn send_frames(&self, output: &Output) {
         let now = self.start_time.elapsed();
         for window in self.space.elements() {
             window.send_frame(output, now, Some(std::time::Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
+        }
+        for layer in smithay::desktop::layer_map_for_output(output).layers() {
+            layer.send_frame(output, now, Some(Duration::ZERO), |_, _| Some(output.clone()));
         }
         if let render::CursorDraw::Surface(surface) = render::cursor_draw(self.pointer_drawn(), &self.cursor_image) {
             smithay::desktop::utils::send_frames_surface_tree(&surface, output, now, Some(Duration::ZERO), |_, _| {
@@ -1082,6 +1110,9 @@ impl Orrery {
                 })
                 .unwrap_or_default()
         });
+        for monitor in &mut view.monitors {
+            monitor.layers = self.layer_views(&monitor.name);
+        }
         view.frames = self.frames.view();
         view.session = self.session_view().map(Box::new);
         view.last_key = self.last_key.clone();

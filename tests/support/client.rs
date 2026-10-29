@@ -1,5 +1,6 @@
 //! A tiny Wayland client for the end-to-end tests: xdg toplevels with app ids and titles, a 1×1 shm buffer each
-//! (sizes follow configures; the tests check state, not pixels), and a record of what the compositor told each one.
+//! (sizes follow configures; the tests check state, not pixels), layer surfaces (wlr-layer-shell) with a buffer of
+//! their configured size, and a record of what the compositor told each one.
 
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
@@ -11,9 +12,12 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, 
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use super::TIMEOUT;
 
+pub use zwlr_layer_shell_v1::Layer;
+pub use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity};
 pub use zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 /// What the compositor has told one toplevel.
@@ -66,12 +70,15 @@ pub struct State {
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     decorations: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     activation: Option<xdg_activation_v1::XdgActivationV1>,
+    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     /// The token the compositor gave for the last `activation_token` request.
     token: Option<String>,
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// The window with keyboard focus, and the serial of the latest wl_keyboard.enter (kept after a leave).
     pub keyboard_focus: Option<usize>,
+    /// The layer surface with keyboard focus.
+    pub keyboard_layer: Option<usize>,
     pub enter_serial: Option<u32>,
     /// wl_keyboard.key events in order: (evdev keycode, pressed).
     pub keys: Vec<(u32, bool)>,
@@ -85,6 +92,9 @@ pub struct State {
     pointer: Option<wl_pointer::WlPointer>,
     /// The window under the pointer (wl_pointer.enter, until its leave).
     pub pointer_focus: Option<usize>,
+    /// The layer surface, or popup, under the pointer.
+    pub pointer_layer: Option<usize>,
+    pub pointer_popup: Option<usize>,
     /// wl_pointer.button events in order: (button, pressed).
     pub buttons: Vec<(u32, bool)>,
     /// wl_pointer.motion events so far, and the latest one's position (surface-local).
@@ -94,6 +104,7 @@ pub struct State {
     pub globals: Vec<String>,
     pub windows: Vec<Win>,
     pub popups: Vec<Popup>,
+    pub layers: Vec<LayerSurf>,
 }
 
 /// An xdg_popup's user data, so its objects dispatch apart from the windows'.
@@ -108,6 +119,70 @@ pub struct Popup {
     buffer: Option<wl_buffer::WlBuffer>,
     pub configures: usize,
     pub done: bool,
+}
+
+/// A layer surface's user data, so its objects dispatch apart from the windows' and popups'.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerId(pub usize);
+
+/// What a layer surface asks for.
+#[derive(Debug, Clone)]
+pub struct LayerSpec {
+    pub namespace: &'static str,
+    pub layer: Layer,
+    pub anchor: Anchor,
+    /// 0 along an axis anchored on both its edges: the compositor's size.
+    pub size: (u32, u32),
+    pub exclusive_zone: i32,
+    pub keyboard: KeyboardInteractivity,
+    /// An output by its index in bind order; None leaves the choice to the compositor.
+    pub output: Option<usize>,
+}
+
+impl LayerSpec {
+    /// A bar `height` high along the top edge, reserving its height.
+    pub fn bar(height: u32) -> Self {
+        Self {
+            namespace: "bar",
+            layer: Layer::Top,
+            anchor: Anchor::Top | Anchor::Left | Anchor::Right,
+            size: (0, height),
+            exclusive_zone: i32::try_from(height).expect("a small height"),
+            keyboard: KeyboardInteractivity::None,
+            output: None,
+        }
+    }
+
+    /// `size`, centred on the screen (no anchors), on `layer`.
+    pub fn centred(namespace: &'static str, layer: Layer, size: (u32, u32)) -> Self {
+        Self {
+            namespace,
+            layer,
+            anchor: Anchor::empty(),
+            size,
+            exclusive_zone: 0,
+            keyboard: KeyboardInteractivity::None,
+            output: None,
+        }
+    }
+}
+
+/// What the compositor has told one layer surface.
+#[derive(Debug, Default)]
+pub struct LayerSurf {
+    surface: Option<wl_surface::WlSurface>,
+    layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    buffer: Option<wl_buffer::WlBuffer>,
+    /// Attach a buffer of the configured size on each configure (false: it stays unmapped).
+    auto_buffer: bool,
+    /// The size of the buffer attached right now; None while unmapped.
+    pub attached: Option<(i32, i32)>,
+    /// The latest configure's size.
+    pub size: Option<(u32, u32)>,
+    pub configures: usize,
+    pub closed: bool,
+    /// wl_surface.enter minus leave.
+    pub outputs: i32,
 }
 
 pub struct Client {
@@ -311,6 +386,111 @@ impl Client {
         self.state.token.take().expect("the token")
     }
 
+    /// A layer surface as `spec` says, given a buffer of its configured size on each configure; returns its index
+    /// in `layers`.
+    pub fn create_layer(&mut self, spec: &LayerSpec) -> usize {
+        let qh = self.queue.handle();
+        let i = self.state.layers.len();
+        let id = LayerId(i);
+        let s = &self.state;
+        let surface = s.compositor.as_ref().expect("compositor").create_surface(&qh, id);
+        let output = spec.output.map(|o| &s.outputs[o]);
+        let shell = s.layer_shell.as_ref().expect("zwlr_layer_shell_v1");
+        let layer_surface = shell.get_layer_surface(&surface, output, spec.layer, spec.namespace.to_owned(), &qh, id);
+        layer_surface.set_size(spec.size.0, spec.size.1);
+        layer_surface.set_anchor(spec.anchor);
+        layer_surface.set_exclusive_zone(spec.exclusive_zone);
+        layer_surface.set_keyboard_interactivity(spec.keyboard);
+        // The initial commit, with no buffer: the compositor answers with the first configure.
+        surface.commit();
+        self.state.layers.push(LayerSurf {
+            surface: Some(surface),
+            layer_surface: Some(layer_surface),
+            auto_buffer: true,
+            ..LayerSurf::default()
+        });
+        self.roundtrip();
+        i
+    }
+
+    /// Unmaps layer surface `i` by committing a null buffer; it stays unmapped until `remap_layer`.
+    pub fn unmap_layer(&mut self, i: usize) {
+        let l = &mut self.state.layers[i];
+        l.auto_buffer = false;
+        l.attached = None;
+        let surface = l.surface.as_ref().expect("live layer surface");
+        surface.attach(None, 0, 0);
+        surface.commit();
+        self.roundtrip();
+    }
+
+    /// After an unmap: the initial commit again; the buffer goes on with the configure that answers it.
+    pub fn remap_layer(&mut self, i: usize) {
+        let l = &mut self.state.layers[i];
+        l.auto_buffer = true;
+        l.surface.as_ref().expect("live layer surface").commit();
+        self.roundtrip();
+    }
+
+    /// A new exclusive zone for layer surface `i`, committed.
+    pub fn set_exclusive_zone(&mut self, i: usize, zone: i32) {
+        let l = &self.state.layers[i];
+        l.layer_surface
+            .as_ref()
+            .expect("live layer surface")
+            .set_exclusive_zone(zone);
+        l.surface.as_ref().expect("live layer surface").commit();
+        self.roundtrip();
+    }
+
+    pub fn destroy_layer(&mut self, i: usize) {
+        let l = &mut self.state.layers[i];
+        if let Some(ls) = l.layer_surface.take() {
+            ls.destroy();
+        }
+        if let Some(s) = l.surface.take() {
+            s.destroy();
+        }
+        if let Some(b) = l.buffer.take() {
+            b.destroy();
+        }
+        self.roundtrip();
+    }
+
+    /// A 10×10 popup on layer surface `parent` (zwlr_layer_surface_v1.get_popup), its top-left at the parent's;
+    /// returns its index in `popups`.
+    pub fn create_layer_popup(&mut self, parent: usize) -> usize {
+        let qh = self.queue.handle();
+        let i = self.state.popups.len();
+        let id = PopupId(i);
+        let s = &self.state;
+        let surface = s.compositor.as_ref().expect("compositor").create_surface(&qh, id);
+        let wm_base = s.wm_base.as_ref().expect("wm_base");
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, id);
+        let positioner = wm_base.create_positioner(&qh, ());
+        positioner.set_size(10, 10);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let popup = xdg_surface.get_popup(None, &positioner, &qh, id);
+        positioner.destroy();
+        let parent = s.layers[parent].layer_surface.as_ref().expect("live parent");
+        parent.get_popup(&popup);
+        surface.commit();
+        self.state.popups.push(Popup {
+            surface: Some(surface),
+            xdg_surface: Some(xdg_surface),
+            popup: Some(popup),
+            ..Popup::default()
+        });
+        self.roundtrip();
+        i
+    }
+
+    pub fn layer(&self, i: usize) -> &LayerSurf {
+        &self.state.layers[i]
+    }
+
     pub fn popup(&self, i: usize) -> &Popup {
         &self.state.popups[i]
     }
@@ -405,6 +585,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(6), qh, ())),
             "zxdg_decoration_manager_v1" => state.decorations = Some(registry.bind(name, 1, qh, ())),
             "xdg_activation_v1" => state.activation = Some(registry.bind(name, 1, qh, ())),
+            "zwlr_layer_shell_v1" => state.layer_shell = Some(registry.bind(name, version.min(4), qh, ())),
             "wl_seat" => state.seat = Some(registry.bind(name, version.min(5), qh, ())),
             // Without a bound wl_output, wl_surface.enter cannot be sent, and mapping could not be observed.
             "wl_output" => state.outputs.push(registry.bind(name, version.min(4), qh, ())),
@@ -613,8 +794,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Enter { serial, surface, .. } => {
                 state.enter_serial = Some(serial);
                 state.keyboard_focus = surface.data::<usize>().copied();
+                state.keyboard_layer = surface.data::<LayerId>().map(|l| l.0);
             }
-            wl_keyboard::Event::Leave { .. } => state.keyboard_focus = None,
+            wl_keyboard::Event::Leave { .. } => {
+                state.keyboard_focus = None;
+                state.keyboard_layer = None;
+            }
             wl_keyboard::Event::Key { key, state: k, .. } => {
                 state
                     .keys
@@ -643,8 +828,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { surface, .. } => state.pointer_focus = surface.data::<usize>().copied(),
-            wl_pointer::Event::Leave { .. } => state.pointer_focus = None,
+            wl_pointer::Event::Enter { surface, .. } => {
+                state.pointer_focus = surface.data::<usize>().copied();
+                state.pointer_layer = surface.data::<LayerId>().map(|l| l.0);
+                state.pointer_popup = surface.data::<PopupId>().map(|p| p.0);
+            }
+            wl_pointer::Event::Leave { .. } => {
+                state.pointer_focus = None;
+                state.pointer_layer = None;
+                state.pointer_popup = None;
+            }
             wl_pointer::Event::Motion {
                 surface_x, surface_y, ..
             } => {
@@ -656,6 +849,65 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     .buttons
                     .push((button, b == WEnum::Value(wl_pointer::ButtonState::Pressed)));
             }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerId> for State {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        &LayerId(i): &LayerId,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                layer_surface.ack_configure(serial);
+                let size = (
+                    i32::try_from(width).unwrap_or(1).max(1),
+                    i32::try_from(height).unwrap_or(1).max(1),
+                );
+                let l = &state.layers[i];
+                // A buffer of the new size, as a client redrawing for its configure does.
+                let new_buffer =
+                    (l.auto_buffer && l.attached != Some(size)).then(|| Client::buffer(state, qh, size.0, size.1));
+                let l = &mut state.layers[i];
+                l.size = Some((width, height));
+                l.configures += 1;
+                let Some(surface) = &l.surface else {
+                    return;
+                };
+                if let Some(b) = new_buffer {
+                    surface.attach(Some(&b), 0, 0);
+                    surface.damage_buffer(0, 0, size.0, size.1);
+                    if let Some(old) = l.buffer.replace(b) {
+                        old.destroy();
+                    }
+                    l.attached = Some(size);
+                }
+                surface.commit();
+            }
+            zwlr_layer_surface_v1::Event::Closed => state.layers[i].closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, LayerId> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        &LayerId(i): &LayerId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_surface::Event::Enter { .. } => state.layers[i].outputs += 1,
+            wl_surface::Event::Leave { .. } => state.layers[i].outputs -= 1,
             _ => {}
         }
     }
@@ -679,5 +931,6 @@ ignore_events!(
     xdg_positioner::XdgPositioner,
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     xdg_activation_v1::XdgActivationV1,
+    zwlr_layer_shell_v1::ZwlrLayerShellV1,
     wl_seat::WlSeat
 );

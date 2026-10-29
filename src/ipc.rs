@@ -306,6 +306,29 @@ pub struct MonitorView {
     pub layout: String,
     pub focused: bool,
     pub slots: Vec<SlotView>,
+    /// Its mapped layer surfaces, back to front as drawn.
+    #[serde(default)]
+    pub layers: Vec<LayerView>,
+}
+
+/// A layer surface (layer-shell): the namespace its client gave, its layer, where it is drawn (global
+/// coordinates), and whether it has the keyboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerView {
+    pub namespace: String,
+    pub layer: LayerName,
+    pub rect: Rect,
+    pub keyboard: bool,
+}
+
+/// The four layers, back to front: two under the slots, two over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerName {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
 }
 
 /// One workspace, wherever it is: the monitor it lives on (by name), whether that monitor shows it, and its slots
@@ -422,6 +445,7 @@ impl StateView {
                     layout: ws.layout().name.clone(),
                     focused,
                     slots: slots(ws, focused),
+                    layers: Vec::new(),
                 }
             })
             .collect();
@@ -989,6 +1013,17 @@ mod tests {
                         }],
                     }],
                 }],
+                layers: vec![LayerView {
+                    namespace: "panel".into(),
+                    layer: LayerName::Top,
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 3840,
+                        h: 30,
+                    },
+                    keyboard: false,
+                }],
             }],
             workspaces: vec![WorkspaceView {
                 number: 4,
@@ -1073,6 +1108,9 @@ mod tests {
             r#""focused_slot":1,"slots":[]}]"#
         );
         assert!(json(&r).contains(workspaces), "{}", json(&r));
+        let layers =
+            r#""layers":[{"namespace":"panel","layer":"top","rect":{"x":0,"y":0,"w":3840,"h":30},"keyboard":false}]"#;
+        assert!(json(&r).contains(layers), "{}", json(&r));
     }
 
     fn words(s: &str) -> Vec<String> {
