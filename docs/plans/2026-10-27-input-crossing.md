@@ -131,4 +131,8 @@ Known limits:
   host screen beside it lets the pointer slip out before the lock holds); the receiver's drawn cursor; focus loss
   reclaiming.
 
-Live one-machine test: pending.
+Live one-machine test, 2026-10-29: passed. Two nested orrerys side by side in a host compositor (primary left,
+satellite right): typing follows `workspace 2`; Super held across the handoff opens a terminal on the satellite;
+`Super+Escape` brings input home with nothing left pressed; the pointer crosses past the primary's right edge (the
+satellite draws its cursor) and back past the satellite's left edge; no crossing while a button is held; `Super+1`
+typed on the satellite comes home; closing the satellite while input is there brings input home at once.
