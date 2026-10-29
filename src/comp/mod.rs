@@ -2,6 +2,7 @@
 //! Wayland state. Every decision about where a window goes is made by the core (`placement` for a new one, then
 //! `Stacks`); this layer gathers the facts they need and maps, unmaps and configures what `placements()` says.
 
+mod backend_drm;
 mod backend_headless;
 mod backend_winit;
 pub mod cursor_theme;
@@ -15,6 +16,7 @@ mod remote;
 mod render;
 mod spawn;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
@@ -308,6 +310,18 @@ pub fn screen_name(base: &str, number: u8) -> String {
 /// binding it meanwhile gets no protocol error.
 const GLOBAL_GRACE: Duration = Duration::from_secs(10);
 
+/// Each screen's x in global space, from their widths in opening order: side by side from 0.
+#[must_use]
+pub fn side_by_side(widths: &[i32]) -> Vec<i32> {
+    (widths.iter())
+        .scan(0, |x, w| {
+            let at = *x;
+            *x += w;
+            Some(at)
+        })
+        .collect()
+}
+
 /// A backend's own way to open and close screens past the one it starts with, set by the backend at init. None
 /// on `Orrery` means the backend cannot (`open-screen` and `close-screen` are answered with an error).
 pub trait Screens {
@@ -358,8 +372,12 @@ pub struct Orrery {
     pub pointer_seen: bool,
     /// The surface (and its origin) the pointer was last pointed at by arrange or real motion.
     pub pointer_target: Option<(WlSurface, Point<f64, Logical>)>,
-    /// The cursor the client under the pointer asked for, drawn while input from the primary moves the pointer.
+    /// The cursor the client under the pointer asked for, drawn where orrery draws the pointer (`pointer_drawn`).
     pub cursor_image: CursorImageStatus,
+    /// The backend shows no cursor of its own (bare metal): orrery draws the pointer for this machine's input too.
+    pub draws_pointer: bool,
+    /// Where named cursors come from (loaded as they are first drawn).
+    pub cursor_theme: RefCell<cursor_theme::CursorTheme>,
     /// Keys held for binds (swallowed, show-tabs).
     pub held: input::Held,
     /// The last key press, for `state` (see `input::key_note`).
@@ -471,6 +489,8 @@ impl Orrery {
             pointer_seen: false,
             pointer_target: None,
             cursor_image: CursorImageStatus::default_named(),
+            draws_pointer: false,
+            cursor_theme: RefCell::new(cursor_theme::CursorTheme::from_env()),
             held: input::Held::default(),
             last_key: None,
             children: Vec::new(),
@@ -550,6 +570,26 @@ impl Orrery {
             .map(|g| g.loc.x + g.size.w)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Every screen side by side again in opening order, so a wider one never overlaps the next one in global space
+    /// (where pointer positions are hit-tested) and a closed one leaves no gap. The monitors of the screens that moved
+    /// follow, and that of `resized` (its size changed) even where it stayed.
+    pub fn lay_side_by_side(&mut self, resized: Option<&str>) {
+        let sizes: Vec<_> = (self.outputs.iter())
+            .map(|o| o.current_mode().map_or((0, 0), |m| (m.size.w, m.size.h)))
+            .collect();
+        let xs = side_by_side(&sizes.iter().map(|&(w, _)| w).collect::<Vec<_>>());
+        for ((output, (w, h)), x) in self.outputs.clone().into_iter().zip(sizes).zip(xs) {
+            let moved = output.current_location().x != x;
+            if moved {
+                output.change_current_state(None, None, None, Some((x, 0).into()));
+                self.space.map_output(&output, (x, 0));
+            }
+            if moved || resized == Some(output.name().as_str()) {
+                self.resize_output(&output.name(), Rect { x, y: 0, w, h });
+            }
+        }
     }
 
     /// Runs one of the backend's screen operations, `what` naming it in the error when the backend has none.
@@ -860,6 +900,13 @@ impl Orrery {
         self.popups.cleanup();
     }
 
+    /// orrery draws the pointer: input from the primary moves it, or the backend has no cursor of its own and input is
+    /// here (while it is away the pointer is held, and hidden as nested).
+    #[must_use]
+    pub fn pointer_drawn(&self) -> bool {
+        self.remote_input_active() || (self.draws_pointer && !self.input_away())
+    }
+
     /// Frame callbacks for every window on `output`, and the cursor surface while it is drawn, so clients keep
     /// drawing.
     pub fn send_frames(&self, output: &Output) {
@@ -869,9 +916,7 @@ impl Orrery {
                 Some(output.clone())
             });
         }
-        if let render::CursorDraw::Surface(surface) =
-            render::cursor_draw(self.remote_input_active(), &self.cursor_image)
-        {
+        if let render::CursorDraw::Surface(surface) = render::cursor_draw(self.pointer_drawn(), &self.cursor_image) {
             smithay::desktop::utils::send_frames_surface_tree(&surface, output, now, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
@@ -1132,12 +1177,6 @@ fn listen(display: Display<Orrery>, event_loop: &mut EventLoop<'static, Orrery>)
 pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
     let backend = (opts.backend).backend(wayland_display.as_deref(), std::env::var_os("DISPLAY").as_deref());
-    if backend == Backend::Drm {
-        bail!(
-            "the bare-metal backend (drm) is not built yet: run {NAME} inside a Wayland or X session \
-             (`--backend winit`)"
-        );
-    }
     let config_path = opts.config.clone().or_else(default_config_path);
 
     // First, before any socket of ours exists: a second orrery must refuse without side effects (one answering
@@ -1177,8 +1216,9 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     control.serve(&event_loop.handle())?;
     tracing::info!("control socket {}", control_path.display());
 
+    // After the control socket: a second orrery has refused (or joined the first) before opening a seat session.
     match backend {
-        Backend::Drm => unreachable!("refused above"),
+        Backend::Drm => backend_drm::init(&mut event_loop, &mut state)?,
         Backend::Winit => backend_winit::init(&mut event_loop, &mut state)?,
         Backend::Headless => backend_headless::init(&mut event_loop, &mut state, opts.size)?,
     }
@@ -1216,6 +1256,12 @@ mod tests {
         assert_eq!(ipc_server::socket_path_in(dir), dir.join(format!("{NAME}.sock")));
         let base = Path::new("/home/someone/.config");
         assert_eq!(config_path_in(base), base.join(NAME).join("config.kdl"));
+    }
+
+    #[test]
+    fn screens_sit_side_by_side_in_opening_order() {
+        assert_eq!(side_by_side(&[]), Vec::<i32>::new());
+        assert_eq!(side_by_side(&[1280, 800, 1920]), vec![0, 1280, 2080]);
     }
 
     #[test]

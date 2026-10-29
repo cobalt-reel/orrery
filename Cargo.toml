@@ -12,7 +12,11 @@ name = "orrery"
 path = "src/main.rs"
 
 [dependencies]
-smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "wayland_frontend", "desktop", "renderer_glow"] }
+# Nested (winit), and bare metal: DRM/KMS, GBM buffers, libinput, the seat through libseat, udev for devices.
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_winit", "wayland_frontend", "desktop", "renderer_glow",
+    "backend_drm", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev",
+] }
 calloop = { version = "0.14.5", features = ["signals"] }
 kdl = "6.7.1"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -1,22 +1,28 @@
 //! Drawing one output. `scene` decides what is drawn, purely from the stacks: the top window of each slot,
-//! clipped to its slot, and the decorations (focus border, tab badges, held tab strips). `render_output` turns
-//! that into render elements for the GL renderer, with the pointer in front while input from the primary moves it
-//! (`cursor_draw`): the host's cursor stands for this machine's own.
+//! clipped to its slot, and the decorations (focus border, tab badges, held tab strips). `output_elements` turns
+//! that into render elements for the GL renderer, with the pointer in front where orrery draws it (`cursor_draw`):
+//! while input from the primary moves it, and on bare metal, where no host cursor stands for this machine's own.
+//! `render_output` draws them into a framebuffer (nested); bare metal hands them to its `DrmCompositor`.
+
+use std::rc::Rc;
 
 use anyhow::Context;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::damage::{OutputDamageTracker, RenderOutputResult};
+use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement};
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree};
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind, render_elements};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
-use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale};
+use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::compositor::with_states;
 
 use super::Orrery;
+use super::cursor_theme::Image;
 use crate::config::{Color, Colors};
 use crate::layout::Rect;
 use crate::stacks::{Stacks, WinId};
@@ -300,22 +306,23 @@ pub fn fallback_cursor((x, y): (i32, i32)) -> [Solid; 2] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorDraw {
     None,
-    /// The built-in cursor (`fallback_cursor`).
-    Fallback,
+    /// A named cursor: the xcursor theme's image (`cursor_theme`), else the built-in one (`fallback_cursor`).
+    Named(CursorIcon),
     /// The cursor surface a client set.
     Surface(WlSurface),
 }
 
-/// What stands for the pointer: nothing while input is this machine's own (`remote` false: nested, the host's cursor
-/// stands for it), else the client's cursor surface, or the built-in cursor for a named one (orrery has no cursor
-/// theme). A cursor a client hid stays hidden.
+/// What stands for the pointer: nothing where orrery does not draw it (`drawn` false: nested input of this machine's
+/// own, the host's cursor stands for it), else the client's cursor surface, or the named cursor (the default one for a
+/// surface gone). A cursor a client hid stays hidden.
 #[must_use]
-pub fn cursor_draw(remote: bool, image: &CursorImageStatus) -> CursorDraw {
+pub fn cursor_draw(drawn: bool, image: &CursorImageStatus) -> CursorDraw {
     match image {
-        _ if !remote => CursorDraw::None,
+        _ if !drawn => CursorDraw::None,
         CursorImageStatus::Hidden => CursorDraw::None,
         CursorImageStatus::Surface(s) if s.alive() => CursorDraw::Surface(s.clone()),
-        CursorImageStatus::Named(_) | CursorImageStatus::Surface(_) => CursorDraw::Fallback,
+        CursorImageStatus::Surface(_) => CursorDraw::Named(CursorIcon::Default),
+        CursorImageStatus::Named(icon) => CursorDraw::Named(*icon),
     }
 }
 
@@ -323,15 +330,37 @@ render_elements! {
     pub OrreryElement<=GlesRenderer>;
     Window=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
+    Image=MemoryRenderBufferRenderElement<GlesRenderer>,
     Solid=SolidColorRenderElement,
 }
 
 /// Solid buffers kept across frames, so an unchanged decoration keeps its id and is not damage (and a moved one is
-/// damage only where it was and is).
+/// damage only where it was and is); the theme cursor's buffer likewise, while its image stays the same.
 #[derive(Default)]
 pub struct Decorations {
     buffers: Vec<SolidColorBuffer>,
     cursor: Vec<SolidColorBuffer>,
+    cursor_image: Option<(Rc<Image>, MemoryRenderBuffer)>,
+}
+
+impl Decorations {
+    /// The buffer holding `image`: the kept one while it is the same image, a new one (a new id) when it changed.
+    fn cursor_buffer(&mut self, image: Rc<Image>) -> MemoryRenderBuffer {
+        if let Some((kept, buffer)) = &self.cursor_image
+            && Rc::ptr_eq(kept, &image)
+        {
+            return buffer.clone();
+        }
+        // xcursor pixels are little-endian ARGB words, which is DRM's Argb8888.
+        let size = (
+            i32::try_from(image.width).unwrap_or(0),
+            i32::try_from(image.height).unwrap_or(0),
+        );
+        let buffer =
+            MemoryRenderBuffer::from_slice(&image.pixels_rgba, Fourcc::Argb8888, size, 1, Transform::Normal, None);
+        self.cursor_image = Some((image, buffer.clone()));
+        buffer
+    }
 }
 
 /// Puts `solids` into `buffers` (reusing them in order) and returns their elements.
@@ -364,9 +393,9 @@ fn cursor_elements(
     output: &str,
     state: &Orrery,
     renderer: &mut GlesRenderer,
-    buffers: &mut Vec<SolidColorBuffer>,
+    decorations: &mut Decorations,
 ) -> Vec<OrreryElement> {
-    let draw = cursor_draw(state.remote_input_active(), &state.cursor_image);
+    let draw = cursor_draw(state.pointer_drawn(), &state.cursor_image);
     let geometry = (state.outputs.iter())
         .find(|o| o.name() == output)
         .and_then(|o| state.space.output_geometry(o));
@@ -381,7 +410,25 @@ fn cursor_elements(
     let (x, y) = (local.x.floor() as i32, local.y.floor() as i32);
     match draw {
         CursorDraw::None => Vec::new(),
-        CursorDraw::Fallback => solid_elements(buffers, &fallback_cursor((x, y))),
+        CursorDraw::Named(icon) => {
+            let image = state.cursor_theme.borrow_mut().get(icon);
+            let Some(image) = image else {
+                return solid_elements(&mut decorations.cursor, &fallback_cursor((x, y)));
+            };
+            let hotspot = (
+                i32::try_from(image.xhot).unwrap_or(0),
+                i32::try_from(image.yhot).unwrap_or(0),
+            );
+            let buffer = decorations.cursor_buffer(image);
+            let at = Point::<f64, Physical>::from((f64::from(x - hotspot.0), f64::from(y - hotspot.1)));
+            match MemoryRenderBufferRenderElement::from_buffer(renderer, at, &buffer, None, None, None, Kind::Cursor) {
+                Ok(element) => vec![OrreryElement::Image(element)],
+                Err(e) => {
+                    tracing::debug!("cannot upload the cursor image: {e}");
+                    solid_elements(&mut decorations.cursor, &fallback_cursor((x, y)))
+                }
+            }
+        }
         CursorDraw::Surface(surface) => {
             let hotspot = with_states(&surface, |states| {
                 (states.data_map.get::<CursorImageSurfaceData>())
@@ -398,16 +445,14 @@ fn cursor_elements(
     }
 }
 
-/// Draws the monitor named after `output` (scale 1, output-local coordinates).
-pub fn render_output<'d>(
+/// What the monitor named after `output` shows (scale 1, output-local coordinates), front to back: the pointer,
+/// decorations, then windows.
+pub fn output_elements(
     output: &str,
     state: &Orrery,
     renderer: &mut GlesRenderer,
-    framebuffer: &mut GlesTarget<'_>,
-    damage_tracker: &'d mut OutputDamageTracker,
     decorations: &mut Decorations,
-    age: usize,
-) -> anyhow::Result<RenderOutputResult<'d>> {
+) -> Vec<OrreryElement> {
     let scene = scene(
         &state.stacks,
         output,
@@ -416,8 +461,7 @@ pub fn render_output<'d>(
         state.config_error.is_some(),
     );
     let scale = Scale::from(1.0);
-    // Front to back: the pointer, decorations, then windows.
-    let mut elements = cursor_elements(output, state, renderer, &mut decorations.cursor);
+    let mut elements = cursor_elements(output, state, renderer, decorations);
     elements.extend(solid_elements(&mut decorations.buffers, &scene.solids));
 
     for (id, slot) in &scene.windows {
@@ -436,15 +480,28 @@ pub fn render_output<'d>(
                 .map(OrreryElement::from),
         );
     }
+    elements
+}
 
+/// What shows where nothing is drawn.
+#[must_use]
+pub fn clear_color(state: &Orrery) -> Color32F {
+    color32f(state.config.colors.background)
+}
+
+/// Draws the monitor named after `output` (`output_elements`) into `framebuffer`.
+pub fn render_output<'d>(
+    output: &str,
+    state: &Orrery,
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut GlesTarget<'_>,
+    damage_tracker: &'d mut OutputDamageTracker,
+    decorations: &mut Decorations,
+    age: usize,
+) -> anyhow::Result<RenderOutputResult<'d>> {
+    let elements = output_elements(output, state, renderer, decorations);
     damage_tracker
-        .render_output(
-            renderer,
-            framebuffer,
-            age,
-            &elements,
-            color32f(state.config.colors.background),
-        )
+        .render_output(renderer, framebuffer, age, &elements, clear_color(state))
         .context("rendering the output")
 }
 
@@ -498,15 +555,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_is_drawn_only_for_remote_input_and_never_one_a_client_hid() {
-        use smithay::input::pointer::{CursorIcon, CursorImageStatus};
-        let named = CursorImageStatus::Named(CursorIcon::Default);
+    fn a_cursor_is_drawn_only_where_orrery_draws_it_and_never_one_a_client_hid() {
+        let named = CursorImageStatus::Named(CursorIcon::Text);
         assert_eq!(
             cursor_draw(false, &named),
             CursorDraw::None,
             "the host's cursor stands for local input"
         );
-        assert_eq!(cursor_draw(true, &named), CursorDraw::Fallback);
+        assert_eq!(cursor_draw(true, &named), CursorDraw::Named(CursorIcon::Text));
         assert_eq!(cursor_draw(true, &CursorImageStatus::Hidden), CursorDraw::None);
     }
 

@@ -204,7 +204,7 @@ impl SeatHandler for Orrery {
         &mut self.seat_state
     }
 
-    /// Kept for drawing the pointer while input from the primary moves it (`render::cursor_draw`).
+    /// Kept for drawing the pointer where orrery draws it (`Orrery::pointer_drawn`, `render::cursor_draw`).
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
         self.cursor_image = image;
     }

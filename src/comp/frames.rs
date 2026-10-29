@@ -10,6 +10,14 @@ use crate::ipc::FramesView;
 pub const WINDOW: usize = 4096;
 /// The info log line comes at most this often.
 pub const LOG_EVERY: Duration = Duration::from_secs(10);
+/// A screen's failed frames are logged at most this often: one that keeps failing would fill the log at 60 Hz.
+pub const WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// Whether a failed frame is logged, the last one having been logged at `last`.
+#[must_use]
+pub fn warn_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= WARN_EVERY)
+}
 
 pub struct FrameStats {
     count: u64,
@@ -80,6 +88,14 @@ impl FrameStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failing_screen_is_logged_once_per_ten_seconds() {
+        let t = Instant::now();
+        assert!(warn_due(None, t), "the first failure");
+        assert!(!warn_due(Some(t), t + Duration::from_secs(9)));
+        assert!(warn_due(Some(t), t + Duration::from_secs(10)));
+    }
 
     #[test]
     fn statistics_over_the_window_and_a_log_line_every_ten_seconds() {

@@ -74,15 +74,13 @@ use smithay::reexports::winit::window::{CursorGrabMode, Window as WinitWindow, W
 use smithay::utils::{Clock, Monotonic, Physical, Rectangle, Size, Transform};
 use wayland_egl::WlEglSurface;
 
+use super::frames::{WARN_EVERY, warn_due};
 use super::{Orrery, render, screen_name};
 use crate::NAME;
 use crate::layout::Rect;
 
 /// How often housekeeping runs, clients get frame callbacks and redraws are requested: about 60 Hz.
 const FRAME: Duration = Duration::from_millis(16);
-
-/// A window's failed frames are logged at most this often: one that keeps failing would fill the log at 60 Hz.
-const WARN_EVERY: Duration = Duration::from_secs(10);
 
 /// Every screen's output is called this, numbered from the second on (`screen_name`).
 const BASE: &str = "winit";
@@ -351,7 +349,7 @@ fn unqueue(opening: &mut Vec<Output>, name: &str) -> bool {
 /// Takes output `name` away and lays the others side by side again.
 fn remove_screen(state: &mut Orrery, name: &str) {
     state.remove_output(name);
-    lay_side_by_side(state, None);
+    state.lay_side_by_side(None);
 }
 
 /// What the pump saw, kept until the event source can hand it to `handle` with the state.
@@ -426,32 +424,13 @@ fn handle(host: &RefCell<Host>, state: &mut Orrery, event: HostEvent) {
     }
 }
 
-/// Output `name` follows its window's new size; every screen is laid side by side again (`lay_side_by_side`).
+/// Output `name` follows its window's new size; every screen is laid side by side again
+/// (`Orrery::lay_side_by_side`).
 fn resize_screen(state: &mut Orrery, name: &str, size: Size<i32, Physical>) {
     if let Some(output) = state.outputs.iter().find(|o| o.name() == name) {
         output.change_current_state(Some(Mode { size, refresh: 60_000 }), None, None, None);
     }
-    lay_side_by_side(state, Some(name));
-}
-
-/// Every screen side by side again in opening order, so a wider window never overlaps the next one in global space
-/// (where pointer positions are hit-tested) and a closed one leaves no gap. The monitors of the screens that moved
-/// follow, and that of `resized` (its size changed) even where it stayed.
-fn lay_side_by_side(state: &mut Orrery, resized: Option<&str>) {
-    let sizes: Vec<_> = (state.outputs.iter())
-        .map(|o| o.current_mode().map_or((0, 0), |m| (m.size.w, m.size.h)))
-        .collect();
-    let xs = side_by_side(&sizes.iter().map(|&(w, _)| w).collect::<Vec<_>>());
-    for ((output, (w, h)), x) in state.outputs.clone().into_iter().zip(sizes).zip(xs) {
-        let moved = output.current_location().x != x;
-        if moved {
-            output.change_current_state(None, None, None, Some((x, 0).into()));
-            state.space.map_output(&output, (x, 0));
-        }
-        if moved || resized == Some(output.name().as_str()) {
-            state.resize_output(&output.name(), Rect { x, y: 0, w, h });
-        }
-    }
+    state.lay_side_by_side(Some(name));
 }
 
 /// One frame of window `id`, on its `RedrawRequested` only (see the module doc): render, and submit (swap) only
@@ -515,11 +494,6 @@ fn draw(host: &mut Host, id: WindowId, state: &mut Orrery) {
             }
         }
     }
-}
-
-/// Whether a failed frame is logged, the last one having been logged at `last`.
-fn warn_due(last: Option<Instant>, now: Instant) -> bool {
-    last.is_none_or(|t| now.duration_since(t) >= WARN_EVERY)
 }
 
 /// Swaps the window's surface (current since `draw`), with `pre_present_notify` first: it asks the host for the
@@ -1003,17 +977,6 @@ impl<T> Table<T> {
     }
 }
 
-/// Each screen's x in global space, from their widths in opening order: side by side from 0.
-fn side_by_side(widths: &[i32]) -> Vec<i32> {
-    (widths.iter())
-        .scan(0, |x, w| {
-            let at = *x;
-            *x += w;
-            Some(at)
-        })
-        .collect()
-}
-
 /// Damage in GL's bottom-up coordinates, as EGL's swap with damage wants it, on a surface `height` tall.
 fn flipped(damage: &[Rectangle<i32, Physical>], height: i32) -> Vec<Rectangle<i32, Physical>> {
     (damage.iter())
@@ -1083,20 +1046,6 @@ mod tests {
         assert!(!unqueue(&mut opening, "winit-2"), "once");
         assert!(!unqueue(&mut opening, "winit"), "not queued");
         assert_eq!(opening.iter().map(Output::name).collect::<Vec<_>>(), ["winit-3"]);
-    }
-
-    #[test]
-    fn a_failing_window_is_logged_once_per_ten_seconds() {
-        let t = Instant::now();
-        assert!(warn_due(None, t), "the first failure");
-        assert!(!warn_due(Some(t), t + Duration::from_secs(9)));
-        assert!(warn_due(Some(t), t + Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn screens_sit_side_by_side_in_opening_order() {
-        assert_eq!(side_by_side(&[]), Vec::<i32>::new());
-        assert_eq!(side_by_side(&[1280, 800, 1920]), vec![0, 1280, 2080]);
     }
 
     #[test]

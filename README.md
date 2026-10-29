@@ -18,12 +18,14 @@ workspace has its own layout, slots, tabs and focused slot, starting from its sc
 else the first layout); a layout switch changes only the workspace shown. A workspace neither locked, shown nor
 holding a window goes away. Windows of a hidden workspace are unmapped but keep their slot's size, so showing them
 again is instant. When a screen goes, its workspaces move intact to the focused remaining screen, hidden there.
+On bare metal each connected monitor is a screen, coming and going as monitors are plugged in and out.
 Nested, each screen is one orrery window: `open-screen` (or a second `orrery run`) opens another, which the host
 places and sizes like any window, and closing one takes its screen away. Headless (tests) orrery opens and closes
 screens on request too (`open-screen`, `close-screen`).
 
-For now orrery runs **nested**, as a window inside another Wayland compositor, or **headless** (no screen) for
-tests. The design and the build order ahead are in `docs/plans/2026-10-26-orrery-design.md`.
+orrery runs on **bare metal** (DRM/KMS and libinput, started from a text console), **nested** as a window inside
+another Wayland compositor, or **headless** (no screen) for tests. The design and the build order ahead are in
+`docs/plans/2026-10-26-orrery-design.md`.
 
 ## Build and test
 
@@ -63,7 +65,7 @@ size), and `--debug-inject` (a testing aid, off by default: orrery then answers 
 
 `--backend`: `auto` (the default) runs nested (`winit`) when `WAYLAND_DISPLAY` or `DISPLAY` is set and bare metal
 (`drm`) otherwise, from a text console; `winit` and `drm` force one; `headless` has no screen and no input devices
-(tests). The bare-metal backend is not built yet: `drm` (and `auto` outside a session) says so and exits.
+(tests). Bare metal has a section of its own below.
 
 A second `orrery run` on the same control socket does not start another orrery: it asks the running one for one
 more screen (`open-screen`), prints the answer and exits, 0 if it was opened (its other options are not used).
@@ -91,6 +93,37 @@ windowrule = render_unfocused on, match:class ^(orrery)$
 
 These match every orrery window: with several screens, leave out the `workspace` rule (or move the windows by hand
 afterwards), or every screen lands on the same host workspace.
+
+## Bare metal
+
+```sh
+orrery run      # from a text console: `auto` picks bare metal there (or force it: `--backend drm`)
+```
+
+Requirements: a seat, from logind, elogind or seatd (orrery opens the GPU and the input devices through it, never
+directly, and needs no privileges), a GPU with KMS and GBM (Mesa), and a text console: log in on a free one
+(`Ctrl+Alt+F3`, or `doas chvt 3` / `sudo chvt 3` from a running session) and run `orrery run` there. stdout prints
+`WAYLAND_DISPLAY=...` as nested, logs go to stderr (redirect them to a file to keep them off the console:
+`orrery run 2>/tmp/orrery.log`). Clients are started from inside with `Super+Return` (a terminal that runs on Wayland,
+such as kitty or foot) or with `orrery msg spawn`.
+
+- **Screens:** every connected monitor at its preferred mode, named after its connector as the kernel names it
+  (`DP-3`, `HDMI-A-1`, `eDP-1`; `monitor "DP-3" layout="..."` rules match), side by side in the order they were
+  found. Plugging one in adds a screen (the lowest free number), unplugging one takes it away with its workspaces
+  moving as for any screen; the others close the gap. `open-screen` and `close-screen` answer that the monitors
+  decide, and so does a second `orrery run` (it joins the running orrery, which says so).
+- **Input:** keyboards, mice and touchpads through libinput, with the `keyboard` block (or `XKB_DEFAULT_*`). The pointer
+  moves over the screens and stops at their edges (in a session of linked machines, pushed past the outer edges it
+  crosses as nested). orrery draws the pointer: the cursor the client under it asked for, else the named cursor from
+  the xcursor theme (`XCURSOR_THEME` and `XCURSOR_SIZE`, default `default` and 24), else a small light square.
+- **Consoles:** `Super+Ctrl+F1` ... `F12` and `Ctrl+Alt+F1` ... `F12` switch consoles (they are binds, so they work
+  with any `mod`). Switching away pauses orrery: it stops drawing and reading input, and lets go of every key and
+  button held; switching back redraws everything (monitors plugged meanwhile are picked up then).
+- `Super+Shift+E` quits, giving the console back; so does a crash (the seat restores it).
+- No seat, no GPU or no connected monitor: orrery says which and exits non-zero.
+- Limits: one GPU (the boot one); no Xwayland; no hardware cursor (the pointer is drawn into each frame); no
+  linux-dmabuf yet, so clients render in software (shared memory); scale 1, each monitor at its preferred mode; no
+  layer-shell (bars, launchers), lock or idle.
 
 ## Default keys
 
@@ -484,7 +517,7 @@ as if typed on it. The satellite's own keyboard and pointer keep working on it a
   sends its relative motion; on return it is let go and shown where it came in. Pointer crossing nested needs the
   host's relative-pointer protocol (most Wayland compositors have it; X11 reports raw motion): pushing past orrery's
   outer edge counts. Headless there is nothing to hold. The machine input went to draws the pointer itself while it
-  has it: the client's cursor, or a plain square where a client names one (orrery has no cursor theme).
+  has it: the client's cursor, or where a client names one, that cursor from the xcursor theme (else a plain square).
 - **Motion merges, keys never do:** when a link stalls, pointer movement waiting for it merges into one step and is
   never replayed late, and so does touchpad scroll (its stop kept apart); keys, buttons and wheel steps all arrive,
   in order. The satellite acknowledges the input it ran,
@@ -510,7 +543,7 @@ Put the `desk` window against the right edge of a host monitor (the host stops i
 it; at a window edge with more host screen beside it, the pointer slips out before the lock takes hold) and `side`'s
 anywhere visible. Open a terminal in each (`Super+Return`) and hand `desk` the keys. Both nested windows also take
 the host's input directly when they have it, so drive everything from `desk`'s window. While input is on `side` it
-draws the pointer itself: the cursor its client under it asked for, else a small light square in a dark outline.
+draws the pointer itself: the cursor its client under it asked for, else the theme's (or a small light square).
 
 - [ ] `Super+2` on `desk`: `state` shows `input` and the marker on `side`; typing lands in `side`'s terminal, in
       `desk`'s layout; the host's pointer is hidden and stays put.
@@ -525,14 +558,15 @@ draws the pointer itself: the cursor its client under it asked for, else a small
 ## Limits
 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
-- The host's cursor stands for orrery's own pointer: orrery draws a cursor only for a pointer moved from another
-  machine (the client's cursor surface, or a plain square for a named cursor: no cursor theme).
+- Nested, the host's cursor stands for orrery's own pointer: orrery draws a cursor only for a pointer moved from
+  another machine. Bare metal it always draws it (see Bare metal).
 - No popup grabs: menus open and work, but a click elsewhere does not dismiss them by itself.
 - Maximize and fullscreen requests are ignored: a window is always its slot's size.
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
-- Nested, one output per window, scale 1; no layer-shell, no Xwayland, no touch input.
+- Nested, one output per window, scale 1; no layer-shell, no Xwayland, no touch input (bare metal: see its
+  section).
 - Nested, `open-screen` holds orrery until the host has configured the new window (milliseconds).
 - Input crossing: a keyboard layout switched while input is on a satellite (a group toggle key, say) switches only
   there; the primary comes home on the layout it was on, and the next handoff sends that one.
@@ -610,3 +644,25 @@ workspace 1.
 - [ ] `orrery run` again: the new window is `winit-2` again and takes workspace 2 back.
 - [ ] Close the first window: `winit-2` remains, with workspace 1 hidden on it. Close that one too: orrery quits
       and `$XDG_RUNTIME_DIR/orrery.sock` is gone.
+
+## Bare metal: checklist
+
+On a machine whose own desktop session keeps running on its console. Copy the example config to a scratch file
+first (`cp examples/config.kdl /tmp/orrery-try.kdl`), and have a Wayland terminal installed (kitty or foot).
+
+- [ ] Switch to a free console: `doas chvt 3` from the desktop session (or `Ctrl+Alt+F3`), and log in.
+- [ ] `./target/release/orrery run --config /tmp/orrery-try.kdl 2>/tmp/orrery.log` (auto picks bare metal): every
+      monitor shows orrery's background and the focused slot's border; `/tmp/orrery.log` names the GPU and each
+      screen (`DP-3: 2560x1440 at 59.95 Hz`, say). The pointer moves (the theme's arrow, or a small square) and stops
+      at the screens' edges.
+- [ ] `Super+Return`: a terminal opens in the top-left slot and takes typing; the pointer over it shows its cursor
+      (a text beam over the text, say).
+- [ ] With two monitors: move the pointer to the other one and click into it; `Super+2` and `Super+1` move the
+      focus between screens; `Super+Shift+2` moves the focused terminal there.
+- [ ] `Super+Ctrl+F<n>` (the desktop session's console, often 1 or 2; `Ctrl+Alt+F<n>` too): the desktop session is
+      back and works normally (no stuck keys). Return to console 3 (`Ctrl+Alt+F3`, or `doas chvt 3`): orrery
+      redraws everything, the terminal still takes typing, nothing is held down.
+- [ ] If possible, unplug a monitor: its screen goes, its workspaces move to the remaining one (`Super+<n>` shows
+      them), the pointer stays on the screens. Plug it back in: the screen comes back and takes its workspace again.
+- [ ] From the terminal in orrery, `orrery msg state` lists the monitors by connector name.
+- [ ] `Super+Shift+E`: orrery quits, the console comes back as it was; switch back to the desktop session.
