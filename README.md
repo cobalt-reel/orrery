@@ -265,7 +265,9 @@ one), detached (a process group of its own, no stdin, stdout or stderr), in orre
 `XDG_CURRENT_DESKTOP=orrery` and `XDG_SESSION_TYPE=wayland`, which portals, toolkits and desktop entries read;
 `ORRERY_SOCKET` set to orrery's control socket, which `orrery msg` uses when not given `--socket` (so a program talks
 to the orrery that started it); and an xdg-activation token as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`, so
-its window opens where it was started.
+its window opens where it was started. A program written in the config starting with `./` or `../` is taken from the
+directory of the config file it is written in (so an included snippet can start the scripts beside it, see
+[A kitty desktop](#a-kitty-desktop)); its arguments are passed as written.
 
 ## The config, its reload and `orrery check`
 
@@ -346,7 +348,8 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   follows includes. An included bind cannot be overridden: binding its keys to something else is an error naming
   both places, so change such a bind by removing it from the snippet (or not including the snippet).
 - `spawn-at-start "PROGRAM" ["ARG"...]`: run once when orrery starts, with its screens and control socket up, as a
-  `spawn` bind runs it (see [Programs orrery starts](#programs-orrery-starts)); any number, in order. Never again on
+  `spawn` bind runs it (see [Programs orrery starts](#programs-orrery-starts)); any number, in order. A `PROGRAM`
+  starting with `./` or `../` (here and in `spawn` binds) is relative to the file the line is in. Never again on
   a reload (nor when a config broken at startup is fixed by one).
 - `binds { "COMBO" ACTION [ARGS...] }`: `COMBO` is modifiers and one key joined by `+`, e.g. `"Mod+Shift+H"`:
   modifiers `Mod`, `Alt`, `Ctrl`/`Control`, `Shift`, `Super`/`Logo`; the key is an xkb keysym name, any case
@@ -614,6 +617,73 @@ draws the pointer itself: the cursor its client under it asked for, else the the
 - [ ] With input on `side`, `Super+1`: back on `desk`.
 - [ ] With input on `side`, quit `side` (`orrery msg --socket /tmp/orrery-side.sock quit`): input comes home at once.
 
+## A kitty desktop
+
+`examples/kitty/` turns orrery and [kitty](https://sw.kovidgoyal.net/kitty/) into a small desktop, each part a
+script or a kitty kitten driven by `orrery msg`:
+
+- **A bar** along the top of every screen (`bars.py` starts `bar.py` in a `kitten panel` per screen, and keeps one
+  per screen as screens come and go): left the workspaces (the one this screen shows highlighted, in a block when the
+  screen has the focus; one shown on another screen in the badge colour; occupied ones plain, empty ones dim; one
+  asking for attention in the attention colour; in a session, other machines' numbers dim), middle the tabs of the
+  focused slot of this screen's workspace (the current one bright, titles cut to fit), right the session's machines
+  (only in a session; where input is in the focus colour, one whose link is down dim) and the time. It follows
+  `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
+  ends; without orrery for a minute it stops. Its panel reserves its line, so the slots start below it.
+- **A drop-down terminal** on `Mod+grave` (`dropdown`): kitty's quick-access terminal, shown and hidden by the key;
+  set it up in `~/.config/kitty/quick-access-terminal.conf`.
+- **A launcher** on `Mod+D` (`launcher.sh`): fzf in a kitty panel over everything, over the desktop applications
+  (desktop entries in `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, hidden ones left out) and the commands on `PATH`.
+  Enter starts the choice through `orrery msg spawn`, so it opens as a new tab in the focused slot; Escape closes it.
+  `launcher.sh --list` prints what it offers.
+- **File chooser and light/dark** through the desktop-ui kitten (below).
+- **`orrery.kdl`**, the snippet that brings it in: the two binds, the bars as `spawn-at-start`, and a
+  `spawn-at-start "dbus-update-activation-environment" ...` so programs D-Bus starts (portals, the kitten) see
+  orrery's `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` and `ORRERY_SOCKET`.
+
+**Needs** kitty 0.43 or later (`kitten panel`, `kitten quick-access-terminal`), python3 (the bar; standard library
+only), fzf (the launcher) and, for the environment line, `dbus-update-activation-environment` (it comes with D-Bus)
+with a session bus: run orrery as `dbus-run-session orrery run` when your login has none. On a systemd login, add
+`"--systemd"` after the program name in that line so user units get the variables too.
+
+**To use it**, add one line to your config (an absolute path, `~/...`, or relative to your config file):
+
+```kdl
+include "/path/to/orrery/examples/kitty/orrery.kdl"
+```
+
+The snippet's programs are written `./bars.py`, `./dropdown` and `./launcher.sh`, which orrery takes from the
+snippet's own directory (see [Programs orrery starts](#programs-orrery-starts)), so nothing goes on `PATH` and the
+scripts can stay where they are (or be copied together, snippet included, anywhere). Options for the bars' panels
+go after `./bars.py` (`spawn-at-start "./bars.py" "-o" "font_size=10"`), but a snippet line cannot be changed from
+your config: to change the snippet, copy `examples/kitty/` and include your copy. Its binds clash with yours on the
+same keys (an error naming both places); take such a bind out of your copy. `spawn-at-start` runs at startup only,
+so a newly included snippet's bars come with the next start (or run `./bars.py` from a terminal in orrery once).
+The scripts find orrery as `orrery` on `PATH`, or as `$ORRERY`.
+
+### The file chooser and light/dark: the desktop-ui kitten
+
+kitty's `desktop-ui` kitten is an xdg-desktop-portal backend: programs that ask the portal for a file chooser get
+kitty's `choose-files` kitten in a panel, and the portal's light/dark setting is the kitten's. With
+xdg-desktop-portal installed:
+
+1. Inside orrery (so `XDG_CURRENT_DESKTOP` is `orrery`), run `kitten desktop-ui enable-portal`. It registers the
+   kitten with D-Bus and writes the portal configuration for this desktop name. If the portal still picks other
+   backends, put `examples/kitty/orrery-portals.conf` in `~/.config/xdg-desktop-portal/`: xdg-desktop-portal reads
+   `<desktop>-portals.conf` for `XDG_CURRENT_DESKTOP=orrery` (see `man portals.conf`; with several desktop names,
+   the first that has a file wins).
+2. Start the kitten's server early, before other programs, from your config (after the environment line, which the
+   snippet's include brings): `spawn-at-start "kitten" "desktop-ui" "run-server"`.
+3. Have toolkits use the portal: `GTK_USE_PORTAL=1` and `QT_QPA_PLATFORMTHEME=xdgdesktopportal` in the environment
+   orrery starts with (your login's profile or `/etc/environment`), so every program it starts has them.
+4. Start orrery again (a new session, so D-Bus and the portal start with the new environment).
+
+Then `kitten desktop-ui set-color-scheme dark` (or `light`, `no-preference`, `toggle`) switches every program that
+follows the portal's colour scheme; bind it if you like (`"Mod+F10" spawn "kitten" "desktop-ui"
+"set-color-scheme" "toggle"`). Its starting values (colour scheme, accent colour, the chooser's size and kitty
+options) are in `~/.config/kitty/desktop-ui-portal.conf`. `/usr/lib/xdg-desktop-portal -r -v` (the path varies by
+distribution) logs which backend the portal picks for what, and why.
+
 ## Limits
 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
@@ -725,3 +795,35 @@ first (`cp examples/config.kdl /tmp/orrery-try.kdl`), and have a Wayland termina
       them), the pointer stays on the screens. Plug it back in: the screen comes back and takes its workspace again.
 - [ ] From the terminal in orrery, `orrery msg state` lists the monitors by connector name.
 - [ ] `Super+Shift+E`: orrery quits, the console comes back as it was; switch back to the desktop session.
+
+## A kitty desktop: checklist
+
+Nested (as in the first checklist) and then bare metal, with kitty 0.43 or later, python3 and fzf installed. Add the
+snippet to the scratch config first:
+
+```sh
+echo "include \"$PWD/examples/kitty/orrery.kdl\"" >> /tmp/orrery-try.kdl
+./target/release/orrery check --config /tmp/orrery-try.kdl      # ok
+```
+
+- [ ] Start orrery: a one-line bar runs along the top of the screen, in orrery's background colour; the slots start
+      below it (`orrery msg state`: slot 0's `y` is the bar's height). It shows `1` highlighted and the time.
+- [ ] `Super+Return` twice with `Super+S` between (two tabs): the bar's middle shows both titles, the current one
+      bright; `Super+Tab` moves the brightness; `vim` in one changes its title there.
+- [ ] `Super+3`: the bar shows `1` plain (occupied), `3` highlighted; `Super+1` back. A window asking for
+      attention on a hidden workspace (in a kitty there, `sleep 3; printf '\a'`, then `Super+2` at once: its bell
+      asks) turns its number to the attention colour.
+- [ ] Narrow the window (nested): the titles shorten with `…`, the time stays; widen it: they come back.
+- [ ] Change `colors { focus ... }` in the config: the bar recolours within a second.
+- [ ] Open a second screen (`orrery run` again nested; a second monitor bare metal): it gets its own bar, showing
+      its own workspace highlighted (without the block until it has the focus). Close it: its bar goes; `ps` shows
+      one `kitten panel` per screen.
+- [ ] `Super+grave`: the drop-down slides in and takes typing; `Super+grave` again hides it, focus back where it
+      was.
+- [ ] `Super+D`: the launcher appears centred over everything and takes typing; type a name, Enter: the program
+      opens as a new tab in the focused slot; `Super+D` then Escape: it goes, nothing started.
+- [ ] In a linked session (Linking machines): the bar's right shows the machines, the one with input in the focus
+      colour; `Super+2` to the satellite moves it.
+- [ ] Quit orrery: within a minute no `bars.py` or `bar.py` is left running (`pgrep -f bars.py`).
+- [ ] desktop-ui (optional): after the steps above, a file dialog (e.g. a browser's Save As) is kitty's chooser,
+      and `kitten desktop-ui set-color-scheme dark` turns a portal-following program dark.

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Toggles kitty's quick-access terminal, a drop-down along the top edge that takes the keyboard while it shows: the
+# first run starts it, every next one shows or hides it (orrery.kdl binds this to Mod+grave). Its size, edge, look and
+# shell are set in ~/.config/kitty/quick-access-terminal.conf (see `kitten quick-access-terminal --help`); any
+# arguments go to it as they are.
+exec kitten quick-access-terminal "$@"

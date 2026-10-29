@@ -656,6 +656,27 @@ impl<'a> Parser<'a> {
         self.problems.push((self.at, problem));
     }
 
+    /// A program to run, as written in the text being read: starting with `./` or `../`, it is taken from that
+    /// file's directory, so a snippet can start the scripts beside it; anything else (or with no file) as written.
+    fn program(&self, program: &str) -> String {
+        let dir = self.texts[self.at].0.as_deref().and_then(Path::parent);
+        match dir {
+            Some(dir) if program.starts_with("./") || program.starts_with("../") => {
+                // `config.kdl` alone has the parent "": the current directory, never a bare name found on PATH.
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+                dir.join(program.strip_prefix("./").unwrap_or(program))
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            _ => program.to_owned(),
+        }
+    }
+
     /// `[FILE:]LINE:COL` of `offset` in text `at`, as a problem there would show it.
     fn place(&self, (at, offset): (usize, usize)) -> String {
         let (file, src) = &self.texts[at];
@@ -783,7 +804,10 @@ impl<'a> Parser<'a> {
                         .map(|e| e.value().as_string().filter(|a| !a.is_empty()).map(str::to_owned))
                         .collect();
                     match argv {
-                        Some(argv) if !argv.is_empty() => spawn_at_start.push(argv),
+                        Some(mut argv) if !argv.is_empty() => {
+                            argv[0] = self.program(&argv[0]);
+                            spawn_at_start.push(argv);
+                        }
                         _ => self.err(
                             node,
                             "`spawn-at-start` takes a program and its arguments, as non-empty strings",
@@ -1338,8 +1362,13 @@ impl<'a> Parser<'a> {
                 }
             },
             ("layout", Some([name])) => Action::Layout((*name).to_owned()),
-            ("spawn", Some(argv @ [_, ..])) if argv.iter().all(|a| !a.is_empty()) => {
-                Action::Spawn(argv.iter().map(|s| (*s).to_owned()).collect())
+            ("spawn", Some([program, args @ ..])) if !program.is_empty() && args.iter().all(|a| !a.is_empty()) => {
+                let program = self.program(program);
+                Action::Spawn(
+                    std::iter::once(program)
+                        .chain(args.iter().map(|s| (*s).to_owned()))
+                        .collect(),
+                )
             }
             ("focus-slot" | "move" | "swap-slot", _) => {
                 self.err_at(verb_at, format!("`{verb}` takes one direction"));
@@ -2684,6 +2713,44 @@ mod tests {
         ] {
             assert_problem(&format!("{ONE}{line}\n"), 5, word);
         }
+    }
+
+    #[test]
+    fn programs_starting_with_a_dot_are_relative_to_their_file() {
+        let dir = tree(&[
+            (
+                "main.kdl",
+                &format!("{ONE}include \"kitty/desk.kdl\"\nspawn-at-start \"./mine\" \"./arg\"\n"),
+            ),
+            (
+                "kitty/desk.kdl",
+                "spawn-at-start \"./bars\" \"x\"\nspawn-at-start \"bar\"\nbinds {\n \"Mod+D\" spawn \"../menu\" \"./y\"\n}\n",
+            ),
+        ]);
+        let c = parse_main(dir.path(), None).config.expect("parses");
+        let (d, k) = (dir.path().display(), dir.path().join("kitty"));
+        let k = k.display();
+        assert_eq!(
+            c.spawn_at_start,
+            [
+                vec![format!("{k}/bars"), "x".into()],
+                vec!["bar".to_owned()],
+                vec![format!("{d}/mine"), "./arg".into()],
+            ],
+            "only the program, and only `./` or `../`"
+        );
+        assert_eq!(
+            c.binds[0].action,
+            Action::Spawn(vec![format!("{k}/../menu"), "./y".into()])
+        );
+        // A config with no file behind it has nothing to be relative to: as written.
+        let c = parse(&format!("{ONE}spawn-at-start \"./bars\"\n")).expect("parses");
+        assert_eq!(c.spawn_at_start, [vec!["./bars".to_owned()]]);
+        // A config named without a directory is in the current one: never a bare name looked up on PATH.
+        let src = format!("{ONE}spawn-at-start \"./bars\"\n");
+        let c = parse_file(&src, Path::new("main.kdl"), None).config.expect("parses");
+        let here = std::env::current_dir().unwrap().join("bars");
+        assert_eq!(c.spawn_at_start, [vec![here.display().to_string()]]);
     }
 
     #[test]
