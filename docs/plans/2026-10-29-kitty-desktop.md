@@ -47,3 +47,42 @@ Commit `examples: a kitty desktop`.
 ### Task 4: as built
 
 Checks, cleanliness scan, README vs design, "As built"; then the user's live test (nested and bare metal).
+
+## As built
+
+Commits, by task: 1 `3ba067d`, `c6bb008`; 2 `76df9b3`, `2fcee35`; 3 `745e8a0`, `e56db71`; 4 this one (design and
+plan: `9301d03`). 465 Rust tests (343 unit, 122 integration, most of them headless end to end; 456 after task 2, 461
+after task 3, 465 after its review), one more ignored (slow: every prefix of the example config); 30 Python tests in
+`examples/kitty/test_bar.py` (also run by `tests/kitty.rs` when python3 is installed); fmt, clippy and the release
+build clean; `sh -n` on the shell scripts clean.
+
+Deviations from the design and this plan (folded into the design as "As built" notes):
+- Layer-shell: placement and exclusive zones are Smithay's `LayerMap`; popups of bottom and background surfaces are
+  drawn and hit over the windows (under top and overlay); `exclusive` on the bottom or background layer acts as
+  `on_demand`; a buffer before an acked configure is a protocol error; `state` lists each monitor's layer surfaces.
+- The event stream also has `closed` and `layers` events; changes are found by comparing what the events carry with
+  what was last sent, published at most every 8 ms; the backlog is 1 MiB, at most 16 subscribers; `state` and the
+  `config` event carry `colors`.
+- Programs orrery starts also get `ORRERY_SOCKET`. `include` takes relative, absolute and `~/` paths (8 deep, 1 MiB,
+  regular files, watched); `binds` blocks add up across files and an included bind cannot be overridden.
+- Added beyond the plan: a program written `./...` or `../...` in a `spawn` bind or `spawn-at-start` is relative to
+  the config file it is written in (so the snippet needs one `include` line and nothing on `PATH`); `launch=#false`
+  on either records no launch; a launched program's layer surface uses its launch up when it first maps, and a layer
+  surface activating with a launch's token spends it, so panels and launchers never leave a launch for a stranger's
+  window.
+- `examples/kitty/`: the bar is `bar.py` (one screen) run per screen in a `kitten panel` by `bars.py`; both stop when
+  the orrery they follow is gone for a minute or replaced by another at the same socket, and the panels die with
+  `bars.py`. The launcher honours TryExec, OnlyShowIn and NotShowIn and the desktop-file escapes. The desktop-ui
+  steps are a README section (with `orrery-portals.conf` as a fallback), not a separate file.
+
+Known limits:
+- No popup grabs, for layer surfaces' popups as for windows': a click elsewhere does not close a menu.
+- Smithay's zone arithmetic differs from the protocol's letter in corner cases (a positive zone on a surface
+  anchored to a corner, or to two opposite edges only, still takes room along one edge; one leaving nothing is
+  ignored); a surface that never draws keeps its zone.
+- Nothing in `examples/kitty/` has been run against real kitty yet: no panel, drop-down, launcher or desktop-ui
+  portal; whether kitty's `--output-name` matches orrery's output names is the first thing to see.
+- A spawn with a launch whose program opens no surface at all still waits 5 s for a stranger's window; the snippet
+  marks all its programs `launch=#false`, a user's own binds need the same.
+
+Live test: pending (nested and bare metal).

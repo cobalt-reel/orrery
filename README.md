@@ -210,8 +210,9 @@ orrery msg inject-remote side release # testing aid (--debug-inject, primary): a
 
 Errors come back as `{"ok":false,"error":"..."}` (also printed on stderr), e.g. an unknown layout or monitor.
 
-`state` lists `monitors`, each as `{ name, number, workspace, layout, focused, slots }`: its screen number, the
-workspace it shows, and that workspace's layout and slots; and `workspaces`, every existing one by number, as
+`state` lists `monitors`, each as `{ name, number, workspace, layout, focused, slots, layers }`: its screen number,
+the workspace it shows, that workspace's layout and slots, and its mapped layer surfaces back to front as drawn
+(`{ namespace, layer, rect, keyboard }`, see [Layer-shell](#layer-shell)); and `workspaces`, every existing one by number, as
 `{ number, monitor, shown, layout, focused_slot, slots }` (`monitor` by name; `slots` as a monitor lists them, a
 hidden workspace's never focused). Each slot is `{ index, name, rect, focused, tabs }`. Each slot's `tabs` lists its
 tabs left to right, each as `{ current, attention, windows }` with `windows` (`id`, `app_id`, `title`) bottom to
@@ -625,6 +626,30 @@ draws the pointer itself: the cursor its client under it asked for, else the the
 - [ ] With input on `side`, `Super+1`: back on `desk`.
 - [ ] With input on `side`, quit `side` (`orrery msg --socket /tmp/orrery-side.sock quit`): input comes home at once.
 
+## Layer-shell
+
+Bars, docks, wallpapers, drop-downs and launchers come as layer surfaces (`zwlr_layer_shell_v1`), on a screen's four
+layers: two under the slots (`background`, `bottom`) and two over them (`top`, `overlay`), drawn and hit in that
+order (later ones in front on each layer). A layer surface lives on the screen it asks for, else the focused one,
+placed by its anchors, margins and size as the protocol says; it never enters the stacks, tabs or workspaces. A
+screen that goes closes its layer surfaces.
+
+- **Exclusive zones** shrink the area the screen's layout divides: a bar 30 px high along the top moves every slot
+  down by 30 px, and the windows are resized when a bar appears, changes or goes. A surface's zone counts from its
+  first commit until it unmaps (a null buffer) or goes, so one that never draws keeps its room. The zone arithmetic
+  is Smithay's, which differs from the protocol's letter in corner cases: a positive zone on a surface anchored to a
+  corner, or to two opposite edges only, still takes room along one edge, and one anchored to all four edges would
+  take the whole screen, which orrery ignores (the layout keeps the whole screen).
+- **Keyboard:** an `exclusive` surface on the `top` or `overlay` layer takes it while mapped (the frontmost one, the
+  focused screen's first) and gives it back to the focused window when it goes; meanwhile only the quit, `reclaim`
+  and `vt` binds run. An `on_demand` surface takes it on a click and keeps it until a window or slot is focused;
+  `exclusive` on the lower layers does the same. `none` never takes it.
+- **Popups** (menus) open and are kept on screen as windows' are; those of `bottom` and `background` surfaces are
+  drawn and hit over the windows (a bar's menu along the bottom), under the `top` and `overlay` layers.
+- A buffer attached before the configure is acked (at the first commit, or the first after an unmap) is a protocol
+  error: the client is disconnected.
+- A launched program's layer surface uses its launch up (see [Programs orrery starts](#programs-orrery-starts)).
+
 ## A kitty desktop
 
 `examples/kitty/` turns orrery and [kitty](https://sw.kovidgoyal.net/kitty/) into a small desktop, each part a
@@ -638,7 +663,8 @@ script or a kitty kitten driven by `orrery msg`:
   (only in a session; where input is in the focus colour, one whose link is down dim) and the time. It follows
   `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
   ends; without orrery for a minute it stops, and so it does at once when the orrery it reconnects to is another
-  one (started at the same socket after its own quit), which runs its own bars. The bars die with `bars.py`. Its panel reserves its line, so the slots start below it.
+  one (started at the same socket after its own quit), which runs its own bars. The bars die with `bars.py`. Its
+  panel reserves its line, so the slots start below it.
 - **A drop-down terminal** on `Mod+grave` (`dropdown`): kitty's quick-access terminal, shown and hidden by the key;
   set it up in `~/.config/kitty/quick-access-terminal.conf`.
 - **A launcher** on `Mod+D` (`launcher.sh`): fzf in a kitty panel over everything, over the desktop applications
