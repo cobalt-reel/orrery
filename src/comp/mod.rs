@@ -469,6 +469,8 @@ pub struct Orrery {
     subscribers: subscribers::Subscribers,
     /// The control socket's path, handed to the programs orrery starts.
     control_socket: Option<PathBuf>,
+    /// orrery's own program, handed to the programs it starts (`spawn::own_exe`).
+    exe: Option<PathBuf>,
     /// In opening order, which is not the monitors' (number) order: look monitors up by name, never by index.
     pub outputs: Vec<Output>,
     /// Each output's global, by output name, to take away with it.
@@ -580,6 +582,7 @@ impl Orrery {
             config_reads: 0,
             subscribers: subscribers::Subscribers::default(),
             control_socket: None,
+            exe: None,
             outputs: Vec::new(),
             output_globals: HashMap::new(),
             screens: None,
@@ -1351,6 +1354,7 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     state.socket_name = listen(display, &mut event_loop)?;
     state.debug_inject = opts.debug_inject;
     state.control_socket = Some(control_path.clone());
+    state.exe = spawn::own_exe();
 
     event_loop
         .handle()

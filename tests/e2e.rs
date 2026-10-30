@@ -504,3 +504,52 @@ fn spawn_at_start_runs_once_with_the_session_environment() {
     assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
     assert!(orrery.stop().success());
 }
+
+#[test]
+fn programs_orrery_starts_find_it_and_their_stderr_reaches_its_own() {
+    // orrery need not be on PATH for a script it starts to run `$ORRERY msg ...`; and what such a script says on
+    // stderr lands wherever orrery's own stderr goes (here, the log the harness keeps), not nowhere.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = dir.path().join("started.sh");
+    let out = dir.path().join("orrery.txt");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s' \"$ORRERY\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+    )
+    .expect("write the script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    // Built by the shell, so the argv orrery logs when it starts it does not hold it.
+    let marker = "a-child-said-42";
+    let config = format!(
+        "{}spawn-at-start \"{}\" \"{}\" launch=#false\nspawn-at-start \"sh\" \"-c\" \"echo a-child-said-$((6*7)) >&2\" launch=#false\n",
+        config::DEFAULT,
+        script.display(),
+        out.display()
+    );
+    let orrery = Compositor::start(&config, SIZE);
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    while !out.exists() || !orrery.log().contains(marker) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} written: {}; no {marker:?} in the log:\n{}",
+            out.display(),
+            out.exists(),
+            orrery.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let named = std::fs::read_to_string(&out).expect("read what the script wrote");
+    assert!(std::path::Path::new(&named).is_absolute(), "{named:?}");
+    assert_eq!(
+        std::fs::canonicalize(&named).expect("ORRERY names a file"),
+        std::fs::canonicalize(support::BIN).expect("the binary under test"),
+    );
+    // The program is orrery: `$ORRERY msg` from such a script talks to it.
+    let answer = std::process::Command::new(&named)
+        .args(["msg", "state"])
+        .env(orrery_wm::comp::ipc_server::socket_env(), orrery.control_socket())
+        .output()
+        .expect("run $ORRERY msg");
+    assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
+    assert!(orrery.stop().success());
+}

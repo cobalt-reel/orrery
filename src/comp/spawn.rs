@@ -1,5 +1,5 @@
 //! `spawn` binds and `orrery msg spawn`: start a program with orrery as its display, detached from orrery's
-//! terminal and signals.
+//! terminal input and signals (its stderr is orrery's, so its complaints land in orrery's log).
 //! Children are reaped on SIGCHLD (`Orrery::reap_children`, from the signal source in `run`). They are not
 //! signalled when orrery exits: each leads its own process group, deliberately, so a program started from
 //! orrery outlives it like one started from a launcher.
@@ -7,7 +7,7 @@
 
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
@@ -20,16 +20,44 @@ use crate::placement::Launch;
 /// one that some toolkits still read.
 const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
 
+/// The environment variable naming orrery's own program to the programs it starts (`ORRERY`).
+#[must_use]
+pub fn exe_env() -> String {
+    NAME.to_ascii_uppercase()
+}
+
+/// The absolute path of orrery's own program, read once at startup (later, a rebuilt binary would read as
+/// deleted); None, logged, when the system cannot tell.
+#[must_use]
+pub fn own_exe() -> Option<PathBuf> {
+    std::env::current_exe()
+        .inspect_err(|e| {
+            tracing::warn!(
+                "cannot tell where {NAME}'s own program is ({e}): programs it starts get no {}",
+                exe_env()
+            )
+        })
+        .ok()
+}
+
 /// The command for `argv` (no shell): `WAYLAND_DISPLAY` set to orrery's socket and `DISPLAY` removed (so no
 /// toolkit falls back to the host's Xwayland) for the child only (orrery's own environment keeps the host's, which
 /// winit needs), `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` saying where it runs (portals and toolkits read them),
 /// `control` (orrery's control socket) as `ORRERY_SOCKET` (`ipc_server::socket_env`; removed without one),
-/// `token` as its xdg-activation token under both names
-/// toolkits read (removed without one: a token orrery was started with is not orrery's to hand on), no stdio, its
+/// `exe` (orrery's own program, see `own_exe`) as `ORRERY` (`exe_env`; removed without one), so a script runs
+/// `$ORRERY msg ...` whether or not orrery is on `PATH`, `token` as its xdg-activation token under both names
+/// toolkits read (removed without one: a token orrery was started with is not orrery's to hand on), no stdin or
+/// stdout but orrery's own stderr (what it says when it fails lands in orrery's log, as in most compositors), its
 /// own process group (a Ctrl+C in orrery's terminal does not reach it), and an empty signal mask. None for an
 /// empty argv.
 #[must_use]
-pub fn command(argv: &[String], display: &OsStr, control: Option<&Path>, token: Option<&str>) -> Option<Command> {
+pub fn command(
+    argv: &[String],
+    display: &OsStr,
+    control: Option<&Path>,
+    exe: Option<&Path>,
+    token: Option<&str>,
+) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -41,6 +69,10 @@ pub fn command(argv: &[String], display: &OsStr, control: Option<&Path>, token: 
         Some(path) => cmd.env(socket_env(), path),
         None => cmd.env_remove(socket_env()),
     };
+    match exe {
+        Some(path) => cmd.env(exe_env(), path),
+        None => cmd.env_remove(exe_env()),
+    };
     for name in TOKEN_VARS {
         match token {
             Some(t) => cmd.env(name, t),
@@ -49,7 +81,7 @@ pub fn command(argv: &[String], display: &OsStr, control: Option<&Path>, token: 
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .process_group(0);
     // calloop's Signals blocks SIGTERM/SIGINT in orrery's thread and a child inherits the mask across exec:
     // without this, the child could never be stopped with SIGTERM.
@@ -88,7 +120,7 @@ impl Orrery {
             String::from(token)
         });
         let control = self.control_socket.as_deref();
-        let Some(mut cmd) = command(argv, &self.socket_name, control, token.as_deref()) else {
+        let Some(mut cmd) = command(argv, &self.socket_name, control, self.exe.as_deref(), token.as_deref()) else {
             return Err("nothing to spawn: the argv is empty".into());
         };
         match cmd.spawn() {
@@ -161,7 +193,7 @@ mod tests {
     #[test]
     fn the_child_does_not_see_the_host_x_display() {
         // With DISPLAY set (Xwayland in the host), toolkits may pick X and open outside orrery.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&(OsStr::new("DISPLAY"), None)), "{envs:?}");
         assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wayland-9")))));
@@ -169,7 +201,14 @@ mod tests {
 
     #[test]
     fn the_child_gets_its_activation_token_under_both_names() {
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, Some("tok123")).unwrap();
+        let cmd = command(
+            &["true".to_owned()],
+            OsStr::new("wayland-9"),
+            None,
+            None,
+            Some("tok123"),
+        )
+        .unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
             assert!(
@@ -178,7 +217,7 @@ mod tests {
             );
         }
         // Without one, a token orrery itself was started with is not handed on: it is not orrery's to give.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
             assert!(envs.contains(&(OsStr::new(name), None)), "{name}: {envs:?}");
@@ -187,7 +226,7 @@ mod tests {
 
     #[test]
     fn the_child_learns_the_desktop_and_session_type() {
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.contains(&(OsStr::new("XDG_CURRENT_DESKTOP"), Some(OsStr::new(NAME)))));
         assert!(envs.contains(&(OsStr::new("XDG_SESSION_TYPE"), Some(OsStr::new("wayland")))));
@@ -196,7 +235,7 @@ mod tests {
     #[test]
     fn the_child_finds_the_control_socket() {
         let socket = Path::new("/run/user/1000/orrery.sock");
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), Some(socket), None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), Some(socket), None, None).unwrap();
         let envs: Vec<_> = cmd.get_envs().collect();
         let name = ipc_server::socket_env();
         assert!(
@@ -204,13 +243,28 @@ mod tests {
             "{envs:?}"
         );
         // Without one, an outer orrery's is not handed on.
-        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None).unwrap();
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None, None).unwrap();
         assert!(cmd.get_envs().any(|e| e == (OsStr::new(&name), None)));
     }
 
     #[test]
+    fn the_child_finds_orrery_itself() {
+        // A script orrery starts runs `$ORRERY msg ...`: orrery need not be on PATH.
+        let exe = Path::new("/opt/orrery/target/release/orrery");
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, Some(exe), None).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(
+            envs.contains(&(OsStr::new("ORRERY"), Some(exe.as_os_str()))),
+            "{envs:?}"
+        );
+        // Unknown, it is unset: an `ORRERY` orrery was started with may name another build.
+        let cmd = command(&["true".to_owned()], OsStr::new("wayland-9"), None, None, None).unwrap();
+        assert!(cmd.get_envs().any(|e| e == (OsStr::new("ORRERY"), None)));
+    }
+
+    #[test]
     fn empty_argv_is_nothing() {
-        assert!(command(&[], OsStr::new("wayland-9"), None, None).is_none());
+        assert!(command(&[], OsStr::new("wayland-9"), None, None, None).is_none());
     }
 
     #[test]
@@ -225,7 +279,7 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            let mut cmd = command(&argv, OsStr::new("wayland-test-7"), None, None).unwrap();
+            let mut cmd = command(&argv, OsStr::new("wayland-test-7"), None, None, None).unwrap();
             cmd.stdout(Stdio::piped());
             cmd.output().unwrap()
         })

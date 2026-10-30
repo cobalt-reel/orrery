@@ -6,7 +6,8 @@
 Left the workspaces (the one shown on this screen highlighted, occupied ones plain, empty ones dim, one asking for
 attention in the attention colour), middle the tabs of the focused slot of this screen's workspace (the current one
 bright), right the session's machines (only in a session; where input is in the focus colour) and the time. Driven
-by `orrery msg subscribe` ($ORRERY, else `orrery` on PATH); colours from orrery's config. Python 3 standard library
+by `orrery msg subscribe` ($ORRERY, which orrery sets for what it starts, else `orrery` on PATH); colours from
+orrery's config; it stops when its orrery's socket is gone or replaced (see Seen). Python 3 standard library
 only.
 """
 
@@ -52,17 +53,17 @@ def socket_identity(path):
 
 
 class Seen:
-    """The orrery first connected to, by its socket's identity: a later connection to another one (started at the
-    same path after this one quit) is not ours to follow."""
+    """The orrery this script belongs to, by its socket's identity: the socket there when the script started (orrery
+    binds it before it starts its programs), else the first one connected to. Another socket at the path (an
+    orrery started there after ours quit) or none (ours has quit) means ours is gone: stop, never follow another."""
 
-    def __init__(self):
-        self.first = None
+    def __init__(self, identity=None):
+        self.first = identity
 
     def same(self, identity):
-        if identity is None:
-            return True
         if self.first is None:
             self.first = identity
+            return True
         return identity == self.first
 
 
@@ -376,6 +377,8 @@ class Subscription:
 
     def __init__(self, program):
         self.buf = b""
+        # Why it could not be started at all (one line), else None.
+        self.error = None
         try:
             self.proc = subprocess.Popen(
                 [program, "msg", "subscribe"],
@@ -383,8 +386,12 @@ class Subscription:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
-        except OSError:
+        except OSError as e:
             self.proc = None
+            self.error = (
+                f"cannot start `{program} msg subscribe` ({e.strerror or e}): orrery is found as $ORRERY, "
+                "else as `orrery` on PATH"
+            )
 
     def fileno(self):
         return self.proc.stdout.fileno()
@@ -440,6 +447,8 @@ def until_next_minute():
 
 
 def main(argv=None):
+    # Before anything else: the socket there now is the orrery that started this (see Seen).
+    seen = Seen(socket_identity(socket_path()))
     ap = argparse.ArgumentParser(description="A bar for one orrery screen, in this terminal.")
     ap.add_argument("--screen", required=True, help="the screen's output name, as `orrery msg state` lists it")
     args = ap.parse_args(argv)
@@ -465,10 +474,15 @@ def main(argv=None):
         out.write("\r\x1b[2K" + render(model, args.screen, terminal_width(out), time.strftime("%H:%M")))
         out.flush()
 
-    backoff, lost_since, seen = 0.5, None, Seen()
+    backoff, lost_since, said = 0.5, None, False
     try:
         while True:
+            if not seen.same(socket_identity(socket_path())):
+                return 0  # this bar's orrery is gone
             sub = Subscription(orrery_program())
+            if sub.error and not said:
+                print(f"bar.py: {sub.error}", file=sys.stderr, flush=True)
+                said = True
             sel = selectors.DefaultSelector()
             sel.register(wake_r, selectors.EVENT_READ)
             if sub.proc is not None:

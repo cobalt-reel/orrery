@@ -6,8 +6,10 @@ Pure functions only, plus a stand-in `orrery` script in a temp dir: no orrery, n
 import os
 import re
 import shutil
+import select
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +17,7 @@ import unittest
 import bar
 import bars
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 COLORS = {"focus": "#ff7edbff", "badge": "#ff7edbff", "attention": "#ffb000ff", "background": "#1a1625ff"}
 SGR = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -47,6 +50,13 @@ def snapshot(session=None):
         "colors": COLORS,
         "session": session,
     }
+
+
+def replace_file(path):
+    """Another file at `path` (another inode, as a new orrery's socket is), put there in one step."""
+    with open(path + ".new", "w") as f:
+        f.write("new")
+    os.replace(path + ".new", path)
 
 
 def plain(line):
@@ -268,6 +278,44 @@ class Subscription(unittest.TestCase):
             self.assertIsNone(sub.read())
             self.assertNotEqual(sub.close(), 0)
 
+    def test_a_missing_program_says_how_orrery_is_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "none")
+            sub = bar.Subscription(missing)
+            self.assertIn(missing, sub.error)
+            self.assertIn("$ORRERY", sub.error)
+            self.assertIn("PATH", sub.error)
+            self.assertNotIn("\n", sub.error)
+        started = bar.Subscription("true")
+        self.assertIsNone(started.error)
+        started.close()
+
+    def test_both_scripts_say_so_on_stderr(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "none")
+            for script, args in (("bar.py", ["--screen", "x"]), ("bars.py", [])):
+                with self.subTest(script):
+                    env = {**os.environ, "ORRERY": missing, "ORRERY_SOCKET": os.path.join(d, "absent.sock")}
+                    proc = subprocess.Popen(
+                        [sys.executable, "-B", os.path.join(HERE, script), *args],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        ready, _, _ = select.select([proc.stderr], [], [], 10)
+                        self.assertTrue(ready, f"{script} said nothing on stderr")
+                        line = proc.stderr.readline()
+                    finally:
+                        proc.terminate()
+                        proc.wait(5)
+                        proc.stderr.close()
+                    self.assertTrue(line.startswith(f"{script}: "), line)
+                    self.assertIn(missing, line)
+                    self.assertIn("$ORRERY", line)
+
 
 class Identity(unittest.TestCase):
     def test_the_socket_is_orrery_socket_else_the_default(self):
@@ -287,15 +335,58 @@ class Identity(unittest.TestCase):
             open(path, "w").close()
             self.assertNotEqual(bar.socket_identity(path), first)
 
-    def test_the_first_orrery_is_kept_and_another_is_noticed(self):
+    def test_the_first_orrery_is_kept_and_another_or_none_is_noticed(self):
         seen = bar.Seen()
         self.assertTrue(seen.same((1, 2, 3)), "the first one is taken")
         self.assertTrue(seen.same((1, 2, 3)))
-        self.assertTrue(seen.same(None), "unknown: no reason to stop")
         self.assertFalse(seen.same((1, 2, 4)))
+        self.assertFalse(seen.same(None), "its socket is gone: so is it")
         unknown = bar.Seen()
-        self.assertTrue(unknown.same(None))
+        self.assertTrue(unknown.same(None), "none known yet: no reason to stop")
         self.assertTrue(unknown.same((1, 2, 3)), "the first known one is taken")
+
+    def test_the_orrery_is_the_one_whose_socket_was_there_at_start(self):
+        # orrery binds its socket before it starts its programs: the socket there when a script starts is its
+        # orrery's, even before a connection ever succeeds.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "orrery.sock")
+            open(path, "w").close()
+            seen = bar.Seen(bar.socket_identity(path))
+            self.assertTrue(seen.same(bar.socket_identity(path)))
+            replace_file(path)
+            self.assertFalse(seen.same(bar.socket_identity(path)), "replaced: another orrery")
+            os.remove(path)
+            self.assertFalse(bar.Seen(bar.socket_identity(path) or (1, 2, 3)).same(bar.socket_identity(path)))
+
+    def test_both_scripts_stop_when_the_socket_is_replaced_or_gone_before_any_connection(self):
+        # The stand-in orrery never answers (as when `orrery msg subscribe` cannot connect); meanwhile the socket is
+        # replaced by another orrery's, or removed. The script must stop at its next try, not follow the new one.
+        for change in ("replace", "remove"):
+            for script, args in (("bar.py", ["--screen", "x"]), ("bars.py", [])):
+                with self.subTest(change=change, script=script), tempfile.TemporaryDirectory() as d:
+                    sock = os.path.join(d, "orrery.sock")
+                    open(sock, "w").close()
+                    runs = os.path.join(d, "runs")
+                    fake = os.path.join(d, "orrery")
+                    with open(fake, "w") as f:
+                        f.write(f"#!/bin/sh\necho run >> '{runs}'\n")
+                        if change == "replace":
+                            f.write(f"echo new > '{sock}.new' && mv '{sock}.new' '{sock}'\n")
+                        else:
+                            f.write(f"rm -f '{sock}'\n")
+                        f.write("exit 1\n")
+                    os.chmod(fake, stat.S_IRWXU)
+                    env = {**os.environ, "ORRERY": fake, "ORRERY_SOCKET": sock}
+                    out = subprocess.run(
+                        [sys.executable, "-B", os.path.join(HERE, script), *args],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        timeout=20,
+                    )
+                    self.assertEqual(out.returncode, 0, out.stderr)
+                    with open(runs) as f:
+                        self.assertEqual(f.read(), "run\n", "not tried again")
 
 
 class Launcher(unittest.TestCase):

@@ -71,7 +71,7 @@ Deviations from the design and this plan (folded into the design as "As built" n
   surface activating with a launch's token spends it, so panels and launchers never leave a launch for a stranger's
   window.
 - `examples/kitty/`: the bar is `bar.py` (one screen) run per screen in a `kitten panel` by `bars.py`; both stop when
-  the orrery they follow is gone for a minute or replaced by another at the same socket, and the panels die with
+  the orrery they follow is gone or replaced by another at the same socket (see the live test below), and the panels die with
   `bars.py`. The launcher honours TryExec, OnlyShowIn and NotShowIn and the desktop-file escapes. The desktop-ui
   steps are a README section (with `orrery-portals.conf` as a fallback), not a separate file.
 
@@ -85,4 +85,18 @@ Known limits:
 - A spawn with a launch whose program opens no surface at all still waits 5 s for a stranger's window; the snippet
   marks all its programs `launch=#false`, a user's own binds need the same.
 
-Live test: pending (nested and bare metal).
+Live test, first round: no bar. Fixed after it (one commit):
+- `bars.py` ran but could not start `orrery msg subscribe`: orrery was not on `PATH`, and with no stderr the failure
+  was invisible. Programs orrery starts now get `ORRERY` (orrery's own program, read once at startup; unset, logged,
+  if the system cannot tell), and their stderr is orrery's (stdin and stdout stay null), as in most compositors: a
+  failing program's complaint lands in orrery's log. `bar.py`/`bars.py` say once on stderr when `orrery msg` cannot
+  be started, naming `$ORRERY` and `PATH`.
+- A `bars.py` whose connection never succeeded had recorded no socket identity, so it followed a new orrery started
+  at the same socket later and every screen got a second bar. Both scripts now record the control socket's identity
+  at process start (orrery binds it before it starts its programs) and stop, panels with them, as soon as the socket
+  is gone or another one is there at a reconnect; the minute without orrery applies only when no socket was known.
+- 467 Rust tests (2 more: the `ORRERY` environment, and an end-to-end start that finds the binary under test through
+  `$ORRERY` with a child's stderr in orrery's log); 34 Python tests (4 more: the message and its stderr line, the
+  identity taken at start, both scripts stopping on a replaced or removed socket before any connection).
+
+Live test: pending again (nested and bare metal).

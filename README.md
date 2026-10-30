@@ -261,12 +261,14 @@ carries all a bar needs to redraw its part without asking again; at one time the
 ## Programs orrery starts
 
 `spawn` binds, `orrery msg spawn` and `spawn-at-start` run a program directly (no shell: write `"sh" "-c" "..."` for
-one), detached (a process group of its own, no stdin, stdout or stderr), in orrery's own environment with:
+one), detached (a process group of its own, no stdin or stdout), in orrery's own environment with:
 `WAYLAND_DISPLAY` set to orrery's socket; `DISPLAY` removed, so no toolkit falls back to the host's X server;
 `XDG_CURRENT_DESKTOP=orrery` and `XDG_SESSION_TYPE=wayland`, which portals, toolkits and desktop entries read;
 `ORRERY_SOCKET` set to orrery's control socket, which `orrery msg` uses when not given `--socket` (so a program talks
-to the orrery that started it); and an xdg-activation token as `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`, so
-its window opens where it was started. A program written in the config starting with `./` or `../` is taken from the
+to the orrery that started it); `ORRERY` set to the absolute path of orrery's own program, so a script runs
+`"$ORRERY" msg ...` whether or not orrery is on `PATH`; and an xdg-activation token as `XDG_ACTIVATION_TOKEN` and
+`DESKTOP_STARTUP_ID`, so its window opens where it was started. Their stderr is orrery's: what a program says when it
+fails lands where orrery's own log goes (start orrery with `2>>orrery.log` to keep both out of a terminal). A program written in the config starting with `./` or `../` is taken from the
 directory of the config file it is written in (so an included snippet can start the scripts beside it, see
 [A kitty desktop](#a-kitty-desktop)); its arguments are passed as written.
 
@@ -662,9 +664,10 @@ script or a kitty kitten driven by `orrery msg`:
   focused slot of this screen's workspace (the current one bright, titles cut to fit), right the session's machines
   (only in a session; where input is in the focus colour, one whose link is down dim) and the time. It follows
   `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
-  ends; without orrery for a minute it stops, and so it does at once when the orrery it reconnects to is another
-  one (started at the same socket after its own quit), which runs its own bars. The bars die with `bars.py`. Its
-  panel reserves its line, so the slots start below it.
+  ends. It belongs to the orrery whose control socket was there when it started: when that socket is gone or
+  another orrery's has taken its place (one started at the same path after its quit, which runs its own bars), it
+  stops at once; with no socket known, after a minute without orrery. The bars die with `bars.py`. Its panel
+  reserves its line, so the slots start below it.
 - **A drop-down terminal** on `Mod+grave` (`dropdown`): kitty's quick-access terminal, shown and hidden by the key;
   set it up in `~/.config/kitty/quick-access-terminal.conf`.
 - **A launcher** on `Mod+D` (`launcher.sh`): fzf in a kitty panel over everything, over the desktop applications
@@ -695,7 +698,9 @@ go after `./bars.py` (`spawn-at-start "./bars.py" "-o" "font_size=10" launch=#fa
 be changed from your config: to change the snippet, copy `examples/kitty/` and include your copy. Its binds clash
 with yours on the same keys (an error naming both places); take such a bind out of your copy. `spawn-at-start`
 runs at startup only, so a newly included snippet's bars come with the next start (or run `./bars.py` from a
-terminal in orrery once). The scripts find orrery as `orrery` on `PATH`, or as `$ORRERY`.
+terminal in orrery once). The scripts find orrery as `$ORRERY`, which orrery sets for the programs it starts, so
+orrery need not be on `PATH` (run by hand outside orrery, they fall back to `orrery` on `PATH`); one that cannot
+start `orrery msg` says so on its stderr, which is orrery's (see [Programs orrery starts](#programs-orrery-starts)).
 
 ### The file chooser and light/dark: the desktop-ui kitten
 

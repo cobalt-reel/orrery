@@ -4,10 +4,12 @@
     bars.py [KITTEN-PANEL-OPTION...]       e.g. bars.py -o font_size=10 -o font_family=monospace
 
 The options go to each `kitten panel` (see `kitten panel --help`). Run once by `spawn-at-start` (orrery.kdl); the
-screens come from `orrery msg subscribe` ($ORRERY, else `orrery` on PATH). A bar that dies while its screen is there
-is started again, waiting longer each time it dies young; a screen that goes takes its bar. Without orrery for a
-minute (it has quit), the bars are stopped and this ends; so it does when another orrery has taken the socket's
-place (one started after this one's quit): that one runs its own. The bars die with this script.
+screens come from `orrery msg subscribe` ($ORRERY, which orrery sets for what it starts, else `orrery` on PATH). A
+bar that dies while its screen is there is started again, waiting longer each time it dies young; a screen that goes
+takes its bar. This belongs to the orrery whose control socket was there when it started: when that socket is gone
+or another has taken its place (an orrery started after this one's quit, which runs its own), the bars are stopped
+and this ends; with no socket known at start, so it does after a minute without orrery. The bars die with this
+script.
 """
 
 import ctypes
@@ -119,14 +121,21 @@ def stop(proc):
 
 
 def main(argv=None):
+    # Before anything else: the socket there now is the orrery that started this (see bar.Seen).
+    seen = bar.Seen(bar.socket_identity(bar.socket_path()))
     extra = list(sys.argv[1:] if argv is None else argv)
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))
     panels = Panels(extra)
-    backoff, lost_since, seen = 0.5, None, bar.Seen()
+    backoff, lost_since, said = 0.5, None, False
     try:
         while True:
+            if not seen.same(bar.socket_identity(bar.socket_path())):
+                return 0  # our orrery is gone (finally stops the bars)
             sub = bar.Subscription(bar.orrery_program())
+            if sub.error and not said:
+                print(f"bars.py: {sub.error}", file=sys.stderr, flush=True)
+                said = True
             connected = False
             if sub.proc is not None:
                 sel = selectors.DefaultSelector()

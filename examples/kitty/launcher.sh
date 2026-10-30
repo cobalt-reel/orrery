@@ -10,7 +10,7 @@
 # Applications are the desktop entries in $XDG_DATA_HOME and $XDG_DATA_DIRS (`applications/`, earlier directories
 # winning for one entry), without hidden ones, ones whose TryExec is missing and ones OnlyShowIn/NotShowIn keep
 # from $XDG_CURRENT_DESKTOP; their Exec line, unescaped, runs with `sh -c`, its field codes (%f, %U, ...) left out;
-# Terminal=true ones run in a new kitty. $ORRERY names orrery (default: `orrery` on PATH).
+# Terminal=true ones run in a new kitty. $ORRERY names orrery (orrery sets it; default: `orrery` on PATH).
 set -eu
 
 orrery=${ORRERY:-orrery}

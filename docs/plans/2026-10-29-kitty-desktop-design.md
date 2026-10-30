@@ -46,7 +46,9 @@ in `examples/kitty/`. Agreed 2026-10-29. Notifications, lock and idle stay later
 ## Session environment
 
 - Programs orrery starts get `XDG_CURRENT_DESKTOP=orrery` (and `XDG_SESSION_TYPE=wayland`), besides
-  `WAYLAND_DISPLAY`. (As built: and `ORRERY_SOCKET`, orrery's control socket, which `orrery msg` uses first.)
+  `WAYLAND_DISPLAY`. (As built: and `ORRERY_SOCKET`, orrery's control socket, which `orrery msg` uses first;
+  after the first live test also `ORRERY`, orrery's own program, so nothing needs orrery on `PATH`, and orrery's
+  stderr as theirs.)
 - The config gains `include "PATH"` (relative to the including file; cycles and depth limited), so a shipped snippet
   can be added to a user's config with one line. (As built: also absolute or `~/` paths; 8 deep; 1 MiB with
   everything included; regular files only; included files are watched. `binds` blocks add up across files, and an
@@ -67,7 +69,8 @@ in `examples/kitty/`. Agreed 2026-10-29. Notifications, lock and idle stay later
 - **File chooser and light/dark**: the `desktop-ui` kitten, with the steps to enable it (portals config, environment).
 - **`orrery.kdl`**: an includable snippet with the binds and a `spawn-at-start` for the bar. (As built: the bar is
   `bar.py` (one screen, `--screen NAME`) run in a `kitten panel` per screen by `bars.py`, which keeps one per screen
-  as screens come and go; both stop when the orrery they follow is gone or replaced. The snippet's programs are
+  as screens come and go; both stop when the orrery they follow is gone or replaced, judged by the control socket
+  there when they started. The snippet's programs are
   `./bars.py`, `./dropdown` and `./launcher.sh`, all `launch=#false`, plus a `dbus-update-activation-environment`
   line; `orrery-portals.conf` is a fallback portals config; the desktop-ui steps are in the README.)
 - A config line `spawn-at-start "..."` (any number) runs programs when orrery starts (not on reload).
