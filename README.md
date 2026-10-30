@@ -643,9 +643,11 @@ screen that goes closes its layer surfaces.
   corner, or to two opposite edges only, still takes room along one edge, and one anchored to all four edges would
   take the whole screen, which orrery ignores (the layout keeps the whole screen).
 - **Keyboard:** an `exclusive` surface on the `top` or `overlay` layer takes it while mapped (the frontmost one, the
-  focused screen's first) and gives it back to the focused window when it goes; meanwhile only the quit, `reclaim`
-  and `vt` binds run. An `on_demand` surface takes it on a click and keeps it until a window or slot is focused;
-  `exclusive` on the lower layers does the same. `none` never takes it.
+  focused screen's first) and gives it back to the focused window when it goes. An `on_demand` surface takes it on a
+  click and keeps it until a window or slot is focused; `exclusive` on the lower layers does the same. `none` never
+  takes it. Every bind still runs while a layer surface has the keyboard, as in other compositors (so the bind that
+  opened a drop-down closes it again, and workspace keys work over it): a bind's keys, press and release, never
+  reach the surface; every other key does.
 - **Popups** (menus) open and are kept on screen as windows' are; those of `bottom` and `background` surfaces are
   drawn and hit over the windows (a bar's menu along the bottom), under the `top` and `overlay` layers.
 - A buffer attached before the configure is acked (at the first commit, or the first after an unmap) is a protocol

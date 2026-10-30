@@ -182,15 +182,20 @@ fn an_exclusive_overlay_takes_the_keyboard_from_the_window_and_gives_it_back() {
     assert!(client.wait_for(|s| s.keyboard_layer == Some(o) && s.keyboard_focus.is_none()));
     assert_eq!(layers(&orrery.state(), 0)[0]["keyboard"], true);
 
-    // Typing reaches it; so does a bind's key, whose action does not run (only quit, reclaim and vt do).
-    chord(&orrery, &[A]);
+    // Typing reaches it; a bind's key does not: its action runs, as over a window.
     chord(&orrery, &[SUPER, CTRL, TWO]);
+    chord(&orrery, &[A]);
     assert!(
-        client.wait_for(|s| s.keys.contains(&(evdev(A), true)) && s.keys.contains(&(evdev(TWO), true))),
+        client.wait_for(|s| s.keys.contains(&(evdev(A), false))),
         "{:?}",
         client.state.keys
     );
-    assert_eq!(layout(&orrery.state()), "wall");
+    assert!(
+        !client.state.keys.iter().any(|k| k.0 == evdev(TWO)),
+        "{:?}",
+        client.state.keys
+    );
+    assert_eq!(layout(&orrery.state()), "halves");
 
     // A click on the window does not take the keyboard back.
     point(&orrery, 20, 20);
@@ -208,10 +213,10 @@ fn an_exclusive_overlay_takes_the_keyboard_from_the_window_and_gives_it_back() {
     // Unmapped: back to the window.
     client.unmap_layer(o);
     assert!(client.wait_for(|s| s.keyboard_focus == Some(a) && s.keyboard_layer.is_none()));
-    chord(&orrery, &[SUPER, CTRL, TWO]);
+    chord(&orrery, &[SUPER, CTRL, ONE]);
     assert!(
-        client.wait_for(|_| layout(&orrery.state()) == "halves"),
-        "binds run again"
+        client.wait_for(|_| layout(&orrery.state()) == "wall"),
+        "binds still run"
     );
     drop(client);
     assert!(orrery.stop().success());
@@ -395,7 +400,7 @@ fn layer_surfaces_go_to_their_screen_and_a_removed_screen_closes_them() {
 }
 
 #[test]
-fn only_quit_reclaim_and_vt_run_while_an_exclusive_surface_has_the_keyboard() {
+fn every_bind_runs_while_an_exclusive_surface_has_the_keyboard() {
     let (orrery, mut client) = start();
     full_window(&mut client, "a");
     let mut spec = LayerSpec::centred("prompt", Layer::Overlay, (200, 100));
@@ -406,7 +411,7 @@ fn only_quit_reclaim_and_vt_run_while_an_exclusive_surface_has_the_keyboard() {
 
     let bind = |o: &Compositor| o.state()["last_key"]["bind"].clone();
     chord(&orrery, &[SUPER, CTRL, TWO]);
-    assert_eq!(bind(&orrery), Value::Null, "a layout bind is the surface's key");
+    assert_eq!(layout(&orrery.state()), "halves");
     chord(&orrery, &[SUPER, ESCAPE]);
     assert_eq!(bind(&orrery), "Reclaim");
     chord(&orrery, &[SUPER, CTRL, F2]);
@@ -416,13 +421,63 @@ fn only_quit_reclaim_and_vt_run_while_an_exclusive_surface_has_the_keyboard() {
         "{}",
         orrery.log()
     );
-    assert_eq!(layout(&orrery.state()), "wall");
     // Quit stops it on the press: nothing answers the releases.
     for k in [SUPER, SHIFT, E] {
         inject(&orrery, &["key", &k.to_string(), "down"]);
     }
     let (status, _) = orrery.wait_exit();
     assert!(status.success());
+}
+
+/// xkb keycode of grave (evdev's 41 plus 8).
+const GRAVE: u32 = 49;
+
+#[test]
+fn the_bind_that_opened_a_drop_down_runs_over_it_and_plain_keys_are_its() {
+    // The live-test finding: Mod+grave opened kitty's quick-access terminal (an exclusive overlay) and could not
+    // toggle it closed. Here the bind that "opened" it runs again, a workspace bind switches, and a plain key is
+    // still the overlay's; no bind's key reaches it, press or release.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let toggled = dir.path().join("toggled");
+    let config = format!(
+        "{}binds {{\n    \"Mod+grave\" spawn \"touch\" \"{}\" launch=#false\n}}\n",
+        config::DEFAULT,
+        toggled.display()
+    );
+    let orrery = Compositor::start_with(&config, SIZE, INJECT);
+    let mut client = Client::new(orrery.connect());
+    full_window(&mut client, "a");
+    let mut spec = LayerSpec::centred("quick-access-terminal", Layer::Overlay, (200, 100));
+    spec.keyboard = KeyboardInteractivity::Exclusive;
+    let o = client.create_layer(&spec);
+    drawn(&mut client, o);
+    assert!(client.wait_for(|s| s.keyboard_layer == Some(o)));
+
+    chord(&orrery, &[SUPER, GRAVE]);
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    while !toggled.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(toggled.exists(), "the spawn bind ran");
+    chord(&orrery, &[SUPER, TWO]);
+    assert_eq!(orrery.state()["monitors"][0]["workspace"], 2, "the workspace bind ran");
+
+    chord(&orrery, &[A]);
+    assert!(
+        client.wait_for(|s| s.keys.contains(&(evdev(A), true)) && s.keys.contains(&(evdev(A), false))),
+        "{:?}",
+        client.state.keys
+    );
+    assert_eq!(client.state.keyboard_layer, Some(o), "the overlay kept the keyboard");
+    for k in [GRAVE, TWO] {
+        assert!(
+            !client.state.keys.iter().any(|p| p.0 == evdev(k)),
+            "{k}: {:?}",
+            client.state.keys
+        );
+    }
+    drop(client);
+    assert!(orrery.stop().success());
 }
 
 #[test]

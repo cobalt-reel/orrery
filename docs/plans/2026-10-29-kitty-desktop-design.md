@@ -19,7 +19,10 @@ in `examples/kitty/`. Agreed 2026-10-29. Notifications, lock and idle stay later
   a file chooser), and gives it back to the focused window when it goes; `on_demand` takes it on click; `none` never.
   Binds still work while a layer surface has the keyboard, except that `exclusive` overlays get every key but the
   escape, quit and console (`vt`) binds. (As built: the frontmost `exclusive` surface wins, the focused screen's
-  first; `exclusive` on the bottom or background layer acts as `on_demand`, as the protocol allows.)
+  first; `exclusive` on the bottom or background layer acts as `on_demand`, as the protocol allows. After the live
+  test, every bind runs over an `exclusive` surface too, as in other compositors: with only escape, quit and `vt`,
+  Mod+grave could open kitty's quick-access terminal but not close it, nor could any other bind run while it showed.
+  A bind's keys, press and release, never reach the surface; every other key does.)
 - **Pointer:** hit-testing goes overlay → top → slots → bottom → background.
 - Popups of layer surfaces (menus) work as for windows. Layer surfaces never enter stacks, tabs or workspaces. (As
   built: popups of bottom and background surfaces are drawn and hit over the windows, under top and overlay; no

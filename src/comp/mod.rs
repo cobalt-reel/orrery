@@ -423,8 +423,6 @@ pub struct Orrery {
     layers: Vec<layers::Layered>,
     /// The layer surface a click gave the keyboard, and where the stacks' focus was then (`Orrery::layer_keyboard`).
     layer_focus: Option<(WlSurface, layers::FocusKey)>,
-    /// An `exclusive` layer surface has the keyboard: binds other than quit, reclaim and vt do not run.
-    keyboard_exclusive: bool,
     /// Windows that have committed a buffer and so are in the stacks. The rest wait, configured to the slot they
     /// would open into, without hiding anything or taking focus.
     opened: HashSet<WinId>,
@@ -559,7 +557,6 @@ impl Orrery {
             surfaces: HashMap::new(),
             layers: Vec::new(),
             layer_focus: None,
-            keyboard_exclusive: false,
             opened: HashSet::new(),
             opened_before: HashSet::new(),
             pointer_seen: false,
@@ -951,9 +948,7 @@ impl Orrery {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
-        let layer = self.layer_keyboard();
-        self.keyboard_exclusive = layer.as_ref().is_some_and(|(_, exclusive)| *exclusive);
-        let want = layer.map(|(surface, _)| surface).or_else(|| {
+        let want = self.layer_keyboard().or_else(|| {
             (self.stacks.focused_window())
                 .and_then(|id| self.windows.get(&id))
                 .and_then(|w| w.toplevel())

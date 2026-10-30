@@ -18,7 +18,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::Orrery;
-use super::layers::{ABOVE, BELOW, runs_over_exclusive};
+use super::layers::{ABOVE, BELOW};
 use crate::config::{Action, Bind, Keyboard, Mods};
 use crate::ipc::{KeyView, Request};
 use crate::layout::Rect;
@@ -280,8 +280,8 @@ impl Orrery {
             .map(|(s, p)| (s, (p + origin).to_f64()))
     }
 
-    /// Decides a key's fate (see `Held`). While an `exclusive` layer surface has the keyboard, only the binds
-    /// `runs_over_exclusive` names match; every other key is the surface's.
+    /// Decides a key's fate (see `Held`). Every bind runs whoever has the keyboard, a layer surface (`exclusive` or
+    /// `on_demand`) as much as a window, as other compositors do; only keys matching no bind reach it.
     fn filter_key(
         &mut self,
         key_state: KeyState,
@@ -291,9 +291,7 @@ impl Orrery {
     ) -> FilterResult<Option<Action>> {
         match key_state {
             KeyState::Pressed => {
-                let bind = sym
-                    .and_then(|sym| find_bind(&self.config.binds, mods_of(mods), sym))
-                    .filter(|b| !self.keyboard_exclusive || runs_over_exclusive(&b.action));
+                let bind = sym.and_then(|sym| find_bind(&self.config.binds, mods_of(mods), sym));
                 self.last_key = Some(key_note(mods_of(mods), sym, bind.map(|b| &b.action)));
                 self.held.press(code, bind.map(|b| &b.action))
             }

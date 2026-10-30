@@ -14,10 +14,10 @@
 //! Order is the map's, as drawn (later in front on each layer): popups of bottom and background surfaces are drawn
 //! and hit over the windows, under top and overlay surfaces. The keyboard: an `exclusive` surface on the top or
 //! overlay layer takes it while mapped (the frontmost one, on the focused screen first) and gives it back to the
-//! focused window when it goes; while it has it, binds do not run, except quit, reclaim and vt
-//! (`runs_over_exclusive`). An `on_demand` surface takes it on a click and loses it when a window (or slot) is
+//! focused window when it goes. An `on_demand` surface takes it on a click and loses it when a window (or slot) is
 //! focused; `exclusive` on the bottom or background layer does the same, as the protocol allows. `none` never takes
-//! it. Layer surfaces never enter the stacks.
+//! it. Every bind runs whoever has the keyboard, as other compositors do: a bind's keys (its release too) never
+//! reach a layer surface, every other key does. Layer surfaces never enter the stacks.
 
 use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::{LayerMap, LayerSurface, WindowSurfaceType, layer_map_for_output};
@@ -31,7 +31,6 @@ use smithay::wayland::shell::wlr_layer::{
 };
 
 use super::Orrery;
-use crate::config::Action;
 use crate::ipc::{LayerName, LayerView};
 use crate::layout::Rect;
 use crate::stacks::WinId;
@@ -70,13 +69,6 @@ pub fn usable_area(screen: Rect, zone: Rectangle<i32, Logical>) -> Rect {
         w: zone.size.w,
         h: zone.size.h,
     }
-}
-
-/// The binds that still run while an `exclusive` layer surface has the keyboard: quitting, the escape key and the
-/// consoles, so a client grabbing the keyboard can never lock anyone out.
-#[must_use]
-pub fn runs_over_exclusive(action: &Action) -> bool {
-    matches!(action, Action::Quit | Action::Reclaim | Action::Vt(_))
 }
 
 /// A layer as `state` names it.
@@ -313,19 +305,18 @@ impl Orrery {
         })
     }
 
-    /// The layer surface that should have the keyboard, and whether it holds it exclusively: `exclusive_layer`, else
-    /// the one a click gave it while the stacks' focus has not moved since and it still takes the keyboard
-    /// (forgotten otherwise).
-    pub(super) fn layer_keyboard(&mut self) -> Option<(WlSurface, bool)> {
+    /// The layer surface that should have the keyboard: `exclusive_layer`, else the one a click gave it while the
+    /// stacks' focus has not moved since and it still takes the keyboard (forgotten otherwise).
+    pub(super) fn layer_keyboard(&mut self) -> Option<WlSurface> {
         if let Some(surface) = self.exclusive_layer() {
-            return Some((surface, true));
+            return Some(surface);
         }
         let key = self.focus_key();
         let (surface, at) = self.layer_focus.as_ref()?;
         let takes = (self.layers.iter())
             .any(|l| l.mapped && l.surface.wl_surface() == surface && l.surface.can_receive_keyboard_focus());
         if takes && *at == key {
-            return Some((surface.clone(), false));
+            return Some(surface.clone());
         }
         self.layer_focus = None;
         None
@@ -400,7 +391,6 @@ impl Orrery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Dir;
 
     const SCREEN: Rect = Rect {
         x: 1280,
@@ -634,23 +624,6 @@ mod tests {
             );
             pump(&mut display, &mut state, &conn, &mut queue, &mut bar);
             assert_eq!(bar.configure.map(|(_, w, h)| (w, h)), Some((1920, 30)));
-        }
-    }
-
-    #[test]
-    fn only_quit_reclaim_and_vt_run_over_an_exclusive_surface() {
-        assert!(runs_over_exclusive(&Action::Quit));
-        assert!(runs_over_exclusive(&Action::Reclaim));
-        assert!(runs_over_exclusive(&Action::Vt(3)));
-        for other in [
-            Action::FocusSlot(Dir::Left),
-            Action::Close,
-            Action::ShowTabs,
-            Action::Workspace(2),
-            Action::Spawn(vec!["x".into()]),
-            Action::SpawnNoLaunch(vec!["x".into()]),
-        ] {
-            assert!(!runs_over_exclusive(&other), "{other:?}");
         }
     }
 }

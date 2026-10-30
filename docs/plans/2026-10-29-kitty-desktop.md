@@ -99,4 +99,14 @@ Live test, first round: no bar. Fixed after it (one commit):
   `$ORRERY` with a child's stderr in orrery's log); 34 Python tests (4 more: the message and its stderr line, the
   identity taken at start, both scripts stopping on a replaced or removed socket before any connection).
 
+Live test, second round: Mod+grave opened kitty's quick-access terminal (an `exclusive` overlay), and then the user
+was stuck: only quit, `reclaim` and `vt` ran while it had the keyboard, so Mod+grave could not close it, nor could
+Mod+D, the workspace keys or any other bind run. Fixed after it (one commit):
+- Every bind now runs whoever has the keyboard, an `exclusive` or `on_demand` layer surface as much as a window, as in
+  other compositors; a bind's keys (press and release, as `Held` already kept them) never reach the surface, every
+  other key does. `runs_over_exclusive` and the flag behind it are gone.
+- 467 Rust tests (one unit test of the old rule gone; the end-to-end test that asserted binds were swallowed now
+  asserts they run, and a new one has the bind that opened an `exclusive` overlay run again, a workspace bind switch
+  and a plain key reach the overlay, with no bind's key reaching it); 34 Python tests.
+
 Live test: pending again (nested and bare metal).
