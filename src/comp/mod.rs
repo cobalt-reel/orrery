@@ -1396,9 +1396,12 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
     let Some(name) = state.socket_name.to_str().map(str::to_owned) else {
         bail!("the Wayland socket name is not UTF-8");
     };
+    // For whoever started orrery (scripts read it). Best effort: bare metal, stdout is often the console, which can
+    // refuse writes once orrery has the screen (EIO); that must not stop orrery, and the log line below has it too.
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "WAYLAND_DISPLAY={name}").context("cannot write to stdout")?;
-    stdout.flush().context("cannot write to stdout")?;
+    if let Err(e) = writeln!(stdout, "WAYLAND_DISPLAY={name}").and_then(|()| stdout.flush()) {
+        tracing::warn!("cannot print WAYLAND_DISPLAY to stdout ({e}); the next line has it");
+    }
     drop(stdout);
     tracing::info!("listening on WAYLAND_DISPLAY={name}");
 

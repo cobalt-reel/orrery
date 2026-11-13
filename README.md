@@ -104,7 +104,8 @@ Requirements: a seat, from logind, elogind or seatd (orrery opens the GPU and th
 directly, and needs no privileges), a GPU with KMS and GBM (Mesa), and a text console: log in on a free one
 (`Ctrl+Alt+F3`, or `doas chvt 3` / `sudo chvt 3` from a running session) and run `orrery run` there. stdout prints
 `WAYLAND_DISPLAY=...` as nested, logs go to stderr (redirect them to a file to keep them off the console:
-`orrery run 2>/tmp/orrery.log`). Clients are started from inside with `Super+Return` (a terminal that runs on Wayland,
+`orrery run 2>/tmp/orrery.log`; a console refusing the stdout line, as some do once orrery has the screen, is only
+logged). Clients are started from inside with `Super+Return` (a terminal that runs on Wayland,
 such as kitty or foot) or with `orrery msg spawn`.
 
 - **Screens:** every connected monitor at its preferred mode, named after its connector as the kernel names it
