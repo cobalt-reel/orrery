@@ -39,8 +39,8 @@ def snapshot(session=None):
     return {
         "event": "state",
         "monitors": [
-            {"name": "A", "number": 1, "workspace": 1, "layout": "x", "focused": True, "slots": ws1},
-            {"name": "B", "number": 2, "workspace": 2, "layout": "x", "focused": False, "slots": [slot(0, [])]},
+            {"name": "A", "number": 1, "workspace": 1, "layout": "tall", "focused": True, "slots": ws1},
+            {"name": "B", "number": 2, "workspace": 2, "layout": "quad", "focused": False, "slots": [slot(0, [])]},
         ],
         "workspaces": [
             {"number": 1, "monitor": "A", "shown": True, "layout": "x", "focused_slot": 0, "slots": ws1},
@@ -155,6 +155,14 @@ class Model(unittest.TestCase):
         m = model({"event": "session", "session": {"machine": "desk", "input": "desk", "machines": []}})
         self.assertEqual(m.session["machine"], "desk")
 
+    def test_each_screens_layout_comes_from_the_snapshot_and_layout_events(self):
+        self.assertEqual(model().layouts, {"A": "tall", "B": "quad"})
+        m = model({"event": "layout", "screens": [{"name": "A", "workspace": 1, "layout": "wide", "slots": []}]})
+        self.assertEqual(m.layouts, {"A": "wide"})
+        m = model({"event": "workspace", "screens": [{"name": "A", "number": 1, "workspace": 3, "focused": True}],
+                   "workspaces": [{"number": 3, "screen": "A", "shown": True, "occupied": True, "attention": False}]})
+        self.assertEqual(m.layouts["A"], "tall", "kept until a layout event says otherwise")
+
     def test_unknown_or_partial_events_change_nothing(self):
         m = model({"event": "layers", "screens": []}, {"event": "who-knows"}, {"event": "title", "id": 99})
         self.assertEqual(m.tabs, model().tabs)
@@ -193,6 +201,13 @@ class Render(unittest.TestCase):
         line = bar.render(m, "A", 60, "12:34")
         self.assertIn(bar.DIM + " 4 ", line)
         self.assertIn(bar.RESET + " 5 ", line)
+
+    def test_the_layout_sits_before_the_clock_in_the_badge_colour(self):
+        line = bar.render(model(), "A", 60, "12:34")
+        self.assertTrue(plain(line).endswith(" tall  12:34 "), plain(line))
+        self.assertIn(fg("ff7edb") + "tall", line)
+        self.assertTrue(plain(bar.render(model(), "B", 60, "12:34")).endswith(" quad  12:34 "))
+        self.assertNotIn("tall", plain(bar.render(model(), "A", 12, "12:34")), "too narrow: the clock only")
 
     def test_tabs_are_from_this_screens_workspace(self):
         self.assertIn("vim │ htop", plain(bar.render(model(), "A", 60, "00:00")))
@@ -243,7 +258,7 @@ class Render(unittest.TestCase):
         ]}
         m = bar.apply(None, snapshot(session))
         line = bar.render(m, "A", 80, "12:34")
-        self.assertTrue(plain(line).endswith(" desk side far  12:34 "), plain(line))
+        self.assertTrue(plain(line).endswith(" desk side far  tall  12:34 "), plain(line))
         self.assertIn(fg("ff7edb") + bar.BOLD + "side", line, "where input is")
         self.assertIn(bar.DIM + "far", line, "a machine whose link is down")
 

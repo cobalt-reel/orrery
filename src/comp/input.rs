@@ -185,6 +185,10 @@ pub fn action_request(action: &Action) -> Option<Request> {
             name: name.clone(),
             monitor: None,
         },
+        Action::CycleLayout(cycle) => Request::CycleLayout {
+            cycle: *cycle,
+            monitor: None,
+        },
         Action::Workspace(number) => Request::Workspace { number: *number },
         Action::MoveToWorkspace(number) => Request::MoveToWorkspace { number: *number },
         Action::Close => Request::Close,
@@ -645,6 +649,14 @@ mod tests {
         assert_eq!(action_for(MOD_SHIFT, k::KEY_exclam), None);
         assert_eq!(action_for(MOD_CTRL, k::KEY_1), Some(Action::Layout("wall".into())));
         assert_eq!(action_for(MOD_CTRL, k::KEY_2), Some(Action::Layout("halves".into())));
+        assert_eq!(
+            action_for(MOD, k::KEY_bracketright),
+            Some(Action::CycleLayout(Cycle::Next))
+        );
+        assert_eq!(
+            action_for(MOD, k::KEY_bracketleft),
+            Some(Action::CycleLayout(Cycle::Prev))
+        );
     }
 
     #[test]
@@ -831,6 +843,13 @@ mod tests {
             action_request(&Action::Layout("wall".into())),
             Some(Request::Layout {
                 name: "wall".into(),
+                monitor: None
+            })
+        );
+        assert_eq!(
+            action_request(&Action::CycleLayout(Cycle::Prev)),
+            Some(Request::CycleLayout {
+                cycle: Cycle::Prev,
                 monitor: None
             })
         );

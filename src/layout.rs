@@ -8,7 +8,7 @@ pub struct Rect {
     pub h: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotSpec {
     pub name: Option<String>,
     pub col: u32,
@@ -17,16 +17,17 @@ pub struct SlotSpec {
     pub rows: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Deserialized only as part of a state view (a link carries responses); the config is what validates one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub name: String,
     pub cols: u32,
     pub rows: u32,
     /// Relative column widths, one per column; empty means equal columns.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub col_weights: Vec<u32>,
     /// Relative row heights, one per row; empty means equal rows.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_weights: Vec<u32>,
     pub slots: Vec<SlotSpec>,
 }

@@ -405,6 +405,32 @@ fn layout_errors_name_the_problem_and_change_nothing() {
 }
 
 #[test]
+fn cycle_layout_steps_through_the_layouts_the_state_lists() {
+    let (orrery, mut client) = start();
+    open_three(&mut client);
+    let state = orrery.state();
+    let names: Vec<&str> = (state["layouts"].as_array().expect("layouts listed").iter())
+        .map(|l| l["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(names, ["wall", "halves"]);
+    assert_eq!(state["layouts"][1]["slots"].as_array().map(Vec::len), Some(2));
+
+    orrery.msg_ok(&["cycle-layout", "next"]);
+    assert_eq!(orrery.state()["monitors"][0]["layout"], "halves");
+    orrery.msg_ok(&["cycle-layout", "next", "headless"]);
+    assert_eq!(orrery.state()["monitors"][0]["layout"], "wall");
+    orrery.msg_ok(&[r#"{"cmd":"cycle-layout","cycle":"prev"}"#]);
+    assert_eq!(orrery.state()["monitors"][0]["layout"], "halves");
+    let err = orrery.msg_err(&["cycle-layout", "next", "HDMI-9"]);
+    assert!(
+        err["error"].as_str().is_some_and(|e| e.contains("unknown monitor")),
+        "{err}"
+    );
+    drop(client);
+    assert!(orrery.stop().success());
+}
+
+#[test]
 fn close_asks_the_focused_window_to_go() {
     let (orrery, mut client) = start();
     let [a, b, c] = open_three(&mut client);

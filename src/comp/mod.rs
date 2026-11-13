@@ -1223,6 +1223,7 @@ impl Orrery {
         view.frames = self.frames.view();
         view.dmabuf = self.dmabuf_view();
         view.last_key = self.last_key.clone();
+        view.layouts = self.config.layouts.clone();
         let now = Instant::now();
         view.launches = (self.launches.all().iter())
             .map(|l| LaunchView {

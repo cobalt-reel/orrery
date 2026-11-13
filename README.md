@@ -156,6 +156,7 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+1` ... `Super+9`, `Super+0` | show workspace 1 ... 9, 10 (made on the focused screen if it does not exist) |
 | `Super+Shift+1` ... `Super+Shift+0` | move the current tab (its whole stack) to workspace 1 ... 10, as a new tab in its focused slot (focus stays) |
 | `Super+Ctrl+1` / `Super+Ctrl+2` | layout `wall` / `halves` (of the workspace shown) |
+| `Super+]` / `Super+[` | the next / previous layout, in the order the config lists them, wrapping round |
 | `Super+Return` | spawn `kitty` |
 | `Super+Shift+Q` | close the focused window (asks it to close) |
 | `Super+Space` (held) | show tab strips along the top of each slot holding more than one window: one segment per tab, the current tab bright, pips for its depth |
@@ -192,6 +193,7 @@ orrery msg split                      # the top window becomes a tab of its own
 orrery msg toggle-stacking
 orrery msg spawn kitty --single-instance   # every word after spawn is the argv (so --socket goes before spawn)
 orrery msg layout halves              # optionally a monitor: orrery msg layout halves winit
+orrery msg cycle-layout next          # next | prev, in config order, wrapping; optionally a monitor, as for layout
 orrery msg workspace 3                # 1 to 10: show it on its screen (made on the focused screen if new)
 orrery msg move-to-workspace 3        # the current tab, its whole stack, to workspace 3; focus stays
 orrery msg open-screen                # one more screen, numbered the lowest free (nested: one more window)
@@ -229,7 +231,10 @@ clients may use, and `device`, the GPU named as the main device; absent headless
 bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
 Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. `colors` holds the config's colours
 (`focus`, `badge`, `attention`, `background`, each `#rrggbbaa`), for programs drawing in orrery's. In a session,
-`state` also carries `session` (see [Linking machines](#linking-machines)); alone it has none.
+`state` also carries `session` (see [Linking machines](#linking-machines)); alone it has none. `layouts` lists the
+config's layouts in config order (the order `cycle-layout` steps through), each as `{ name, cols, rows, col_weights,
+row_weights, slots }` with the weights left out when the grid has none and each slot `{ name, col, row, cols, rows }`:
+what a layout picker draws. `layouts` is in `state` only, not in the event stream's first line.
 
 ### The event stream
 
@@ -386,6 +391,7 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   | `split` | | the top window leaves its stack for a new tab right after it |
   | `toggle-stacking` | | flip `stacking` (windows orrery did not launch, with no parent) |
   | `layout` | a layout name | switch the layout of the focused screen's workspace (fewer slots: the extra slots' tabs join the last) |
+  | `cycle-layout` | `"next"`/`"prev"` | switch to the layout after / before the workspace's in config order, wrapping round (from a layout no longer in the config: the first / last) |
   | `workspace` | a number, 1 to 10 (`workspace 3`, not `"3"`) | show that workspace on its screen and focus it (made on the focused screen if new) |
   | `move-to-workspace` | a number, 1 to 10 | move the focused slot's current tab, its whole stack, to that workspace as a new tab (focus stays) |
   | `spawn` | program, then its arguments; optionally `launch=#false` | run it (no shell; see [Programs orrery starts](#programs-orrery-starts)); `launch=#false`: record no launch for it, the one property a bind takes |
@@ -449,6 +455,8 @@ binds {
     "Mod+Shift+S" toggle-stacking
     "Mod+Ctrl+1" layout "wall"
     "Mod+Ctrl+2" layout "halves"
+    "Mod+bracketright" cycle-layout "next"   // the layouts in the order written, round and round
+    "Mod+bracketleft" cycle-layout "prev"
     "Mod+1" workspace 1
     "Mod+2" workspace 2
     "Mod+3" workspace 3
@@ -663,6 +671,26 @@ screen that goes closes its layer surfaces.
   error: the client is disconnected.
 - A launched program's layer surface uses its launch up (see [Programs orrery starts](#programs-orrery-starts)).
 
+### A library of layouts
+
+`examples/layouts.kdl` holds layouts ready to include (`include "/path/to/orrery/examples/layouts.kdl"`), placed
+where they should come in the `cycle-layout` order; their names must not clash with yours. Slot 0 is the main slot
+where a layout has one, so a layout switch keeps the focused work there:
+
+| Layout | Slots | |
+|--------|-------|-|
+| `single` | 1 | the whole screen |
+| `tall` | 4 | a main slot on the left (3/5), three stacked on the right |
+| `wide` | 4 | a main slot along the top (3/5), three side by side below |
+| `centre` | 5 | a main slot in the middle (half the width), two stacked either side: for a large screen |
+| `columns` | 3 | three equal columns |
+| `quad` | 4 | two by two |
+| `six` | 6 | three by two: for a large screen |
+| `sidebar` | 3 | a main slot (3/4) and a side column of two |
+
+Give each screen its own starting layout with `monitor` rules (`monitor "DP-1" layout="centre"`), and pick any of
+them on the fly with `cycle-layout`, a `layout` bind or the kitty desktop's layout picker.
+
 ## A kitty desktop
 
 `examples/kitty/` turns orrery and [kitty](https://sw.kovidgoyal.net/kitty/) into a small desktop, each part a
@@ -673,7 +701,8 @@ script or a kitty kitten driven by `orrery msg`:
   screen has the focus; one shown on another screen in the badge colour; occupied ones plain, empty ones dim; one
   asking for attention in the attention colour; in a session, other machines' numbers dim), middle the tabs of the
   focused slot of this screen's workspace (the current one bright, titles cut to fit), right the session's machines
-  (only in a session; where input is in the focus colour, one whose link is down dim) and the time. It follows
+  (only in a session; where input is in the focus colour, one whose link is down dim), this screen's layout (in the
+  badge colour; it goes first when the bar is narrow) and the time. It follows
   `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
   ends. It belongs to the orrery whose control socket was there when it started: when that socket is gone or
   another orrery's has taken its place (one started at the same path after its quit, which runs its own bars), it
@@ -685,14 +714,18 @@ script or a kitty kitten driven by `orrery msg`:
   (desktop entries in `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, hidden ones left out) and the commands on `PATH`.
   Enter starts the choice through `orrery msg spawn`, so it opens as a new tab in the focused slot; Escape closes it.
   `launcher.sh --list` prints what it offers.
+- **A layout picker** on `Mod+backslash` (`layouts.py`): fzf in a kitty panel over the config's layouts in config
+  order, starting on the one in use, each drawn beside the list to the focused screen's proportions with its slots
+  numbered (and named, where they have names) as it is passed over. Enter lays out the workspace on the screen that
+  was focused when the picker opened; Escape closes it. `layouts.py --list` prints what it offers.
 - **File chooser and light/dark** through the desktop-ui kitten (below).
-- **`orrery.kdl`**, the snippet that brings it in: the two binds, the bars as `spawn-at-start` (each with
+- **`orrery.kdl`**, the snippet that brings it in: the three binds, the bars as `spawn-at-start` (each with
   `launch=#false`: none of them opens a window), and a
   `spawn-at-start "dbus-update-activation-environment" ...` so programs D-Bus starts (portals, the kitten) see
   orrery's `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` and `ORRERY_SOCKET`.
 
 **Needs** kitty 0.43 or later (`kitten panel`, `kitten quick-access-terminal`), python3 (the bar; standard library
-only), fzf (the launcher) and, for the environment line, `dbus-update-activation-environment` (it comes with D-Bus)
+only), fzf (the launcher and the layout picker) and, for the environment line, `dbus-update-activation-environment` (it comes with D-Bus)
 with a session bus: run orrery as `dbus-run-session orrery run` when your login has none. On a systemd login, add
 `"--systemd"` after the program name in that line so user units get the variables too.
 
@@ -702,7 +735,7 @@ with a session bus: run orrery as `dbus-run-session orrery run` when your login 
 include "/path/to/orrery/examples/kitty/orrery.kdl"
 ```
 
-The snippet's programs are written `./bars.py`, `./dropdown` and `./launcher.sh`, which orrery takes from the
+The snippet's programs are written `./bars.py`, `./dropdown`, `./launcher.sh` and `./layouts.py`, which orrery takes from the
 snippet's own directory (see [Programs orrery starts](#programs-orrery-starts)), so nothing goes on `PATH` and the
 scripts can stay where they are (or be copied together, snippet included, anywhere). Options for the bars' panels
 go after `./bars.py` (`spawn-at-start "./bars.py" "-o" "font_size=10" launch=#false`), but a snippet line cannot
@@ -919,3 +952,19 @@ Nested first (inside your desktop), then bare metal (the Bare metal checklist's 
 - [ ] Switch workspaces and back, move a GPU client's stack to another slot, resize by switching layouts: its
       content follows, never black or garbled.
 - [ ] Bare metal: switch consoles away and back (`Ctrl+Alt+F<n>`) while `vkcube` runs: it keeps spinning after.
+
+## Layouts: checklist
+
+With the kitty desktop and `examples/layouts.kdl` included (and a `monitor` rule per screen, if you like).
+
+- [ ] `orrery check` says `ok`; `orrery msg state` lists `layouts` in config order.
+- [ ] Each screen's bar shows its layout's name before the clock; it changes with every switch below, on that
+      screen only.
+- [ ] `Super+]` steps through every layout in config order and wraps round to the first; `Super+[` goes back. The
+      windows follow into the new slots (slot 0's tabs stay in slot 0, the main slot where a layout has one).
+- [ ] On the other screen (focus it first), the same: only that screen's workspace changes.
+- [ ] `Super+\`: the picker appears centred, starting on the layout in use, and draws each layout beside the list in
+      the screen's proportions as you move through it (arrows, or type a name). Enter: that layout, on the screen
+      that was focused. `Super+\` then Escape: nothing changes.
+- [ ] `orrery msg cycle-layout next DP-1` (an output name from `state`) switches that screen even when it is not
+      focused.

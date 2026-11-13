@@ -60,7 +60,11 @@ fn the_snippets_programs_are_the_scripts_beside_it_and_executable() {
         }
     }
     let ours: Vec<&String> = programs.iter().filter(|p| p.contains('/')).collect();
-    assert_eq!(ours.len(), 3, "bars.py, dropdown, launcher.sh: {programs:?}");
+    assert_eq!(
+        ours.len(),
+        4,
+        "bars.py, dropdown, launcher.sh, layouts.py: {programs:?}"
+    );
     for p in ours {
         let p = Path::new(p);
         assert!(p.starts_with(kitty_dir()), "{}", p.display());

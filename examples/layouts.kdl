@@ -1,0 +1,78 @@
+// A library of layouts. Add it to your config with
+//     include "/path/to/orrery/examples/layouts.kdl"
+// where you want them in the order `cycle-layout` steps through (after your own layouts, say). The names must not
+// clash with your own. Each works on any screen; the notes say where each shines.
+
+// One window, the whole screen.
+layout "single" {
+    grid cols=1 rows=1
+    slot "main" col=0 row=0
+}
+
+// A main slot on the left, three stacked on the right.
+layout "tall" {
+    grid cols=2 rows=3
+    widths 3 2
+    slot "main" col=0 row=0 rows=3
+    slot col=1 row=0
+    slot col=1 row=1
+    slot col=1 row=2
+}
+
+// A main slot along the top, three side by side below.
+layout "wide" {
+    grid cols=3 rows=2
+    heights 3 2
+    slot "main" col=0 row=0 cols=3
+    slot col=0 row=1
+    slot col=1 row=1
+    slot col=2 row=1
+}
+
+// A main slot in the middle at eye level, two stacked either side: for a large screen.
+layout "centre" {
+    grid cols=3 rows=2
+    widths 1 2 1
+    slot "main" col=1 row=0 rows=2
+    slot col=0 row=0
+    slot col=0 row=1
+    slot col=2 row=0
+    slot col=2 row=1
+}
+
+// Three equal columns.
+layout "columns" {
+    grid cols=3 rows=1
+    slot col=0 row=0
+    slot col=1 row=0
+    slot col=2 row=0
+}
+
+// Two by two.
+layout "quad" {
+    grid cols=2 rows=2
+    slot col=0 row=0
+    slot col=1 row=0
+    slot col=0 row=1
+    slot col=1 row=1
+}
+
+// Three by two: six at once, for a large screen.
+layout "six" {
+    grid cols=3 rows=2
+    slot col=0 row=0
+    slot col=1 row=0
+    slot col=2 row=0
+    slot col=0 row=1
+    slot col=1 row=1
+    slot col=2 row=1
+}
+
+// A wide main slot with a narrow side column of two (a browser and its terminals, a film and a chat).
+layout "sidebar" {
+    grid cols=2 rows=2
+    widths 3 1
+    slot "main" col=0 row=0 rows=2
+    slot col=1 row=0
+    slot col=1 row=1
+}

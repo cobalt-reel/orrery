@@ -36,6 +36,13 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         monitor: Option<String>,
     },
+    /// The layout after (`next`) or before (`prev`) the one the workspace shown on `monitor` has, in config order,
+    /// wrapping round; from a layout no longer in the config, the first (last). `monitor` as for `layout`.
+    CycleLayout {
+        cycle: Cycle,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        monitor: Option<String>,
+    },
     Close,
     Reload,
     Quit,
@@ -94,6 +101,7 @@ enum Wire {
     CycleTab { cycle: Cycle },
     // A missing Option field reads as None without `#[serde(default)]`.
     Layout { name: String, monitor: Option<String> },
+    CycleLayout { cycle: Cycle, monitor: Option<String> },
     Close {},
     Reload {},
     Quit {},
@@ -123,6 +131,7 @@ impl TryFrom<Wire> for Request {
             Wire::SwapSlot { dir } => Request::SwapSlot { dir },
             Wire::CycleTab { cycle } => Request::CycleTab { cycle },
             Wire::Layout { name, monitor } => Request::Layout { name, monitor },
+            Wire::CycleLayout { cycle, monitor } => Request::CycleLayout { cycle, monitor },
             Wire::Close {} => Request::Close,
             Wire::Reload {} => Request::Reload,
             Wire::Quit {} => Request::Quit,
@@ -238,6 +247,10 @@ pub struct StateView {
     pub session: Option<Box<SessionView>>,
     /// The config's colours, for programs drawing in orrery's (a bar).
     pub colors: ColorsView,
+    /// The config's layouts, in config order (what `cycle-layout` steps through), for a picker to show; `state`
+    /// only, not the event stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<crate::layout::Layout>,
 }
 
 /// linux-dmabuf as advertised: how many format and modifier pairs clients may use, and the GPU named as the main
@@ -522,6 +535,7 @@ impl StateView {
             launches: Vec::new(),
             session: None,
             colors: colors.into(),
+            layouts: Vec::new(),
         }
     }
 }
@@ -543,16 +557,27 @@ impl Request {
                     .iter()
                     .find(|l| &l.name == name)
                     .ok_or_else(|| format!("unknown layout {name:?}"))?;
-                let target = match monitor {
-                    Some(m) if stacks.monitors().iter().any(|x| x.name() == m) => m.clone(),
-                    Some(m) => return Err(format!("unknown monitor {m:?}")),
-                    None => stacks
-                        .monitors()
-                        .get(stacks.focused_monitor())
-                        .map(|x| x.name().to_owned())
-                        .ok_or("no monitor to lay out")?,
-                };
+                let target = layout_target(stacks, monitor.as_deref())?;
                 stacks.set_layout(&target, layout.clone());
+            }
+            Request::CycleLayout { cycle, monitor } => {
+                let target = layout_target(stacks, monitor.as_deref())?;
+                let layouts = &config.layouts;
+                let n = layouts.len();
+                if n == 0 {
+                    return Err("no layouts to cycle".into());
+                }
+                let current = (stacks.monitors().iter().position(|m| m.name() == target))
+                    .and_then(|i| stacks.shown(i))
+                    .map(|ws| ws.layout().name.as_str());
+                let at = layouts.iter().position(|l| Some(l.name.as_str()) == current);
+                let next = match (cycle, at) {
+                    (Cycle::Next, Some(i)) => (i + 1) % n,
+                    (Cycle::Prev, Some(i)) => (i + n - 1) % n,
+                    (Cycle::Next, None) => 0,
+                    (Cycle::Prev, None) => n - 1,
+                };
+                stacks.set_layout(&target, layouts[next].clone());
             }
             Request::Workspace { number } => {
                 if stacks.monitors().is_empty() {
@@ -592,6 +617,7 @@ impl Request {
             Request::SwapSlot { .. } => "swap-slot",
             Request::CycleTab { .. } => "cycle-tab",
             Request::Layout { .. } => "layout",
+            Request::CycleLayout { .. } => "cycle-layout",
             Request::Close => "close",
             Request::Reload => "reload",
             Request::Quit => "quit",
@@ -606,6 +632,17 @@ impl Request {
             Request::Inject { .. } => "inject",
             Request::InjectRemote { .. } => "inject-remote",
         }
+    }
+}
+
+/// The output name of the monitor a `layout` or `cycle-layout` acts on: the one named, else the focused one.
+fn layout_target(stacks: &Stacks, monitor: Option<&str>) -> Result<String, String> {
+    match monitor {
+        Some(m) if stacks.monitors().iter().any(|x| x.name() == m) => Ok(m.to_owned()),
+        Some(m) => Err(format!("unknown monitor {m:?}")),
+        None => (stacks.monitors().get(stacks.focused_monitor()))
+            .map(|x| x.name().to_owned())
+            .ok_or_else(|| "no monitor to lay out".into()),
     }
 }
 
@@ -677,6 +714,19 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
             }),
             _ => Err("`layout` takes a layout name and optionally a monitor".into()),
         },
+        "cycle-layout" => {
+            let (cycle, monitor) = match args.as_slice() {
+                [c] => (*c, None),
+                [c, m] => (*c, Some((*m).to_owned())),
+                _ => return Err("`cycle-layout` takes next or prev and optionally a monitor".into()),
+            };
+            let cycle = match cycle {
+                "next" => Cycle::Next,
+                "prev" => Cycle::Prev,
+                _ => return Err(format!("`cycle-layout` takes next or prev, not {cycle:?}")),
+            };
+            Ok(Request::CycleLayout { cycle, monitor })
+        }
         "inject" => Ok(Request::Inject {
             input: injected(Box::new(input_words(&args)?))?,
         }),
@@ -790,10 +840,11 @@ mod tests {
             Request::Inject { input } => (17, Wire::Inject { input }),
             Request::InjectRemote { machine, message } => (18, Wire::InjectRemote { machine, message }),
             Request::Subscribe => (19, Wire::Subscribe {}),
+            Request::CycleLayout { cycle, monitor } => (20, Wire::CycleLayout { cycle, monitor }),
         }
     }
 
-    const VARIANTS: usize = 20;
+    const VARIANTS: usize = 21;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -823,6 +874,14 @@ mod tests {
             },
             Request::Layout {
                 name: "wall".into(),
+                monitor: Some("winit".into()),
+            },
+            Request::CycleLayout {
+                cycle: Cycle::Next,
+                monitor: None,
+            },
+            Request::CycleLayout {
+                cycle: Cycle::Prev,
                 monitor: Some("winit".into()),
             },
             Request::Close,
@@ -1144,6 +1203,7 @@ mod tests {
                 },
                 ..Colors::default()
             }),
+            layouts: vec![layout("wall")],
         }
     }
 
@@ -1221,6 +1281,20 @@ mod tests {
                 "layout wall winit",
                 Request::Layout {
                     name: "wall".into(),
+                    monitor: Some("winit".into()),
+                },
+            ),
+            (
+                "cycle-layout next",
+                Request::CycleLayout {
+                    cycle: Cycle::Next,
+                    monitor: None,
+                },
+            ),
+            (
+                "cycle-layout prev winit",
+                Request::CycleLayout {
+                    cycle: Cycle::Prev,
                     monitor: Some("winit".into()),
                 },
             ),
@@ -1303,6 +1377,9 @@ mod tests {
             ("cycle-tab forward", "next"),
             ("layout", "layout"),
             ("layout a b c", "layout"),
+            ("cycle-layout", "next or prev"),
+            ("cycle-layout forward", "not \"forward\""),
+            ("cycle-layout next a b", "next or prev"),
             ("close now", "no arguments"),
             ("state please", "no arguments"),
             ("workspace", "1 to 10"),
@@ -1424,6 +1501,76 @@ mod tests {
         .expect_err("unknown monitor");
         assert!(err.contains("hdmi"), "{err}");
         assert_eq!(s, before);
+    }
+
+    fn cycle(s: &mut Stacks, config: &Config, cycle: Cycle, monitor: Option<&str>) -> Result<(), String> {
+        Request::CycleLayout {
+            cycle,
+            monitor: monitor.map(String::from),
+        }
+        .apply(s, config)
+    }
+
+    #[test]
+    fn cycle_layout_steps_through_the_config_order_and_wraps() {
+        let (mut s, config) = setup();
+        let names: Vec<&str> = config.layouts.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["wall", "halves"]);
+        let shown = |s: &Stacks, m: usize| s.shown(m).unwrap().layout().name.clone();
+        assert_eq!(cycle(&mut s, &config, Cycle::Next, None), Ok(()));
+        assert_eq!(shown(&s, 0), "halves");
+        assert_eq!(cycle(&mut s, &config, Cycle::Next, None), Ok(()));
+        assert_eq!(shown(&s, 0), "wall", "wraps at the end");
+        assert_eq!(cycle(&mut s, &config, Cycle::Prev, None), Ok(()));
+        assert_eq!(shown(&s, 0), "halves", "wraps at the start");
+        assert_eq!(shown(&s, 1), "halves", "the other screen keeps its layout");
+        assert_eq!(cycle(&mut s, &config, Cycle::Prev, Some("other")), Ok(()));
+        assert_eq!(shown(&s, 1), "wall");
+        assert_eq!(s.focused_monitor(), 0, "a named monitor takes no focus");
+    }
+
+    #[test]
+    fn cycle_layout_matches_layout_by_name() {
+        let (mut via_cycle, config) = setup();
+        let (mut via_name, _) = setup();
+        assert_eq!(cycle(&mut via_cycle, &config, Cycle::Next, None), Ok(()));
+        let named = Request::Layout {
+            name: "halves".into(),
+            monitor: None,
+        };
+        assert_eq!(named.apply(&mut via_name, &config), Ok(()));
+        assert_eq!(via_cycle, via_name);
+    }
+
+    #[test]
+    fn cycle_layout_from_a_layout_gone_from_the_config_starts_at_an_end() {
+        let (mut s, mut config) = setup();
+        let gone = |config: &Config| crate::layout::Layout {
+            name: "gone".into(),
+            ..config.layouts[1].clone()
+        };
+        s.set_layout("winit", gone(&config));
+        config.layouts.push(crate::layout::Layout {
+            name: "third".into(),
+            ..config.layouts[1].clone()
+        });
+        assert_eq!(cycle(&mut s, &config, Cycle::Next, None), Ok(()));
+        assert_eq!(s.shown(0).unwrap().layout().name, "wall", "next: the first");
+        s.set_layout("winit", gone(&config));
+        assert_eq!(cycle(&mut s, &config, Cycle::Prev, None), Ok(()));
+        assert_eq!(s.shown(0).unwrap().layout().name, "third", "prev: the last");
+    }
+
+    #[test]
+    fn cycle_layout_errors_change_nothing() {
+        let (mut s, config) = setup();
+        let before = s.clone();
+        let err = cycle(&mut s, &config, Cycle::Next, Some("hdmi")).expect_err("unknown monitor");
+        assert!(err.contains("hdmi"), "{err}");
+        assert_eq!(s, before);
+        let mut empty = Stacks::new();
+        assert!(cycle(&mut empty, &config, Cycle::Next, None).is_err(), "no monitor");
+        assert_eq!(empty, Stacks::new());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-// A kitty desktop: a bar on every screen, a drop-down terminal and a launcher. Add it to your config with
+// A kitty desktop: a bar on every screen, a drop-down terminal, a launcher and a layout picker. Add it to your
+// config with
 //     include "/path/to/orrery/examples/kitty/orrery.kdl"
 // Programs starting with ./ are taken from this file's directory. None of the programs here opens a window, so none
 // is recorded as a launch (launch=#false) that would wait for one. Needs kitty 0.43 or later, python3, and fzf for
@@ -16,4 +17,5 @@ spawn-at-start "./bars.py" launch=#false
 binds {
     "Mod+grave" spawn "./dropdown" launch=#false      // kitty's quick-access terminal: shows or hides it
     "Mod+D" spawn "./launcher.sh" launch=#false       // applications and commands, through fzf
+    "Mod+backslash" spawn "./layouts.py" launch=#false   // the layouts, drawn, through fzf
 }

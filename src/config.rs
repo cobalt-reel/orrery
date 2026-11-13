@@ -57,6 +57,8 @@ pub enum Action {
     Split,
     ToggleStacking,
     Layout(String),
+    /// The next / previous layout in config order, on the focused screen's workspace.
+    CycleLayout(Cycle),
     /// 1..=WORKSPACES.
     Workspace(u8),
     /// 1..=WORKSPACES.
@@ -1412,6 +1414,14 @@ impl<'a> Parser<'a> {
                 }
             },
             ("layout", Some([name])) => Action::Layout((*name).to_owned()),
+            ("cycle-layout", Some([c])) => match *c {
+                "next" => Action::CycleLayout(Cycle::Next),
+                "prev" => Action::CycleLayout(Cycle::Prev),
+                other => {
+                    self.err_at(arg_at, format!("{other:?} is not a cycle (next, prev)"));
+                    return None;
+                }
+            },
             ("spawn", Some([program, args @ ..])) if !program.is_empty() && args.iter().all(|a| !a.is_empty()) => {
                 let program = self.program(program);
                 Action::Spawn(
@@ -1430,6 +1440,10 @@ impl<'a> Parser<'a> {
             }
             ("layout", _) => {
                 self.err_at(verb_at, "`layout` takes one layout name");
+                return None;
+            }
+            ("cycle-layout", _) => {
+                self.err_at(verb_at, "`cycle-layout` takes \"next\" or \"prev\"");
                 return None;
             }
             ("spawn", _) => {
@@ -1749,6 +1763,13 @@ mod tests {
                 bind(MOD_SHIFT, "S", k::KEY_s, Action::ToggleStacking),
                 bind(MOD_CTRL, "1", k::KEY_1, Action::Layout("wall".into())),
                 bind(MOD_CTRL, "2", k::KEY_2, Action::Layout("halves".into())),
+                bind(
+                    MOD,
+                    "bracketright",
+                    k::KEY_bracketright,
+                    Action::CycleLayout(Cycle::Next),
+                ),
+                bind(MOD, "bracketleft", k::KEY_bracketleft, Action::CycleLayout(Cycle::Prev)),
             ]
             .into_iter()
             .chain(digit_binds(MOD, Action::Workspace))
@@ -2052,6 +2073,12 @@ mod tests {
         assert_problem(&with_line(n, "    \"Mod+H\" focus-slot \"west\""), n, "west");
         let n = line_of("\"Mod+Tab\"");
         assert_problem(&with_line(n, "    \"Mod+Tab\" cycle-tab \"sideways\""), n, "sideways");
+        assert_problem(
+            &with_line(n, "    \"Mod+Tab\" cycle-layout \"sideways\""),
+            n,
+            "sideways",
+        );
+        assert_problem(&with_line(n, "    \"Mod+Tab\" cycle-layout"), n, "cycle-layout");
     }
 
     #[test]

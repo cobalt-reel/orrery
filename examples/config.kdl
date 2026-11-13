@@ -49,6 +49,8 @@ binds {
     "Mod+Shift+S" toggle-stacking
     "Mod+Ctrl+1" layout "wall"
     "Mod+Ctrl+2" layout "halves"
+    "Mod+bracketright" cycle-layout "next"   // the layouts in the order written, round and round
+    "Mod+bracketleft" cycle-layout "prev"
     "Mod+1" workspace 1
     "Mod+2" workspace 2
     "Mod+3" workspace 3

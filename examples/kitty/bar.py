@@ -5,7 +5,8 @@
 
 Left the workspaces (the one shown on this screen highlighted, occupied ones plain, empty ones dim, one asking for
 attention in the attention colour), middle the tabs of the focused slot of this screen's workspace (the current one
-bright), right the session's machines (only in a session; where input is in the focus colour) and the time. Driven
+bright), right the session's machines (only in a session; where input is in the focus colour), this screen's layout
+(in the badge colour) and the time. Driven
 by `orrery msg subscribe` ($ORRERY, which orrery sets for what it starts, else `orrery` on PATH); colours from
 orrery's config; it stops when its orrery's socket is gone or replaced (see Seen). Python 3 standard library
 only.
@@ -152,6 +153,7 @@ class Model:
         self.screens = {}  # name -> {number, workspace, focused}
         self.workspaces = {}  # number -> {screen, shown, occupied, attention}
         self.tabs = {}  # workspace number -> [{current, attention, windows: [{id, app_id, title}]}]
+        self.layouts = {}  # screen name -> the layout of the workspace it shows
         self.colors = {}  # name -> (r, g, b)
         self.session = None
 
@@ -164,6 +166,8 @@ class Model:
                 "workspace": mon.get("workspace"),
                 "focused": bool(mon.get("focused")),
             }
+            if mon.get("layout"):
+                m.layouts[mon.get("name")] = mon["layout"]
         for w in ev.get("workspaces") or []:
             slots = w.get("slots") or []
             tabs = [t for s in slots for t in s.get("tabs") or []]
@@ -227,6 +231,8 @@ class Model:
             numbers = set(ev.get("workspaces") or [])
             for n, w in self.workspaces.items():
                 w["attention"] = n in numbers
+        elif kind == "layout" and "screens" in ev:
+            self.layouts = {s.get("name"): s["layout"] for s in ev["screens"] if s.get("layout")}
         elif kind == "session":
             self.session = ev.get("session")
         elif kind == "config" and ev.get("colors"):
@@ -343,6 +349,11 @@ def render(model, screen, width, clock):
     """The bar's line for `screen`, exactly `width` cells wide, ending in RESET (SGR sequences only, no movement)."""
     right = [("", clock), ("", " ")]
     if model is not None:
+        layout = model.layouts.get(screen)
+        if layout:
+            seg = [(fg(model.colors.get("badge")), clean(layout)), ("", "  ")]
+            if segments_width(seg) + segments_width(right) + 1 <= width:
+                right = seg + right
         session = session_segments(model)
         if session and segments_width(session) + 2 + segments_width(right) + 1 <= width:
             right = session + [("", "  ")] + right
