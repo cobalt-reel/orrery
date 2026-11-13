@@ -49,13 +49,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::egl::context::{GlAttributes, PixelFormatRequirements};
 use smithay::backend::egl::native::{EGLNativeDisplay, EGLPlatform, XlibWindow};
-use smithay::backend::egl::{EGLContext, EGLDisplay, EGLSurface, SwapBuffersError, ffi};
+use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay, EGLSurface, SwapBuffersError, ffi};
 use smithay::backend::input::InputEvent;
-use smithay::backend::renderer::Bind;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::{Bind, ImportDma};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -131,6 +132,15 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
         );
     }
     state.screens = Some(Box::new(Screens { host: host.clone() }));
+    // linux-dmabuf: what the shared renderer imports, the host's GPU (its render node) as the main device.
+    let (formats, node) = {
+        let h = host.borrow();
+        let formats = h.renderer.dmabuf_formats().iter().copied().collect();
+        let node = (EGLDevice::device_for_display(h.renderer.egl_context().display()).ok())
+            .and_then(|device| device.try_get_render_node().ok().flatten());
+        (formats, node)
+    };
+    state.advertise_dmabuf(formats, node, Box::new(HostImport { host: host.clone() }));
 
     let timer_host = host.clone();
     event_loop
@@ -255,6 +265,24 @@ struct Screen {
     skipped_since_submit: bool,
     /// When a failed frame was last logged (see `warn_due`).
     warned: Option<Instant>,
+}
+
+/// Client dmabufs into the renderer every window shares (see `super::dmabuf`).
+struct HostImport {
+    host: Rc<RefCell<Host>>,
+}
+
+impl super::dmabuf::DmabufImport for HostImport {
+    fn import(&mut self, dmabuf: &Dmabuf) -> Result<(), String> {
+        // Client requests are dispatched outside any borrow of the host; should that change, the buffer is let
+        // through untried and imported when first drawn.
+        let Ok(mut host) = self.host.try_borrow_mut() else {
+            return Ok(());
+        };
+        (host.renderer.import_dmabuf(dmabuf, None))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Opening and closing nested screens: windows.

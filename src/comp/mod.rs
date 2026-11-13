@@ -6,6 +6,7 @@ mod backend_drm;
 mod backend_headless;
 mod backend_winit;
 pub mod cursor_theme;
+mod dmabuf;
 mod forward;
 mod frames;
 mod handlers;
@@ -41,6 +42,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, get_parent, with_states};
+use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
@@ -492,6 +494,9 @@ pub struct Orrery {
     pub xdg_activation_state: XdgActivationState,
     pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
+    /// The linux-dmabuf global a GPU backend advertised (`advertise_dmabuf`); None headless or without imports.
+    dmabuf: Option<dmabuf::Advertised>,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Orrery>,
     pub data_device_state: DataDeviceState,
@@ -531,6 +536,7 @@ impl Orrery {
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let dmabuf_state = DmabufState::new();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let mut seat_state = SeatState::new();
@@ -594,6 +600,8 @@ impl Orrery {
             xdg_activation_state,
             layer_shell_state,
             shm_state,
+            dmabuf_state,
+            dmabuf: None,
             output_manager_state,
             seat_state,
             data_device_state,
@@ -1200,6 +1208,7 @@ impl Orrery {
     pub fn state_view(&self) -> StateView {
         let mut view = self.summary_view();
         view.frames = self.frames.view();
+        view.dmabuf = self.dmabuf_view();
         view.last_key = self.last_key.clone();
         let now = Instant::now();
         view.launches = (self.launches.all().iter())

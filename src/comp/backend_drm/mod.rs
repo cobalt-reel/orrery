@@ -50,14 +50,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement, RenderFrameError};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata, DrmEventTime};
+use smithay::backend::drm::{
+    DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType,
+};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{ButtonState, InputEvent, PointerButtonEvent, PointerMotionEvent};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -138,6 +142,24 @@ pub fn init(event_loop: &mut EventLoop<'static, Orrery>, state: &mut Orrery) -> 
             backend.borrow().path.display()
         );
     }
+    // linux-dmabuf: what the renderer imports, the GPU's render node (else its card node) as the main device.
+    let (formats, node) = {
+        let b = backend.borrow();
+        let formats = b.renderer.dmabuf_formats().iter().copied().collect();
+        let node = DrmNode::from_path(&b.path).ok().map(|card| {
+            (card.node_with_type(NodeType::Render))
+                .and_then(Result::ok)
+                .unwrap_or(card)
+        });
+        (formats, node)
+    };
+    state.advertise_dmabuf(
+        formats,
+        node,
+        Box::new(GpuImport {
+            backend: backend.clone(),
+        }),
+    );
     state.screens = Some(Box::new(Screens));
     state.consoles = Some(Box::new(Consoles { session }));
     state.draws_pointer = true;
@@ -228,6 +250,24 @@ struct Backend {
     reset_spent: bool,
     /// The clock page-flip events are stamped on.
     clock: Clock<Monotonic>,
+}
+
+/// Client dmabufs into the renderer (see `super::dmabuf`).
+struct GpuImport {
+    backend: Rc<RefCell<Backend>>,
+}
+
+impl super::dmabuf::DmabufImport for GpuImport {
+    fn import(&mut self, dmabuf: &Dmabuf) -> Result<(), String> {
+        // Client requests are dispatched outside any borrow of the backend; should that change, the buffer is let
+        // through untried and imported when first drawn.
+        let Ok(mut backend) = self.backend.try_borrow_mut() else {
+            return Ok(());
+        };
+        (backend.renderer.import_dmabuf(dmabuf, None))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// One connector driven as a screen, in opening order.

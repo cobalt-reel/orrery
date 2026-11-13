@@ -56,3 +56,24 @@ fn headless_offers_shell_and_decorations_and_stops_cleanly() {
     let status = orrery.stop();
     assert!(status.success(), "clean exit, got {status}");
 }
+
+#[test]
+fn headless_advertises_no_dmabuf() {
+    // No renderer, so no linux-dmabuf: clients keep to shared memory, and the state says nothing about it.
+    let orrery = Compositor::start(orrery_wm::config::DEFAULT, (1280, 720));
+    let conn = orrery.connect();
+    let mut queue = conn.new_event_queue();
+    let _registry = conn.display().get_registry(&queue.handle(), ());
+    let mut globals = Globals::default();
+    queue.roundtrip(&mut globals).expect("roundtrip");
+    assert!(
+        !globals.0.iter().any(|g| g == "zwp_linux_dmabuf_v1"),
+        "no dmabuf headless; got {:?}",
+        globals.0
+    );
+    let state = orrery.state();
+    assert!(state.get("dmabuf").is_none(), "no dmabuf in the state: {state}");
+    drop(queue);
+    drop(conn);
+    assert!(orrery.stop().success());
+}

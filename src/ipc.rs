@@ -222,6 +222,10 @@ pub struct StateView {
     /// How long drawing a frame takes (the renderer's backends only; absent before the first frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<FramesView>,
+    /// What linux-dmabuf advertises (backends drawing with a GPU only; absent headless or when the renderer imports
+    /// no client buffers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dmabuf: Option<DmabufView>,
     /// The last key press the compositor saw, as its bind lookup read it (absent before the first): what to look
     /// at when a bind does nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +238,15 @@ pub struct StateView {
     pub session: Option<Box<SessionView>>,
     /// The config's colours, for programs drawing in orrery's (a bar).
     pub colors: ColorsView,
+}
+
+/// linux-dmabuf as advertised: how many buffer formats clients may use, and the GPU named as the main device of the
+/// default feedback (absent for a version 3 global, which has none).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmabufView {
+    pub formats: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// The config's `colors`, each `#rrggbbaa`.
@@ -504,6 +517,7 @@ impl StateView {
             stacking,
             config_error,
             frames: None,
+            dmabuf: None,
             last_key: None,
             launches: Vec::new(),
             session: None,
@@ -1085,6 +1099,10 @@ mod tests {
                 mean_us: 200,
                 p95_us: 300,
                 max_us: 400,
+            }),
+            dmabuf: Some(DmabufView {
+                formats: 42,
+                device: Some("/dev/dri/renderD128".into()),
             }),
             last_key: Some(KeyView {
                 key: "h".into(),
