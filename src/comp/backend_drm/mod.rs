@@ -61,8 +61,8 @@ use smithay::backend::drm::{
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{ButtonState, InputEvent, PointerButtonEvent, PointerMotionEvent};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::{ImportDma, Renderer};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
@@ -224,7 +224,8 @@ fn gpu_path(seat: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// What the event sources share, behind one `Rc<RefCell>`. Borrowed only briefly, never across a call into `Orrery`
-/// that could reach back here (nothing in `Orrery` holds it: `Screens` and `Consoles` keep their own).
+/// that could reach back here (`Screens` and `Consoles` keep their own; `Orrery` holds it only through the dmabuf
+/// importer, which yields to a borrow by letting the buffer through untried).
 struct Backend {
     // Declaration order is drop order: the screens' surfaces and swapchains go before the renderer, the buffers'
     // device and the DRM device they were made on.
@@ -264,6 +265,10 @@ impl super::dmabuf::DmabufImport for GpuImport {
         let Ok(mut backend) = self.backend.try_borrow_mut() else {
             return Ok(());
         };
+        // Buffers enter the renderer's texture cache here, at creation; it is otherwise purged only after a drawn
+        // frame, so a client recreating buffers while nothing is drawn (another console, a hidden window) would pin
+        // the dead ones' memory.
+        let _ = backend.renderer.cleanup_texture_cache();
         (backend.renderer.import_dmabuf(dmabuf, None))
             .map(|_| ())
             .map_err(|e| e.to_string())

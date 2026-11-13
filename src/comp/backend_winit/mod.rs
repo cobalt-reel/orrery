@@ -56,7 +56,7 @@ use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay, EGLSurface, SwapB
 use smithay::backend::input::InputEvent;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::{Bind, ImportDma};
+use smithay::backend::renderer::{Bind, ImportDma, Renderer};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -236,8 +236,9 @@ impl EGLNativeDisplay for HostDisplay {
 }
 
 /// What every window shares, behind one `Rc<RefCell>` held by the event source (creating windows, routing their
-/// events, drawing), the timer (redraw requests) and `Screens` (opening, closing). Borrowed only briefly, never
-/// across a call into `Orrery` that could reach `Screens`.
+/// events, drawing), the timer (redraw requests), `Screens` (opening, closing) and the dmabuf importer (which yields
+/// to a borrow by letting the buffer through untried). Borrowed only briefly, never across a call into `Orrery` that
+/// could reach `Screens`.
 struct Host {
     renderer: GlesRenderer,
     /// EGL can swap with damage; without, every frame is a full one (age 0).
@@ -279,6 +280,10 @@ impl super::dmabuf::DmabufImport for HostImport {
         let Ok(mut host) = self.host.try_borrow_mut() else {
             return Ok(());
         };
+        // Buffers enter the renderer's texture cache here, at creation; it is otherwise purged only after a drawn
+        // frame, so a client recreating buffers while nothing is drawn (another console, a hidden window) would pin
+        // the dead ones' memory.
+        let _ = host.renderer.cleanup_texture_cache();
         (host.renderer.import_dmabuf(dmabuf, None))
             .map(|_| ())
             .map_err(|e| e.to_string())

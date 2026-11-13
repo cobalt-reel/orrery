@@ -121,8 +121,8 @@ such as kitty or foot) or with `orrery msg spawn`.
   button held; switching back redraws everything (monitors plugged meanwhile are picked up then).
 - `Super+Shift+E` quits, giving the console back; so does a crash (the seat restores it).
 - No seat, no GPU or no connected monitor: orrery says which and exits non-zero.
-- Limits: one GPU (the boot one); no Xwayland; no hardware cursor (the pointer is drawn into each frame); no
-  linux-dmabuf yet, so OpenGL clients render in software (shared memory) and Vulkan clients fail to start; scale 1,
+- Limits: one GPU (the boot one); no Xwayland; no hardware cursor (the pointer is drawn into each frame); client
+  buffers are drawn into each frame, never put on a monitor directly (see linux-dmabuf); scale 1,
   each monitor at its preferred mode; no lock or idle; touchpads keep libinput's
   defaults (no tap-to-click, no natural scrolling); keyboard LEDs (Caps Lock, Num Lock) do not light; touch and
   tablet tools are ignored, and absolute pointers (a virtual machine's, say) map onto the screen the pointer is on.
@@ -221,7 +221,9 @@ top; `attention` is true when a window of that tab asked to be seen. Besides the
 spawns, oldest first, as `{ pid, token, age_ms, claimed }`: the activation token each was handed and whether a
 window has taken it; a debug aid; one over 5 s old no longer counts and goes on the next spawn, new window or
 activation), `frames` (how long drawing a frame takes on the compositor thread: `count`, `min_us`, `mean_us`,
-`p95_us`, `max_us` over about the last minute; absent before the first frame and headless, which draws nothing) and
+`p95_us`, `max_us` over about the last minute; absent before the first frame and headless, which draws nothing),
+`dmabuf` (what [linux-dmabuf](#gpu-buffers-linux-dmabuf) advertises: `formats`, how many format and modifier pairs
+clients may use, and `device`, the GPU named as the main device; absent headless) and
 `last_key`: the last key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a
 bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
 Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. `colors` holds the config's colours
@@ -728,6 +730,21 @@ scheme, accent colour, the chooser's size and kitty options) are in `~/.config/k
 `/usr/lib/xdg-desktop-portal -r -v` (the path varies by distribution) logs which backend the portal picks for what,
 and why.
 
+## GPU buffers (linux-dmabuf)
+
+Bare metal and nested, orrery offers `zwp_linux_dmabuf_v1`: OpenGL and Vulkan clients render on the GPU and hand
+orrery their buffers, which it draws without copying. It advertises the formats its renderer can import, with the
+GPU's render node as the main device of the default feedback (bare metal the GPU orrery drives, nested the host's
+GPU); with no render node to name it offers the formats alone (version 3). Every buffer a client creates is tried
+in the renderer once; one the GPU cannot use is refused there, at creation. The log names the formats and the device
+at start (`dmabuf: 212 format/modifier pairs, main device /dev/dri/renderD128`), and so does `orrery msg state`
+(`dmabuf`). Mesa's OpenGL clients need that device to be a render node: with only a card node, or none, they keep
+rendering in software and only Vulkan clients use the GPU (the log warns).
+Headless has no renderer and offers none: its clients use shared memory, as clients without GPU drivers do anywhere.
+
+Limits: one GPU (a client rendering on another GPU may have its buffers refused); client buffers are always drawn into
+orrery's frame, never put on a monitor plane directly; implicit synchronization only (no explicit sync protocol).
+
 ## Limits
 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
@@ -870,3 +887,21 @@ echo "include \"$PWD/examples/kitty/orrery.kdl\"" >> /tmp/orrery-try.kdl
 - [ ] Quit orrery: within a minute no `bars.py` or `bar.py` is left running (`pgrep -f bars.py`).
 - [ ] desktop-ui (optional): after the steps above, a file dialog (e.g. a browser's Save As) is kitty's chooser,
       and `kitten desktop-ui set-color-scheme dark` turns a portal-following program dark.
+
+## linux-dmabuf: checklist
+
+Nested first (inside your desktop), then bare metal (the Bare metal checklist's console). Have `eglinfo`
+(mesa-utils/mesa-progs), `vkcube` (vulkan-tools) and kitty at hand.
+
+- [ ] Start orrery: its log says `dmabuf: <n> format/modifier pairs, main device /dev/dri/renderD<n>` (no warning);
+      `orrery msg state` shows the same as `dmabuf`.
+- [ ] In a terminal inside orrery, `eglinfo -B -p wayland`: the OpenGL renderer is your GPU (`Mesa Intel(R) ...`,
+      say), not `llvmpipe`.
+- [ ] `kitty` opens and types normally; scrolling a long `ls -lR /usr` stays smooth, and `top` (outside orrery
+      nested, another console bare metal) shows kitty and orrery using little CPU.
+- [ ] `vkcube --wsi wayland`: the cube spins smoothly in its slot.
+- [ ] A browser: `chrome://gpu` (Chromium-based) or `about:support` (Firefox) reports hardware acceleration for
+      compositing and WebGL; a video plays smoothly.
+- [ ] Switch workspaces and back, move a GPU client's stack to another slot, resize by switching layouts: its
+      content follows, never black or garbled.
+- [ ] Bare metal: switch consoles away and back (`Ctrl+Alt+F<n>`) while `vkcube` runs: it keeps spinning after.

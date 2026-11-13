@@ -240,8 +240,8 @@ pub struct StateView {
     pub colors: ColorsView,
 }
 
-/// linux-dmabuf as advertised: how many buffer formats clients may use, and the GPU named as the main device of the
-/// default feedback (absent for a version 3 global, which has none).
+/// linux-dmabuf as advertised: how many format and modifier pairs clients may use, and the GPU named as the main
+/// device of the default feedback (absent for a version 3 global, which has none).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmabufView {
     pub formats: usize,
