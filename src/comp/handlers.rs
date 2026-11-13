@@ -3,7 +3,11 @@
 //! `LayerMap`'s for layer surfaces, see `layers`).
 
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
-use smithay::desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords};
+use smithay::desktop::{
+    PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, find_popup_root_surface,
+    get_popup_toplevel_coords,
+};
+use smithay::input::pointer::Focus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_protocols::xdg::activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -147,8 +151,41 @@ impl XdgShellHandler for Orrery {
         answer_state_request(&surface);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // Popup grabs (menus closing on outside clicks, popup_done) are not handled yet.
+    /// A popup's grab (a menu opened on a click): it takes the keyboard and the pointer until it closes, and a click
+    /// outside its client closes the whole chain (`popup_done`). Refused (the popup closed at once) when the seat is
+    /// held by another grab this one does not follow from (a submenu follows its menu's).
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Orrery>::from_resource(&seat) else {
+            return;
+        };
+        let popup = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&popup) else {
+            return;
+        };
+        let mut grab = match self.popups.grab_popup(root, popup, &seat, serial) {
+            Ok(grab) => grab,
+            Err(e) => {
+                tracing::debug!("popup grab refused: {e:?}");
+                return;
+            }
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            let follows = keyboard.has_grab(serial) || keyboard.has_grab(grab.previous_serial().unwrap_or(serial));
+            if keyboard.is_grabbed() && !follows {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            let previous = grab.previous_serial().unwrap_or_else(|| grab.serial());
+            if pointer.is_grabbed() && !(pointer.has_grab(serial) || pointer.has_grab(previous)) {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 }
 

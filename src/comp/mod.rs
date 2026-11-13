@@ -951,7 +951,9 @@ impl Orrery {
         self.update_pointer_focus();
     }
 
-    /// The keyboard to the layer surface that should have it (`layer_keyboard`), else the focused window.
+    /// The keyboard to the layer surface that should have it (`layer_keyboard`), else the focused window. A popup
+    /// grab (an open menu) keeps the keyboard while its window is still the one to focus; when the focus moves away
+    /// (another slot, workspace or layer surface), its menus are closed first, ending the grab.
     fn update_keyboard_focus(&mut self) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -962,6 +964,17 @@ impl Orrery {
                 .and_then(|w| w.toplevel())
                 .map(|t| t.wl_surface().clone())
         });
+        if keyboard.is_grabbed() {
+            let popup = keyboard.current_focus().and_then(|s| self.popups.find_popup(&s));
+            if let Some(popup) = popup
+                && let Ok(root) = find_popup_root_surface(&popup)
+            {
+                if want.as_ref() == Some(&root) {
+                    return;
+                }
+                let _ = PopupManager::dismiss_popup(&root, &popup);
+            }
+        }
         if keyboard.current_focus() != want {
             keyboard.set_focus(self, want, SERIAL_COUNTER.next_serial());
         }

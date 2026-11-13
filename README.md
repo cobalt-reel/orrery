@@ -730,6 +730,14 @@ scheme, accent colour, the chooser's size and kitty options) are in `~/.config/k
 `/usr/lib/xdg-desktop-portal -r -v` (the path varies by distribution) logs which backend the portal picks for what,
 and why.
 
+## Menus (popup grabs)
+
+A menu a client opens on a click (an `xdg_popup` with a grab) takes the keyboard and the pointer while it is open,
+and its submenus follow it. A click outside the menu's client closes the whole chain (`popup_done`), as does moving
+the focus away from its window: another slot, workspace or layer surface (a launcher, say); a click elsewhere in the
+same client is the client's to handle (it closes its own menus). A grab is refused, the menu closing at once, when
+another grab holds the seat that the new one does not follow from.
+
 ## GPU buffers (linux-dmabuf)
 
 Bare metal and nested, orrery offers `zwp_linux_dmabuf_v1`: OpenGL and Vulkan clients render on the GPU and hand
@@ -750,7 +758,6 @@ orrery's frame, never put on a monitor plane directly; implicit synchronization 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
 - Nested, the host's cursor stands for orrery's own pointer: orrery draws a cursor only for a pointer moved from
   another machine. Bare metal it always draws it (see Bare metal).
-- No popup grabs: menus open and work, but a click elsewhere does not dismiss them by itself.
 - Maximize and fullscreen requests are ignored: a window is always its slot's size.
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.

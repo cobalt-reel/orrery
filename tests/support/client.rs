@@ -95,6 +95,8 @@ pub struct State {
     /// The layer surface, or popup, under the pointer.
     pub pointer_layer: Option<usize>,
     pub pointer_popup: Option<usize>,
+    /// The serial of the latest wl_pointer.button press (what a popup grab answers).
+    pub press_serial: Option<u32>,
     /// wl_pointer.button events in order: (button, pressed).
     pub buttons: Vec<(u32, bool)>,
     /// wl_pointer.motion events so far, and the latest one's position (surface-local).
@@ -337,6 +339,15 @@ impl Client {
 
     /// A 10×10 popup on window `parent`, mapped on its first configure; returns its index in `popups`.
     pub fn create_popup(&mut self, parent: usize) -> usize {
+        self.popup_on(parent, None)
+    }
+
+    /// The same, grabbing the seat with `serial` (a button press's) before its first commit, as a menu does.
+    pub fn create_grabbed_popup(&mut self, parent: usize, serial: u32) -> usize {
+        self.popup_on(parent, Some(serial))
+    }
+
+    fn popup_on(&mut self, parent: usize, grab: Option<u32>) -> usize {
         let qh = self.queue.handle();
         let i = self.state.popups.len();
         let id = PopupId(i);
@@ -350,6 +361,9 @@ impl Client {
         let parent = s.windows[parent].xdg_surface.as_ref().expect("live parent");
         let popup = xdg_surface.get_popup(Some(parent), &positioner, &qh, id);
         positioner.destroy();
+        if let Some(serial) = grab {
+            popup.grab(s.seat.as_ref().expect("seat"), serial);
+        }
         surface.commit();
         self.state.popups.push(Popup {
             surface: Some(surface),
@@ -890,10 +904,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.motions += 1;
                 state.pointer_at = Some((surface_x, surface_y));
             }
-            wl_pointer::Event::Button { button, state: b, .. } => {
-                state
-                    .buttons
-                    .push((button, b == WEnum::Value(wl_pointer::ButtonState::Pressed)));
+            wl_pointer::Event::Button {
+                button,
+                state: b,
+                serial,
+                ..
+            } => {
+                let pressed = b == WEnum::Value(wl_pointer::ButtonState::Pressed);
+                if pressed {
+                    state.press_serial = Some(serial);
+                }
+                state.buttons.push((button, pressed));
             }
             _ => {}
         }
