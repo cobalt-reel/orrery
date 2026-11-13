@@ -21,6 +21,7 @@ monitor "winit" layout="wall"     // output name -> starting layout; unknown out
 // keyboard { layout "us"; options "ctrl:nocaps"; repeat-delay 200; repeat-rate 25 }  // unset: XKB_DEFAULT_*
 
 stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
+// focus-follows-mouse #true  // the slot under the pointer takes the focus as it moves in; left out: a click focuses
 
 colors {
     focus "#ff7edb"

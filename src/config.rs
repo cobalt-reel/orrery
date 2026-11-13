@@ -106,6 +106,9 @@ pub struct Config {
     /// Where a window with nowhere else to go opens at startup: on top of the focused stack, or (false) as a new
     /// tab there. The running value is the compositor's (`toggle-stacking`).
     pub stacking: bool,
+    /// The slot under the pointer takes the focus as the pointer moves into it (true), or only on a click (false,
+    /// the default).
+    pub focus_follows_mouse: bool,
     pub colors: Colors,
     pub binds: Vec<Bind>,
     /// This machine's place in a session of linked orrerys (`listen` or `primary`); None: alone.
@@ -710,6 +713,7 @@ impl<'a> Parser<'a> {
         let mut layout_names: Vec<String> = Vec::new();
         let mut monitors: Vec<RawMonitor> = Vec::new();
         let mut stacking: Option<bool> = None;
+        let mut focus_follows_mouse: Option<bool> = None;
         let mut colors: Option<Colors> = None;
         let mut raw_binds: Vec<RawBind> = Vec::new();
         let mut link: Option<LinkConfig> = None;
@@ -763,6 +767,17 @@ impl<'a> Parser<'a> {
                     match positional(node).as_slice() {
                         [e] if e.value().as_bool().is_some() => stacking = e.value().as_bool(),
                         _ => self.err(node, "`stacking` takes #true or #false"),
+                    }
+                }
+                "focus-follows-mouse" => {
+                    if focus_follows_mouse.is_some() {
+                        self.err(node, "`focus-follows-mouse` is set twice");
+                    }
+                    self.no_children(node);
+                    self.props(node, &[]);
+                    match positional(node).as_slice() {
+                        [e] if e.value().as_bool().is_some() => focus_follows_mouse = e.value().as_bool(),
+                        _ => self.err(node, "`focus-follows-mouse` takes #true or #false"),
                     }
                 }
                 "colors" => {
@@ -863,6 +878,7 @@ impl<'a> Parser<'a> {
                 })
                 .collect(),
             stacking: stacking.unwrap_or(true),
+            focus_follows_mouse: focus_follows_mouse.unwrap_or(false),
             colors: colors.unwrap_or_default(),
             binds,
             link,
@@ -1702,6 +1718,7 @@ mod tests {
                 layout: "wall".into(),
             }],
             stacking: true,
+            focus_follows_mouse: false,
             colors: Colors {
                 focus: PINK,
                 badge: PINK,
@@ -1878,6 +1895,31 @@ mod tests {
                 a: 0x80
             }
         );
+    }
+
+    #[test]
+    fn focus_follows_mouse_is_read_and_off_by_default() {
+        let n = line_of("stacking #true");
+        assert!(
+            !parse(&with_line(n, "stacking #true"))
+                .expect("parses")
+                .focus_follows_mouse
+        );
+        let on = parse(&with_line(n, "stacking #true\nfocus-follows-mouse #true")).expect("parses");
+        assert!(on.focus_follows_mouse);
+        for bad in [
+            "focus-follows-mouse",
+            "focus-follows-mouse 1",
+            "focus-follows-mouse #true #false",
+        ] {
+            assert_problem(
+                &with_line(n, &format!("stacking #true\n{bad}")),
+                n + 1,
+                "focus-follows-mouse",
+            );
+        }
+        let twice = "stacking #true\nfocus-follows-mouse #true\nfocus-follows-mouse #false";
+        assert_problem(&with_line(n, twice), n + 2, "twice");
     }
 
     #[test]

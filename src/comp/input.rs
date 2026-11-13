@@ -217,6 +217,13 @@ pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
     })
 }
 
+/// The focused monitor's name and the focused slot of the workspace it shows.
+#[must_use]
+pub fn focused_slot(stacks: &Stacks) -> Option<(&str, usize)> {
+    let m = stacks.focused_monitor();
+    Some((stacks.monitors().get(m)?.name(), stacks.shown(m)?.focus()))
+}
+
 /// The top window of the slot holding the point, and that slot's rectangle.
 #[must_use]
 pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
@@ -445,6 +452,27 @@ impl Orrery {
             },
         );
         pointer.frame(self);
+        if self.config.focus_follows_mouse && !pointer.is_grabbed() {
+            self.hover_focus(pos);
+        }
+    }
+
+    /// `focus-follows-mouse`: the pointer moving into another slot focuses it (empty or not), as a click would;
+    /// not over a layer surface above the slots (a bar never takes the focus by hovering). Only motion calls it, so
+    /// a focus moved by keys stays until the pointer moves; a grab (a menu, a drag) holds it off.
+    fn hover_focus(&mut self, at: Point<f64, Logical>) {
+        if self.under(at).is_some_and(|u| u.over_slots) {
+            return;
+        }
+        let Some((monitor, slot)) = slot_at(&self.stacks, at.x as i32, at.y as i32) else {
+            return;
+        };
+        if focused_slot(&self.stacks) == Some((monitor.as_str(), slot)) {
+            return;
+        }
+        self.stacks.focus_at(&monitor, slot);
+        self.layer_focus = None;
+        self.arrange();
     }
 
     /// A pointer button went down or up: a press first focuses the slot under the pointer (empty or not), through
@@ -830,6 +858,24 @@ mod tests {
             action_request(&Action::MoveToWorkspace(3)),
             Some(Request::MoveToWorkspace { number: 3 })
         );
+    }
+
+    #[test]
+    fn focused_slot_follows_focus_at() {
+        let c = config::default_config();
+        let wall = c.layouts.iter().find(|l| l.name == "wall").unwrap().clone();
+        let mut s = Stacks::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 900,
+        };
+        let last = wall.rects(area).len() - 1;
+        s.add_monitor("m", area, wall);
+        assert_eq!(focused_slot(&s).map(|(m, _)| m), Some("m"));
+        s.focus_at("m", last);
+        assert_eq!(focused_slot(&s), Some(("m", last)));
     }
 
     #[test]

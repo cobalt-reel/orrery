@@ -284,6 +284,11 @@ no launch and hands it no token.
 
 ## The config, its reload and `orrery check`
 
+`focus-follows-mouse #true` makes the slot under the pointer take the focus as the pointer moves into it, empty or not,
+on any screen (left out, or `#false`: a click focuses, as before). Only pointer motion does it, so a focus moved by
+keys stays until the pointer moves; a layer surface over the slots (a bar) never takes the focus by hovering, and an
+open menu (a popup grab) or a drag holds it where it is.
+
 orrery looks at its config file and the files it includes once a second (modification time and size) and reloads it when
 one changes, or at once on `orrery msg reload`. A good file replaces binds, colours and layouts (`stacking` toggled at
 runtime is kept, unless the file's own `stacking` value changed): every workspace, hidden ones too, takes the new
@@ -416,6 +421,7 @@ monitor "winit" layout="wall"     // output name -> starting layout; unknown out
 // keyboard { layout "us"; options "ctrl:nocaps"; repeat-delay 200; repeat-rate 25 }  // unset: XKB_DEFAULT_*
 
 stacking #true            // windows orrery did not launch, with no parent: on the focused stack; #false: a new tab
+// focus-follows-mouse #true  // the slot under the pointer takes the focus as it moves in; left out: a click focuses
 
 colors {
     focus "#ff7edb"
