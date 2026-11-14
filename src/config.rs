@@ -56,6 +56,8 @@ pub enum Action {
     CycleTab(Cycle),
     Split,
     ToggleStacking,
+    /// The focused window over its whole screen, or back into its slot.
+    ToggleFullscreen,
     Layout(String),
     /// The next / previous layout in config order, on the focused screen's workspace.
     CycleLayout(Cycle),
@@ -1455,11 +1457,12 @@ impl<'a> Parser<'a> {
             }
             ("split", Some([])) => Action::Split,
             ("toggle-stacking", Some([])) => Action::ToggleStacking,
+            ("toggle-fullscreen", Some([])) => Action::ToggleFullscreen,
             ("close", Some([])) => Action::Close,
             ("show-tabs", Some([])) => Action::ShowTabs,
             ("quit", Some([])) => Action::Quit,
             ("reclaim", Some([])) => Action::Reclaim,
-            ("split" | "toggle-stacking" | "close" | "show-tabs" | "quit" | "reclaim", _) => {
+            ("split" | "toggle-stacking" | "toggle-fullscreen" | "close" | "show-tabs" | "quit" | "reclaim", _) => {
                 self.err_at(arg_at, format!("`{verb}` takes no arguments"));
                 return None;
             }
@@ -1761,6 +1764,7 @@ mod tests {
                 bind(MOD_SHIFT, "Tab", k::KEY_Tab, Action::CycleTab(Cycle::Prev)),
                 bind(MOD, "S", k::KEY_s, Action::Split),
                 bind(MOD_SHIFT, "S", k::KEY_s, Action::ToggleStacking),
+                bind(MOD, "F", k::KEY_f, Action::ToggleFullscreen),
                 bind(MOD_CTRL, "1", k::KEY_1, Action::Layout("wall".into())),
                 bind(MOD_CTRL, "2", k::KEY_2, Action::Layout("halves".into())),
                 bind(
@@ -1971,6 +1975,12 @@ mod tests {
             &with_line(n, "    \"Mod+Shift+S\" toggle-stacking #true"),
             n,
             "toggle-stacking",
+        );
+        let n = line_of("\"Mod+F\"");
+        assert_problem(
+            &with_line(n, "    \"Mod+F\" toggle-fullscreen \"on\""),
+            n,
+            "no arguments",
         );
         let n = line_of("\"Mod+Escape\"");
         assert_problem(&with_line(n, "    \"Mod+Escape\" reclaim \"side\""), n, "no arguments");

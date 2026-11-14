@@ -180,6 +180,7 @@ pub fn action_request(action: &Action) -> Option<Request> {
         Action::CycleTab(cycle) => Request::CycleTab { cycle: *cycle },
         Action::Split => Request::Split,
         Action::ToggleStacking => Request::ToggleStacking,
+        Action::ToggleFullscreen => Request::ToggleFullscreen,
         Action::Spawn(argv) => Request::Spawn { argv: argv.clone() },
         Action::Layout(name) => Request::Layout {
             name: name.clone(),
@@ -203,11 +204,15 @@ pub fn on_output(local: Point<f64, Logical>, origin: Point<i32, Logical>) -> Poi
     local + origin.to_f64()
 }
 
-/// The monitor and slot (of its shown workspace) whose rectangle holds the point, empty slots included.
+/// The monitor and slot (of its shown workspace) whose rectangle holds the point, empty slots included. A screen
+/// covered by a fullscreen window is all that window's slot, the part its layout does not divide too.
 #[must_use]
 pub fn slot_at(stacks: &Stacks, x: i32, y: i32) -> Option<(String, usize)> {
     let inside = |r: Rect| x >= r.x && y >= r.y && x - r.x < r.w && y - r.y < r.h;
     stacks.monitors().iter().enumerate().find_map(|(mi, m)| {
+        if stacks.fullscreen_on(mi).is_some() && inside(m.screen()) {
+            return Some((m.name().to_owned(), stacks.shown(mi)?.focus()));
+        }
         if !inside(m.area()) {
             return None;
         }
@@ -228,11 +233,15 @@ pub fn focused_slot(stacks: &Stacks) -> Option<(&str, usize)> {
     Some((stacks.monitors().get(m)?.name(), stacks.shown(m)?.focus()))
 }
 
-/// The top window of the slot holding the point, and that slot's rectangle.
+/// The top window of the slot holding the point, and that slot's rectangle; the fullscreen window of a screen
+/// covered by one, and that screen.
 #[must_use]
 pub fn top_at(stacks: &Stacks, x: i32, y: i32) -> Option<(WinId, Rect)> {
     let (name, slot) = slot_at(stacks, x, y)?;
     let mi = stacks.monitors().iter().position(|m| m.name() == name)?;
+    if let Some(full) = stacks.fullscreen_on(mi) {
+        return Some((full, stacks.monitors()[mi].screen()));
+    }
     let ws = stacks.shown(mi)?;
     let top = ws.slots().get(slot)?.top()?;
     let rect = *ws.layout().rects(stacks.monitors()[mi].area()).get(slot)?;
@@ -255,7 +264,8 @@ impl Orrery {
     }
 
     /// What is under `pos`, as drawn, front to back: overlay and top layer surfaces, popups of bottom and
-    /// background ones, the slots' windows (`window_under`), bottom and background layer surfaces themselves.
+    /// background ones, the slots' windows (`window_under`), bottom and background layer surfaces themselves. On a
+    /// screen covered by a fullscreen window, only the layer surfaces drawn over it (`over_fullscreen`) and it.
     pub fn under(&self, pos: Point<f64, Logical>) -> Option<Under> {
         let layer = |over_slots| {
             move |(layer, surface, origin)| Under {
@@ -637,6 +647,7 @@ mod tests {
         assert_eq!(action_for(MOD_SHIFT, k::KEY_h), Some(Action::Move(Dir::Left)));
         assert_eq!(action_for(MOD, k::KEY_s), Some(Action::Split));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_s), Some(Action::ToggleStacking));
+        assert_eq!(action_for(MOD, k::KEY_f), Some(Action::ToggleFullscreen));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_Tab), Some(Action::CycleTab(Cycle::Prev)));
         assert_eq!(action_for(MOD, k::KEY_Tab), Some(Action::CycleTab(Cycle::Next)));
         assert_eq!(action_for(MOD_SHIFT, k::KEY_e), Some(Action::Quit));
@@ -867,6 +878,10 @@ mod tests {
         );
         assert_eq!(action_request(&Action::Split), Some(Request::Split));
         assert_eq!(action_request(&Action::ToggleStacking), Some(Request::ToggleStacking));
+        assert_eq!(
+            action_request(&Action::ToggleFullscreen),
+            Some(Request::ToggleFullscreen)
+        );
         assert_eq!(action_request(&Action::ShowTabs), None);
         assert_eq!(action_request(&Action::Reclaim), None);
         assert_eq!(
@@ -895,6 +910,44 @@ mod tests {
         assert_eq!(focused_slot(&s).map(|(m, _)| m), Some("m"));
         s.focus_at("m", last);
         assert_eq!(focused_slot(&s), Some(("m", last)));
+    }
+
+    #[test]
+    fn a_fullscreen_window_is_under_every_point_of_its_screen() {
+        let c = config::default_config();
+        let wall = c.layouts.iter().find(|l| l.name == "wall").unwrap().clone();
+        // A bar takes the top 30 px of a 900x930 screen.
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 930,
+        };
+        let area = Rect {
+            y: 30,
+            h: 900,
+            ..screen
+        };
+        let rects = wall.rects(area);
+        let mut s = Stacks::new();
+        s.add_monitor("m", area, wall);
+        s.set_screen("m", screen);
+        s.open_stacked(1);
+        s.focus_slot(Dir::Right);
+        s.open_stacked(2);
+        assert_eq!(slot_at(&s, 10, 10), None, "the bar's strip is no slot");
+        assert_eq!(top_at(&s, 10, 40), Some((1, rects[0])));
+
+        assert!(s.toggle_fullscreen());
+        let slot = s.shown(0).unwrap().focus();
+        for (x, y) in [(10, 10), (10, 40), (899, 929), (rects[0].w, 500)] {
+            assert_eq!(slot_at(&s, x, y), Some(("m".into(), slot)), "({x}, {y})");
+            assert_eq!(top_at(&s, x, y), Some((2, screen)), "({x}, {y})");
+        }
+        assert_eq!(slot_at(&s, 900, 10), None, "past the screen");
+        // Hovering or clicking anywhere on it keeps it fullscreen.
+        s.focus_at("m", slot);
+        assert!(s.is_fullscreen(2));
     }
 
     #[test]

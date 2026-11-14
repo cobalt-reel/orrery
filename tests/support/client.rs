@@ -61,6 +61,10 @@ impl Win {
     pub fn mapped(&self) -> bool {
         self.outputs > 0
     }
+
+    pub fn fullscreen(&self) -> bool {
+        self.states.contains(&xdg_toplevel::State::Fullscreen)
+    }
 }
 
 #[derive(Default)]
@@ -191,6 +195,8 @@ pub struct Client {
     _conn: Connection,
     queue: EventQueue<State>,
     pub state: State,
+    /// The next window asks for fullscreen before its first commit (`create_fullscreen_window`).
+    open_fullscreen: bool,
 }
 
 impl Client {
@@ -212,6 +218,7 @@ impl Client {
             _conn: conn,
             queue,
             state,
+            open_fullscreen: false,
         }
     }
 
@@ -219,6 +226,26 @@ impl Client {
     /// returns its index in `windows`.
     pub fn create_window(&mut self, app_id: &str, title: &str) -> usize {
         self.create_window_with(app_id, title, true, false, None)
+    }
+
+    /// `create_window` with `xdg_toplevel.set_fullscreen` before its first commit, as a player started fullscreen
+    /// does.
+    pub fn create_fullscreen_window(&mut self, app_id: &str) -> usize {
+        self.open_fullscreen = true;
+        let i = self.create_window_with(app_id, app_id, true, false, None);
+        self.open_fullscreen = false;
+        i
+    }
+
+    /// `xdg_toplevel.set_fullscreen` (on no particular output) or `unset_fullscreen` for window `i`.
+    pub fn set_fullscreen(&mut self, i: usize, on: bool) {
+        let toplevel = self.state.windows[i].toplevel.as_ref().expect("live window");
+        if on {
+            toplevel.set_fullscreen(None);
+        } else {
+            toplevel.unset_fullscreen();
+        }
+        self.roundtrip();
     }
 
     /// `create_window` with `xdg_toplevel.set_parent(parent)` before its first commit, as a dialog does.
@@ -254,6 +281,9 @@ impl Client {
         toplevel.set_title(title.to_owned());
         if let Some(p) = parent {
             toplevel.set_parent(Some(s.windows[p].toplevel.as_ref().expect("live parent")));
+        }
+        if self.open_fullscreen {
+            toplevel.set_fullscreen(None);
         }
         let decoration = s.decorations.as_ref().map(|d| {
             let deco = d.get_toplevel_decoration(&toplevel, &qh, i);

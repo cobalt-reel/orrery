@@ -1,7 +1,8 @@
 //! Drawing one output. `scene` decides what is drawn, purely from the stacks: the top window of each slot,
 //! clipped to its slot, and the decorations (focus border, tab badges, held tab strips). `output_elements` turns
 //! that into render elements for the GL renderer, between the screen's layer surfaces (background and bottom
-//! behind, top and overlay in front), with the pointer in front of everything where orrery draws it
+//! behind, top and overlay in front; a fullscreen window alone on black, under only the layer surfaces
+//! `over_fullscreen` names), with the pointer in front of everything where orrery draws it
 //! (`cursor_draw`): while input from the primary moves it, and on bare metal, where no host cursor stands for this
 //! machine's own. `render_output` draws them into a framebuffer (nested); bare metal hands them to its
 //! `DrmCompositor`.
@@ -28,7 +29,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 
 use super::Orrery;
 use super::cursor_theme::Image;
-use super::layers::{ABOVE, BELOW, layer_origin};
+use super::layers::{ABOVE, BELOW, layer_origin, over_fullscreen};
 use crate::config::{Color, Colors};
 use crate::layout::Rect;
 use crate::stacks::{Stacks, WinId};
@@ -87,13 +88,23 @@ pub struct Solid {
     pub color: Color,
 }
 
+/// What a fullscreen window is drawn on: it may be smaller than its screen, or see-through.
+pub const BACKDROP: Color = Color {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0xff,
+};
+
 /// What one output shows, in output-local coordinates.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Scene {
-    /// Each slot's top window and the slot it is clipped to.
+    /// Each slot's top window and the slot it is clipped to; a fullscreen window alone, and the whole screen.
     pub windows: Vec<(WinId, Rect)>,
-    /// Decorations, front to back; all drawn over the windows.
+    /// Decorations, front to back; all drawn over the windows. None around a fullscreen window.
     pub solids: Vec<Solid>,
+    /// The black a fullscreen window is drawn on, the whole screen: nothing behind it shows.
+    pub backdrop: Option<Solid>,
     /// The red bar of a broken config, in front of everything (layer surfaces too).
     pub bar: Option<Solid>,
 }
@@ -122,6 +133,26 @@ pub fn scene(
         y: r.y - screen.y,
         ..r
     };
+    let bar = config_error
+        .then(|| {
+            non_empty(Rect {
+                x: 0,
+                y: 0,
+                w: screen.w,
+                h: ERROR_BAR.min(screen.h),
+            })
+        })
+        .flatten()
+        .map(|rect| Solid { rect, color: ERROR_RED });
+    if let Some(full) = stacks.fullscreen_on(mi) {
+        let rect = local(mon.screen());
+        return Scene {
+            windows: vec![(full, rect)],
+            solids: Vec::new(),
+            backdrop: non_empty(rect).map(|rect| Solid { rect, color: BACKDROP }),
+            bar,
+        };
+    }
     let rects = ws.layout().rects(mon.area());
     let mut borders = Vec::new();
     let mut badges = Vec::new();
@@ -152,17 +183,7 @@ pub fn scene(
             strips.extend(strip(rect, &tabs, slot.current(), colors));
         }
     }
-    out.bar = config_error
-        .then(|| {
-            non_empty(Rect {
-                x: 0,
-                y: 0,
-                w: screen.w,
-                h: ERROR_BAR.min(screen.h),
-            })
-        })
-        .flatten()
-        .map(|rect| Solid { rect, color: ERROR_RED });
+    out.bar = bar;
     out.solids = [borders, badges, strips].concat();
     out
 }
@@ -356,6 +377,7 @@ render_elements! {
 pub struct Decorations {
     buffers: Vec<SolidColorBuffer>,
     bar: Vec<SolidColorBuffer>,
+    backdrop: Vec<SolidColorBuffer>,
     cursor: Vec<SolidColorBuffer>,
     cursor_image: Option<(Rc<Image>, MemoryRenderBuffer)>,
 }
@@ -463,11 +485,13 @@ fn cursor_elements(
 }
 
 /// The layer surfaces of `output` on `layers` (front to back), front to back, as much of each as `kinds` says: its
-/// popups (in front) and its own surface with its subsurfaces.
+/// popups (in front) and its own surface with its subsurfaces. Over a `fullscreen` window, only those
+/// `over_fullscreen` names.
 fn layer_elements(
     output: &Output,
     layers: &[Layer],
     kinds: WindowSurfaceType,
+    fullscreen: bool,
     renderer: &mut GlesRenderer,
 ) -> Vec<OrreryElement> {
     let map = layer_map_for_output(output);
@@ -480,6 +504,9 @@ fn layer_elements(
     };
     for &layer in layers {
         for surface in map.layers_on(layer).rev() {
+            if fullscreen && !over_fullscreen(layer, surface.cached_state().keyboard_interactivity) {
+                continue;
+            }
             let Some(at) = layer_origin(&map, surface) else {
                 continue;
             };
@@ -498,7 +525,8 @@ fn layer_elements(
 
 /// What the monitor named after `output` shows (scale 1, output-local coordinates), front to back: the pointer,
 /// the red bar, overlay and top layer surfaces, popups of bottom and background ones (menus of a bar there must
-/// show over the windows), decorations, windows, bottom and background layer surfaces.
+/// show over the windows), decorations, windows, bottom and background layer surfaces. With a fullscreen window:
+/// the pointer, the red bar, the layer surfaces drawn over it (`over_fullscreen`), it, and black.
 pub fn output_elements(
     output: &str,
     state: &Orrery,
@@ -524,9 +552,22 @@ pub fn output_elements(
     let scale = Scale::from(1.0);
     let mut elements = cursor_elements(output, state, renderer, decorations);
     elements.extend(solid_elements(&mut decorations.bar, scene.bar.as_slice()));
+    let fullscreen = scene.backdrop.is_some();
     if let Some(screen) = &screen {
-        elements.extend(layer_elements(screen, &ABOVE, WindowSurfaceType::ALL, renderer));
-        elements.extend(layer_elements(screen, &BELOW, WindowSurfaceType::POPUP, renderer));
+        elements.extend(layer_elements(
+            screen,
+            &ABOVE,
+            WindowSurfaceType::ALL,
+            fullscreen,
+            renderer,
+        ));
+        elements.extend(layer_elements(
+            screen,
+            &BELOW,
+            WindowSurfaceType::POPUP,
+            fullscreen,
+            renderer,
+        ));
     }
     elements.extend(solid_elements(&mut decorations.buffers, &scene.solids));
 
@@ -546,9 +587,10 @@ pub fn output_elements(
                 .map(OrreryElement::from),
         );
     }
+    elements.extend(solid_elements(&mut decorations.backdrop, scene.backdrop.as_slice()));
     if let Some(screen) = &screen {
         let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
-        elements.extend(layer_elements(screen, &BELOW, own, renderer));
+        elements.extend(layer_elements(screen, &BELOW, own, fullscreen, renderer));
     }
     elements
 }
@@ -678,6 +720,58 @@ mod tests {
             ..c.colors
         };
         (s, rects, colors)
+    }
+
+    #[test]
+    fn a_fullscreen_window_is_drawn_alone_on_black_over_its_whole_screen() {
+        let (mut s, _, colors) = wall();
+        // A bar takes the top 30 px: the layout divides the rest, a fullscreen window covers it too.
+        let screen = Rect { x: 500, ..AREA };
+        s.set_area(
+            "m",
+            Rect {
+                x: 500,
+                y: 30,
+                h: 870,
+                ..AREA
+            },
+        );
+        s.set_screen("m", screen);
+        s.open_stacked(1);
+        s.open_stacked(2);
+        s.focus_slot(crate::layout::Dir::Right);
+        s.open_tab(3, None, None);
+        s.open_tab(4, None, None);
+        let tiled = scene(&s, "m", screen, &colors, true, false);
+        assert_eq!(tiled.windows.len(), 2);
+        assert!(tiled.backdrop.is_none() && !tiled.solids.is_empty());
+
+        assert!(s.toggle_fullscreen());
+        let whole = Rect { x: 0, y: 0, ..AREA };
+        let full = scene(&s, "m", screen, &colors, true, true);
+        assert_eq!(
+            full.windows,
+            [(4, whole)],
+            "alone, at the screen's origin, the bar's strip too"
+        );
+        assert_eq!(
+            full.backdrop,
+            Some(Solid {
+                rect: whole,
+                color: BACKDROP
+            })
+        );
+        assert!(full.solids.is_empty(), "no border, badge or tab strip around it");
+        assert_eq!(
+            full.bar.map(|b| b.color),
+            Some(ERROR_RED),
+            "a broken config still shows"
+        );
+
+        // Another workspace on that screen is drawn as ever.
+        s.workspace(5);
+        let other = scene(&s, "m", screen, &colors, false, false);
+        assert!(other.backdrop.is_none() && other.windows.is_empty());
     }
 
     fn of_color(scene: &Scene, color: Color) -> Vec<Rect> {

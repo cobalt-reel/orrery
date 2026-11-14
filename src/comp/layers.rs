@@ -40,6 +40,14 @@ pub const ABOVE: [Layer; 2] = [Layer::Overlay, Layer::Top];
 /// The layers under the slots, front to back.
 pub const BELOW: [Layer; 2] = [Layer::Bottom, Layer::Background];
 
+/// Whether a layer surface on `layer` shows over a fullscreen window: every overlay one, and a top one only while
+/// it takes the keyboard for itself (a launcher, a prompt), so what has the keyboard is never hidden. A bar is
+/// covered, like everything under the slots.
+#[must_use]
+pub fn over_fullscreen(layer: Layer, keyboard: KeyboardInteractivity) -> bool {
+    layer == Layer::Overlay || (layer == Layer::Top && keyboard == KeyboardInteractivity::Exclusive)
+}
+
 /// A layer surface orrery knows (its order is not the drawing order: that is its map's).
 #[derive(Debug)]
 pub struct Layered {
@@ -288,6 +296,19 @@ impl Orrery {
         self.layers.iter().any(|l| l.mapped && l.surface == *layer)
     }
 
+    /// The screen named `output` is covered by a fullscreen window.
+    pub(super) fn fullscreen_on_output(&self, output: &str) -> bool {
+        (self.stacks.monitors().iter())
+            .position(|m| m.name() == output)
+            .is_some_and(|mi| self.stacks.fullscreen_on(mi).is_some())
+    }
+
+    /// `layer` (on the screen named `output`) is hidden by a fullscreen window there.
+    fn covered(&self, output: &str, layer: &LayerSurface) -> bool {
+        self.fullscreen_on_output(output)
+            && !over_fullscreen(layer.layer(), layer.cached_state().keyboard_interactivity)
+    }
+
     /// The frontmost mapped `exclusive` layer surface over the slots, as drawn: the focused screen's first, then the
     /// others in opening order.
     fn exclusive_layer(&self) -> Option<WlSurface> {
@@ -296,6 +317,7 @@ impl Orrery {
         outputs.sort_by_key(|o| Some(o.name()) != focused);
         outputs.into_iter().find_map(|o| {
             let map = layer_map_for_output(o);
+            // Exclusive ones over the slots are never covered by a fullscreen window (`over_fullscreen`).
             (ABOVE.iter())
                 .flat_map(|&layer| map.layers_on(layer).rev())
                 .find(|l| {
@@ -306,15 +328,20 @@ impl Orrery {
     }
 
     /// The layer surface that should have the keyboard: `exclusive_layer`, else the one a click gave it while the
-    /// stacks' focus has not moved since and it still takes the keyboard (forgotten otherwise).
+    /// stacks' focus has not moved since, it still takes the keyboard and no fullscreen window covers it (forgotten
+    /// otherwise).
     pub(super) fn layer_keyboard(&mut self) -> Option<WlSurface> {
         if let Some(surface) = self.exclusive_layer() {
             return Some(surface);
         }
         let key = self.focus_key();
         let (surface, at) = self.layer_focus.as_ref()?;
-        let takes = (self.layers.iter())
-            .any(|l| l.mapped && l.surface.wl_surface() == surface && l.surface.can_receive_keyboard_focus());
+        let takes = (self.layers.iter()).any(|l| {
+            l.mapped
+                && l.surface.wl_surface() == surface
+                && l.surface.can_receive_keyboard_focus()
+                && !self.covered(&l.output, &l.surface)
+        });
         if takes && *at == key {
             return Some(surface.clone());
         }
@@ -323,7 +350,8 @@ impl Orrery {
     }
 
     /// The layer surface on one of `layers` (front to back) under `pos` (global), on the screen there, with the
-    /// surface hit (of `kinds`: its own, a subsurface's, a popup's) and that surface's origin.
+    /// surface hit (of `kinds`: its own, a subsurface's, a popup's) and that surface's origin. Those a fullscreen
+    /// window covers are not there to hit.
     pub(super) fn layer_under(
         &self,
         layers: &[Layer],
@@ -336,8 +364,12 @@ impl Orrery {
         })?;
         let map = layer_map_for_output(output);
         let local = pos - geo.loc.to_f64();
+        let name = output.name();
         for &layer in layers {
             for l in map.layers_on(layer).rev() {
+                if self.covered(&name, l) {
+                    continue;
+                }
                 let Some(at) = layer_origin(&map, l) else {
                     continue;
                 };
@@ -398,6 +430,19 @@ mod tests {
         w: 1920,
         h: 1080,
     };
+
+    #[test]
+    fn only_overlays_and_what_holds_the_keyboard_show_over_a_fullscreen_window() {
+        use KeyboardInteractivity::{Exclusive, None, OnDemand};
+        for keyboard in [None, OnDemand, Exclusive] {
+            assert!(over_fullscreen(Layer::Overlay, keyboard));
+            assert!(!over_fullscreen(Layer::Bottom, keyboard));
+            assert!(!over_fullscreen(Layer::Background, keyboard));
+        }
+        assert!(over_fullscreen(Layer::Top, Exclusive), "a launcher");
+        assert!(!over_fullscreen(Layer::Top, None), "a bar");
+        assert!(!over_fullscreen(Layer::Top, OnDemand));
+    }
 
     #[test]
     fn exclusive_zones_shrink_the_screen_in_global_coordinates() {

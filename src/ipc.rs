@@ -49,6 +49,9 @@ pub enum Request {
     /// The focused stack's top window becomes a tab of its own.
     Split,
     ToggleStacking,
+    /// The focused window over its whole screen (bars and the other slots covered), or back into its slot. It
+    /// leaves fullscreen by itself when it is no longer the top of its workspace's focused slot.
+    ToggleFullscreen,
     /// Launches a program as a `spawn` bind does; never empty, no empty program.
     Spawn {
         argv: Vec<String>,
@@ -107,6 +110,7 @@ enum Wire {
     Quit {},
     Split {},
     ToggleStacking {},
+    ToggleFullscreen {},
     Spawn { argv: Vec<String> },
     // Any JSON number, so every one out of range (or not an integer) gets the range in its error, not serde's
     // "expected u8".
@@ -137,6 +141,7 @@ impl TryFrom<Wire> for Request {
             Wire::Quit {} => Request::Quit,
             Wire::Split {} => Request::Split,
             Wire::ToggleStacking {} => Request::ToggleStacking,
+            Wire::ToggleFullscreen {} => Request::ToggleFullscreen,
             Wire::Spawn { argv } => Request::Spawn {
                 argv: spawn_argv(argv)?,
             },
@@ -429,6 +434,9 @@ pub struct WindowView {
     pub id: u64,
     pub app_id: Option<String>,
     pub title: Option<String>,
+    /// It is fullscreen: over its whole screen while its workspace is shown (absent when not).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fullscreen: bool,
 }
 
 impl Response {
@@ -487,7 +495,12 @@ impl StateView {
                                 .iter()
                                 .map(|&id| {
                                     let (app_id, title) = info(id);
-                                    WindowView { id, app_id, title }
+                                    WindowView {
+                                        id,
+                                        app_id,
+                                        title,
+                                        fullscreen: stacks.is_fullscreen(id),
+                                    }
                                 })
                                 .collect(),
                         })
@@ -551,6 +564,11 @@ impl Request {
             Request::Split => stacks.split(),
             Request::SwapSlot { dir } => stacks.swap_slot(*dir),
             Request::CycleTab { cycle } => stacks.cycle_tab(*cycle),
+            Request::ToggleFullscreen => {
+                if !stacks.toggle_fullscreen() {
+                    return Err("no focused window to make fullscreen".into());
+                }
+            }
             Request::Layout { name, monitor } => {
                 let layout = config
                     .layouts
@@ -623,6 +641,7 @@ impl Request {
             Request::Quit => "quit",
             Request::Split => "split",
             Request::ToggleStacking => "toggle-stacking",
+            Request::ToggleFullscreen => "toggle-fullscreen",
             Request::Spawn { .. } => "spawn",
             Request::Workspace { .. } => "workspace",
             Request::MoveToWorkspace { .. } => "move-to-workspace",
@@ -683,6 +702,7 @@ pub fn parse_words(words: &[String]) -> Result<Request, String> {
         "quit" => none(Request::Quit),
         "split" => none(Request::Split),
         "toggle-stacking" => none(Request::ToggleStacking),
+        "toggle-fullscreen" => none(Request::ToggleFullscreen),
         "open-screen" => none(Request::OpenScreen),
         "close-screen" => match args.as_slice() {
             [name] => Ok(Request::CloseScreen {
@@ -841,10 +861,11 @@ mod tests {
             Request::InjectRemote { machine, message } => (18, Wire::InjectRemote { machine, message }),
             Request::Subscribe => (19, Wire::Subscribe {}),
             Request::CycleLayout { cycle, monitor } => (20, Wire::CycleLayout { cycle, monitor }),
+            Request::ToggleFullscreen => (21, Wire::ToggleFullscreen {}),
         }
     }
 
-    const VARIANTS: usize = 21;
+    const VARIANTS: usize = 22;
 
     #[test]
     fn every_request_has_a_wire_twin_and_a_sample() {
@@ -889,6 +910,7 @@ mod tests {
             Request::Quit,
             Request::Split,
             Request::ToggleStacking,
+            Request::ToggleFullscreen,
             Request::Spawn {
                 argv: vec!["kitty".into(), "--single-instance".into()],
             },
@@ -1127,6 +1149,7 @@ mod tests {
                             id: 7,
                             app_id: Some("kitty".into()),
                             title: None,
+                            fullscreen: false,
                         }],
                     }],
                 }],
@@ -1372,6 +1395,7 @@ mod tests {
             ("move-tab left", "unknown"),
             ("split now", "no arguments"),
             ("toggle-stacking on", "no arguments"),
+            ("toggle-fullscreen on", "no arguments"),
             ("spawn", "program"),
             ("cycle-tab", "next"),
             ("cycle-tab forward", "next"),
@@ -1666,12 +1690,14 @@ mod tests {
                             WindowView {
                                 id: 1,
                                 app_id: Some("app1".into()),
-                                title: None
+                                title: None,
+                                fullscreen: false,
                             },
                             WindowView {
                                 id: 2,
                                 app_id: Some("app2".into()),
-                                title: Some("two".into())
+                                title: Some("two".into()),
+                                fullscreen: false,
                             },
                         ],
                     },
@@ -1681,7 +1707,8 @@ mod tests {
                         windows: vec![WindowView {
                             id: 3,
                             app_id: Some("app3".into()),
-                            title: None
+                            title: None,
+                            fullscreen: false,
                         }],
                     },
                 ],

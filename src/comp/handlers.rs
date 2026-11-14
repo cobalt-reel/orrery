@@ -131,9 +131,9 @@ impl XdgShellHandler for Orrery {
         surface.send_repositioned(token);
     }
 
-    // Static tiling: interactive move/resize, maximize and fullscreen are not honoured; the window keeps its
-    // slot. The protocol wants a configure in answer to (un)maximize and (un)fullscreen, but none may go out
-    // before the initial commit, which Smithay's default handlers do not check.
+    // Static tiling: interactive move/resize and maximize are not honoured; the window keeps its slot. The
+    // protocol wants a configure in answer to (un)maximize, but none may go out before the initial commit, which
+    // Smithay's default handlers do not check.
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         answer_state_request(&surface);
@@ -143,12 +143,13 @@ impl XdgShellHandler for Orrery {
         answer_state_request(&surface);
     }
 
+    // Fullscreen is the window's own screen, whichever output the client names.
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
-        answer_state_request(&surface);
+        self.fullscreen_requested(&surface, true);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        answer_state_request(&surface);
+        self.fullscreen_requested(&surface, false);
     }
 
     /// A popup's grab (a menu opened on a click): it takes the keyboard and the pointer until it closes, and a click

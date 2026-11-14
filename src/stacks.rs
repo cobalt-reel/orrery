@@ -50,6 +50,8 @@ pub struct Monitor {
     /// Its screen number, 1..=WORKSPACES, kept while it lives; it locks the workspace of that number.
     number: u8,
     area: Rect,
+    /// The whole screen, when the compositor has said (`Stacks::set_screen`): what a fullscreen window covers.
+    screen: Option<Rect>,
     /// What a workspace made on this monitor starts with.
     default_layout: Layout,
     /// The number of the workspace it shows, always one living on it.
@@ -71,6 +73,10 @@ pub struct Stacks {
     attention: BTreeMap<WinId, Mark>,
     /// Workspace numbers another machine owns: never a workspace or screen here.
     foreign: BTreeSet<u8>,
+    /// Windows that are fullscreen, or will be once they open. A placed one is always the top of its workspace's
+    /// focused slot (`settle` drops the flag of any that is not), so a workspace has at most one, and while its
+    /// monitor shows that workspace it covers the whole screen and nothing else there is drawn.
+    fullscreen: BTreeSet<WinId>,
 }
 
 /// What `workspace` and `move_to_workspace` did.
@@ -100,6 +106,8 @@ pub struct Tile {
     pub rect: Rect,
     pub win: WinId,
     pub focused: bool,
+    /// Fullscreen: `rect` is the monitor's whole screen, and it is the monitor's only tile.
+    pub fullscreen: bool,
     /// The slot's tab count.
     pub tabs: usize,
     /// The current tab's stack length.
@@ -119,7 +127,8 @@ pub struct Placement {
     pub monitor: usize,
     pub slot: usize,
     pub tab: usize,
-    /// The slot's rectangle: waiting windows are kept at this size so showing them is instant.
+    /// The slot's rectangle: waiting windows are kept at this size so showing them is instant. A fullscreen
+    /// window's is its monitor's whole screen.
     pub rect: Rect,
     /// Its workspace is the one its monitor shows.
     pub shown: bool,
@@ -127,6 +136,10 @@ pub struct Placement {
     pub on_top: bool,
     /// On top of the focused slot of the focused monitor's shown workspace.
     pub focused: bool,
+    /// Fullscreen: it covers its monitor's screen while `shown`.
+    pub fullscreen: bool,
+    /// Another window of its workspace is fullscreen: not drawn, even `shown` and `on_top`.
+    pub covered: bool,
 }
 
 impl Slot {
@@ -247,6 +260,12 @@ impl Monitor {
         self.area
     }
 
+    /// The whole screen: what a fullscreen window covers. The area until `Stacks::set_screen` says otherwise.
+    #[must_use]
+    pub fn screen(&self) -> Rect {
+        self.screen.unwrap_or(self.area)
+    }
+
     #[must_use]
     pub fn default_layout(&self) -> &Layout {
         &self.default_layout
@@ -294,6 +313,14 @@ impl Stacks {
         }
     }
 
+    /// The whole screen of a monitor, of which `area` is what its layout divides (the rest is taken by bars and
+    /// the like); unknown names are ignored.
+    pub fn set_screen(&mut self, monitor: &str, screen: Rect) {
+        if let Some(i) = self.index_of(monitor) {
+            self.monitors[i].screen = Some(screen);
+        }
+    }
+
     /// Focuses a slot of a monitor's shown workspace by pointer, empty or not; an unknown monitor or slot does
     /// nothing.
     pub fn focus_at(&mut self, monitor: &str, slot: usize) {
@@ -323,6 +350,7 @@ impl Stacks {
             let shown = mon.shown == ws.number;
             let focused_ws = shown && ws.monitor == self.focused_monitor;
             let rects = ws.layout.rects(mon.area);
+            let full = self.fullscreen_in(ws);
             ws.slots
                 .iter()
                 .zip(rects)
@@ -331,16 +359,19 @@ impl Stacks {
                     slot.tabs.iter().enumerate().flat_map(move |(ti, stack)| {
                         stack.iter().enumerate().map(move |(pos, &win)| {
                             let on_top = ti == slot.current && pos + 1 == stack.len();
+                            let fullscreen = full == Some(win);
                             Placement {
                                 win,
                                 workspace: ws.number,
                                 monitor: ws.monitor,
                                 slot: si,
                                 tab: ti,
-                                rect,
+                                rect: if fullscreen { mon.screen() } else { rect },
                                 shown,
                                 on_top,
                                 focused: on_top && focused_ws && si == ws.focus,
+                                fullscreen,
+                                covered: full.is_some() && !fullscreen,
                             }
                         })
                     })
@@ -401,6 +432,7 @@ impl Stacks {
             name: name.to_owned(),
             number,
             area,
+            screen: None,
             default_layout,
             shown: number,
         };
@@ -646,7 +678,49 @@ impl Stacks {
             self.workspaces[wi].slots[s].remove(t, p);
         }
         self.pending.retain(|&x| x != w);
+        self.fullscreen.remove(&w);
         self.settle();
+    }
+
+    /// Makes `w` fullscreen or not. A placed window can be only while it is the top of its workspace's focused
+    /// slot (else asking changes nothing), and stops being when it no longer is: covered by a new window, its tab
+    /// or slot left, moved. One not placed yet (waiting to open) keeps the wish until it is placed, and loses it
+    /// when it closes. Says whether `w` is fullscreen now.
+    pub fn set_fullscreen(&mut self, w: WinId, on: bool) -> bool {
+        if on {
+            self.fullscreen.insert(w);
+        } else {
+            self.fullscreen.remove(&w);
+        }
+        self.settle();
+        self.is_fullscreen(w)
+    }
+
+    /// Flips the focused window between fullscreen and its slot; `false` (and nothing done) with none.
+    pub fn toggle_fullscreen(&mut self) -> bool {
+        let Some(w) = self.focused_window() else {
+            return false;
+        };
+        self.set_fullscreen(w, !self.is_fullscreen(w));
+        true
+    }
+
+    /// `w` is fullscreen, or waits to open so.
+    #[must_use]
+    pub fn is_fullscreen(&self, w: WinId) -> bool {
+        self.fullscreen.contains(&w)
+    }
+
+    /// The window covering monitor `monitor` (an index): the fullscreen one of the workspace it shows.
+    #[must_use]
+    pub fn fullscreen_on(&self, monitor: usize) -> Option<WinId> {
+        self.fullscreen_in(self.shown(monitor)?)
+    }
+
+    /// The fullscreen window of `ws`: its focused slot's top, when flagged.
+    fn fullscreen_in(&self, ws: &Workspace) -> Option<WinId> {
+        let top = ws.slots.get(ws.focus)?.top()?;
+        self.fullscreen.contains(&top).then_some(top)
     }
 
     /// Via `Layout::neighbour`; a slot at the edge has no neighbour past it.
@@ -825,11 +899,12 @@ impl Stacks {
         self.attention.contains_key(&w)
     }
 
-    /// One per non-empty slot of a shown workspace: the top of its current tab at the slot's rectangle.
+    /// One per non-empty slot of a shown workspace: the top of its current tab at the slot's rectangle. A workspace
+    /// with a fullscreen window has that one alone, at the whole screen.
     #[must_use]
     pub fn tiles(&self) -> Vec<Tile> {
         self.placements()
-            .filter(|p| p.shown && p.on_top)
+            .filter(|p| p.shown && p.on_top && !p.covered)
             .filter_map(|p| {
                 let ws = &self.workspaces[self.index_of_workspace(p.workspace)?];
                 let slot = &ws.slots[p.slot];
@@ -839,6 +914,7 @@ impl Stacks {
                     rect: p.rect,
                     win: p.win,
                     focused: p.focused,
+                    fullscreen: p.fullscreen,
                     tabs: slot.tabs.len(),
                     depth: slot.tabs[p.tab].len(),
                     windows: slot.len(),
@@ -863,6 +939,12 @@ impl Stacks {
         ws.layout.rects(area).get(ws.focus).copied()
     }
 
+    /// The focused monitor's whole screen: what a toplevel waiting to open fullscreen is configured to.
+    #[must_use]
+    pub fn focused_screen(&self) -> Option<Rect> {
+        Some(self.monitors.get(self.focused_monitor)?.screen())
+    }
+
     /// (workspace number, slot, tab, position from the bottom) of `w`; None for unknown or pending windows.
     #[must_use]
     pub fn where_is(&self, w: WinId) -> Option<(u8, usize, usize, usize)> {
@@ -872,14 +954,28 @@ impl Stacks {
 
     /// Drops what is no longer needed: workspaces neither locked nor shown that hold no window, and the marks `Mark`
     /// says are seen (a waiting window now shown, whatever showed it; one marked while shown now focused) or whose
-    /// windows closed or went to `pending`, for good. Every method that changes a slot's tabs, current tab, focus or
-    /// a shown workspace ends with this (their early returns change nothing); the random walk checks both rules
-    /// after every operation, so a method that forgets it fails there.
+    /// windows closed or went to `pending`, for good; and the fullscreen flag of a placed window that is not the top
+    /// of its workspace's focused slot (see `set_fullscreen`). Every method that changes a slot's tabs, current tab,
+    /// focus or a shown workspace ends with this (their early returns change nothing); the random walk checks these
+    /// rules after every operation, so a method that forgets it fails there.
     fn settle(&mut self) {
         let monitors = &self.monitors;
         let locked = |n: u8| monitors.iter().any(|m| m.number == n);
         self.workspaces
             .retain(|w| locked(w.number) || monitors[w.monitor].shown == w.number || !w.is_empty());
+        if !self.fullscreen.is_empty() {
+            // A placed window stays fullscreen only as the top of its workspace's focused slot; one in no slot
+            // (waiting to open, or pending a monitor) keeps the wish.
+            let workspaces = &self.workspaces;
+            self.fullscreen.retain(|w| {
+                let mut holders = workspaces
+                    .iter()
+                    .filter(|ws| (ws.slots.iter().flat_map(|s| &s.tabs)).any(|stack| stack.contains(w)));
+                holders
+                    .next()
+                    .is_none_or(|ws| ws.slots.get(ws.focus).and_then(Slot::top) == Some(*w))
+            });
+        }
         if self.attention.is_empty() {
             return;
         }
@@ -1112,10 +1208,13 @@ mod tests {
             assert!(s.pending.is_empty(), "pending windows while a monitor exists");
         }
 
-        let non_empty = (s.monitors.iter().enumerate())
-            .flat_map(|(m, _)| &shown(s, m).slots)
-            .filter(|sl| !sl.is_empty())
-            .count();
+        // A screen with a fullscreen window draws that one alone.
+        let non_empty: usize = (0..s.monitors.len())
+            .map(|m| match s.fullscreen_on(m) {
+                Some(_) => 1,
+                None => shown(s, m).slots.iter().filter(|sl| !sl.is_empty()).count(),
+            })
+            .sum();
         let tiles = s.tiles();
         assert_eq!(tiles.len(), non_empty, "one tile per non-empty shown slot");
         for t in &tiles {
@@ -1151,7 +1250,7 @@ mod tests {
         }
         let tops: Vec<(usize, usize, Rect, WinId, bool)> = placements
             .iter()
-            .filter(|p| p.shown && p.on_top)
+            .filter(|p| p.shown && p.on_top && !p.covered)
             .map(|p| (p.monitor, p.slot, p.rect, p.win, p.focused))
             .collect();
         let from_tiles: Vec<_> = tiles
@@ -1167,6 +1266,33 @@ mod tests {
                 Mark::Unfocused => p.is_some_and(|p| !p.focused),
             };
             assert!(unseen, "window {w} marked {mark:?} but seen or not placed");
+        }
+
+        // A placed fullscreen window is the top of its workspace's focused slot, at its whole screen, and covers
+        // every other window of that workspace.
+        for p in &placements {
+            let ws = s
+                .workspaces
+                .iter()
+                .find(|w| w.number == p.workspace)
+                .expect("its workspace");
+            let full = ws.slots[ws.focus].top().filter(|w| s.fullscreen.contains(w));
+            assert_eq!(p.fullscreen, s.fullscreen.contains(&p.win), "window {}: flag", p.win);
+            assert_eq!(
+                p.fullscreen,
+                full == Some(p.win),
+                "window {}: fullscreen off its focused top",
+                p.win
+            );
+            assert_eq!(p.covered, full.is_some() && !p.fullscreen, "window {}: covered", p.win);
+            if p.fullscreen {
+                assert_eq!(
+                    p.rect,
+                    s.monitors[p.monitor].screen(),
+                    "window {}: not its screen",
+                    p.win
+                );
+            }
         }
 
         for k in &s.foreign {
@@ -1217,6 +1343,7 @@ mod tests {
                 rect: rect(0, 0, 1280, 720),
                 win: 3,
                 focused: true,
+                fullscreen: false,
                 tabs: 1,
                 depth: 3,
                 windows: 3,
@@ -1349,6 +1476,8 @@ mod tests {
             shown: true,
             on_top,
             focused,
+            fullscreen: false,
+            covered: false,
         };
         assert_eq!(
             s.placements().collect::<Vec<_>>(),
@@ -2371,6 +2500,8 @@ mod tests {
             shown,
             on_top: true,
             focused,
+            fullscreen: false,
+            covered: false,
         };
         assert_eq!(
             s.placements().collect::<Vec<_>>(),
@@ -2663,6 +2794,9 @@ mod tests {
         /// `Remote` outcomes, successful renumbers.
         remote: usize,
         renumbered: usize,
+        /// Steps ending with a fullscreen window, and with one covering another slot's top on its screen.
+        fullscreen: usize,
+        covered: usize,
     }
 
     /// One seeded walk of 1,000 operations.
@@ -2701,7 +2835,7 @@ mod tests {
             let op = if live.len() > 12 && rng.below(2) == 0 {
                 3
             } else {
-                rng.below(28)
+                rng.below(30)
             };
             match op {
                 0 | 1 => {
@@ -2873,6 +3007,42 @@ mod tests {
                     assert_eq!(only, before, "seed {seed} step {step}: set_foreign changed more");
                 }
                 25 => s.clear_foreign(),
+                27 => {
+                    let focused = before.focused_window();
+                    assert_eq!(
+                        s.toggle_fullscreen(),
+                        focused.is_some(),
+                        "seed {seed} step {step}: toggle_fullscreen"
+                    );
+                    assert_eq!(
+                        all_tabs(&s),
+                        all_tabs(&before),
+                        "seed {seed} step {step}: toggle_fullscreen"
+                    );
+                    if let Some(w) = focused {
+                        assert_ne!(s.is_fullscreen(w), before.is_fullscreen(w));
+                    }
+                }
+                28 => {
+                    // Granted only to the top of its workspace's focused slot.
+                    let w = pick(&mut rng, &live);
+                    let top = (before.workspaces.iter()).any(|ws| ws.slots[ws.focus].top() == Some(w));
+                    let granted = top || before.find(w).is_none();
+                    assert_eq!(
+                        s.set_fullscreen(w, true),
+                        granted,
+                        "seed {seed} step {step}: set_fullscreen {w}"
+                    );
+                    assert_eq!(
+                        all_tabs(&s),
+                        all_tabs(&before),
+                        "seed {seed} step {step}: set_fullscreen"
+                    );
+                    if !live.contains(&w) {
+                        // The wish of a window that never opens goes when it closes.
+                        s.close(w);
+                    }
+                }
                 26 => {
                     // Mostly onto a free number, so renumbers happen; sometimes anything, so refusals do.
                     let from = number(&mut rng);
@@ -2945,14 +3115,152 @@ mod tests {
             v.marked += usize::from(!s.attention.is_empty());
             v.hidden += usize::from(s.placements().any(|p| !p.shown));
             v.foreign += usize::from(!s.foreign.is_empty());
+            v.fullscreen += usize::from(s.placements().any(|p| p.fullscreen));
+            v.covered += usize::from(s.placements().any(|p| p.covered && p.shown && p.on_top));
         }
         v
     }
 
     #[test]
+    fn fullscreen_is_the_focused_slots_top_over_the_whole_screen() {
+        let mut s = wall_monitor();
+        let screen = rect(0, 0, 3840, 2200);
+        s.set_screen("winit", screen);
+        assert_eq!(s.monitors()[0].screen(), screen);
+        assert_ne!(s.monitors()[0].area(), screen, "the area is what the layout divides");
+        assert!(!s.toggle_fullscreen(), "nothing focused, nothing to toggle");
+        s.open_stacked(1);
+        s.focus_slot(Dir::Right);
+        s.open_stacked(2);
+        let slot = placement(&s, 2).rect;
+        assert!(s.toggle_fullscreen());
+        assert!(s.is_fullscreen(2));
+        assert_eq!(s.fullscreen_on(0), Some(2));
+        let p = placement(&s, 2);
+        assert_eq!(
+            (p.rect, p.fullscreen, p.covered, p.focused),
+            (screen, true, false, true)
+        );
+        let other = placement(&s, 1);
+        assert!(
+            other.covered && other.shown && other.on_top,
+            "the other slot's top is covered"
+        );
+        assert_eq!(
+            s.tiles()
+                .iter()
+                .map(|t| (t.win, t.rect, t.fullscreen))
+                .collect::<Vec<_>>(),
+            [(2, screen, true)]
+        );
+        assert_invariants(&s);
+        // Back into its slot.
+        assert!(s.toggle_fullscreen());
+        assert_eq!(s.fullscreen_on(0), None);
+        assert_eq!(placement(&s, 2).rect, slot);
+        assert!(!placement(&s, 1).covered);
+        assert_eq!(s.tiles().len(), 2);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn fullscreen_ends_when_its_window_is_no_longer_the_focused_slots_top() {
+        let full = || {
+            let mut s = wall_monitor();
+            s.open_stacked(1);
+            s.focus_slot(Dir::Right);
+            s.open_stacked(2);
+            assert!(s.toggle_fullscreen());
+            s
+        };
+        // Covered by a new window, its tab left, its slot left, the focus sent elsewhere, closed.
+        type End = fn(&mut Stacks);
+        let ends: [(&str, End); 5] = [
+            ("a window on top", |s| s.open_stacked(3)),
+            ("a new tab", |s| s.open_tab(3, None, None)),
+            ("the slot left", |s| s.focus_slot(Dir::Left)),
+            ("another slot clicked", |s| s.focus_at("winit", 0)),
+            ("another window focused", |s| {
+                s.focus_window(1);
+            }),
+        ];
+        for (what, end) in ends {
+            let mut s = full();
+            end(&mut s);
+            assert!(!s.is_fullscreen(2), "{what}");
+            assert!(s.placements().all(|p| !p.fullscreen && !p.covered), "{what}");
+            assert_invariants(&s);
+        }
+        let mut s = full();
+        s.close(2);
+        assert!(!s.is_fullscreen(2));
+        assert_eq!(s.fullscreen_on(0), None);
+        // Asking for a window that is not the focused slot's top changes nothing.
+        let mut s = full();
+        assert!(!s.set_fullscreen(1, true));
+        assert_eq!(s.fullscreen_on(0), Some(2));
+        assert!(!s.set_fullscreen(2, false));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn fullscreen_stays_through_what_keeps_its_window_on_top() {
+        let mut s = wall_monitor();
+        s.add_monitor("side", UHD, layout("halves"));
+        s.open_stacked(1);
+        assert!(s.toggle_fullscreen());
+        // The focus on the other screen, another workspace shown and back, a new layout: still fullscreen.
+        s.focus_monitor("side");
+        assert_eq!(s.fullscreen_on(0), Some(1));
+        assert!(!placement(&s, 1).focused);
+        s.open_stacked(2);
+        assert!(!placement(&s, 2).covered, "another screen's windows are not covered");
+        s.focus_monitor("winit");
+        s.workspace(5);
+        assert_eq!(s.fullscreen_on(0), None, "workspace 5 has none");
+        assert!(s.is_fullscreen(1));
+        assert!(!placement(&s, 1).shown);
+        s.workspace(1);
+        assert_eq!(s.fullscreen_on(0), Some(1));
+        s.set_layout("winit", layout("halves"));
+        assert_eq!(s.fullscreen_on(0), Some(1));
+        // Sent to another workspace it is the top of the focused slot there: fullscreen when that one is shown.
+        s.move_to_workspace(7);
+        assert_eq!(s.fullscreen_on(0), None);
+        assert!(s.is_fullscreen(1));
+        s.workspace(7);
+        assert_eq!(s.fullscreen_on(0), Some(1));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn a_window_can_ask_for_fullscreen_before_it_opens() {
+        let mut s = wall_monitor();
+        s.open_stacked(1);
+        assert!(s.set_fullscreen(2, true), "the wish is kept");
+        assert_eq!(s.fullscreen_on(0), None);
+        s.open_stacked(2);
+        assert_eq!(s.fullscreen_on(0), Some(2));
+        assert_invariants(&s);
+        // One opening beneath (on its parent's stack, not raised) loses the wish.
+        s.focus_slot(Dir::Right);
+        assert!(!s.is_fullscreen(2));
+        s.open_stacked(3);
+        s.open_tab(4, None, None);
+        assert!(s.set_fullscreen(5, true));
+        assert!(s.open_on(5, 3));
+        assert!(!s.is_fullscreen(5));
+        // One that never opens: closing drops the wish.
+        assert!(s.set_fullscreen(9, true));
+        s.close(9);
+        assert!(!s.is_fullscreen(9));
+        assert_invariants(&s);
+    }
+
+    #[test]
     fn random_walks_lose_nothing() {
         let mut seed: u64 = 0x51c3_9a07_d2e4;
-        let (mut remote, mut renumbered) = (0, 0);
+        let (mut remote, mut renumbered, mut covered) = (0, 0, 0);
         for _ in 0..32 {
             let v = walk(seed);
             assert!(v.marked > 50, "seed {seed}: marks held on {} steps only", v.marked);
@@ -2967,11 +3275,21 @@ mod tests {
                 "seed {seed}: at most {} open, the walk is unbalanced",
                 v.most
             );
+            assert!(
+                v.fullscreen > 50,
+                "seed {seed}: a window fullscreen on {} steps only",
+                v.fullscreen
+            );
+            covered += v.covered;
             remote += v.remote;
             renumbered += v.renumbered;
             seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1) | 1;
         }
         assert!(remote > 100, "{remote} remote outcomes in all");
         assert!(renumbered > 40, "{renumbered} renumbers in all");
+        assert!(
+            covered > 500,
+            "a tile covered by a fullscreen window on {covered} steps in all"
+        );
     }
 }

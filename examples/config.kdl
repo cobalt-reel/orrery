@@ -47,6 +47,7 @@ binds {
     "Mod+Shift+Tab" cycle-tab "prev"
     "Mod+S" split
     "Mod+Shift+S" toggle-stacking
+    "Mod+F" toggle-fullscreen                // the focused window over its whole screen, and back
     "Mod+Ctrl+1" layout "wall"
     "Mod+Ctrl+2" layout "halves"
     "Mod+bracketright" cycle-layout "next"   // the layouts in the order written, round and round

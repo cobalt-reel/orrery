@@ -152,6 +152,7 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Ctrl+H` / `J` / `K` / `L` | swap everything (all tabs) with the slot left / down / up / right (focus follows) |
 | `Super+Tab` / `Super+Shift+Tab` | show the focused slot's next / previous tab (wrapping; tabs never move) |
 | `Super+S` | split: the top window leaves its stack for a new tab of its own, right after |
+| `Super+F` | fullscreen: the focused window over its whole screen, and back (see [Fullscreen](#fullscreen)) |
 | `Super+Shift+S` | toggle stacking: a window orrery did not launch and with no parent goes on top of the focused stack (on) or opens as a new tab (off) |
 | `Super+1` ... `Super+9`, `Super+0` | show workspace 1 ... 9, 10 (made on the focused screen if it does not exist) |
 | `Super+Shift+1` ... `Super+Shift+0` | move the current tab (its whole stack) to workspace 1 ... 10, as a new tab in its focused slot (focus stays) |
@@ -191,6 +192,7 @@ orrery msg swap-slot down
 orrery msg cycle-tab next             # next | prev
 orrery msg split                      # the top window becomes a tab of its own
 orrery msg toggle-stacking
+orrery msg toggle-fullscreen          # the focused window over its whole screen, or back into its slot
 orrery msg spawn kitty --single-instance   # every word after spawn is the argv (so --socket goes before spawn)
 orrery msg layout halves              # optionally a monitor: orrery msg layout halves winit
 orrery msg cycle-layout next          # next | prev, in config order, wrapping; optionally a monitor, as for layout
@@ -390,6 +392,7 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   | `cycle-tab` | `"next"`/`"prev"` | show the focused slot's next / previous tab |
   | `split` | | the top window leaves its stack for a new tab right after it |
   | `toggle-stacking` | | flip `stacking` (windows orrery did not launch, with no parent) |
+  | `toggle-fullscreen` | | the focused window over its whole screen, or back into its slot (see [Fullscreen](#fullscreen)) |
   | `layout` | a layout name | switch the layout of the focused screen's workspace (fewer slots: the extra slots' tabs join the last) |
   | `cycle-layout` | `"next"`/`"prev"` | switch to the layout after / before the workspace's in config order, wrapping round (from a layout no longer in the config: the first / last) |
   | `workspace` | a number, 1 to 10 (`workspace 3`, not `"3"`) | show that workspace on its screen and focus it (made on the focused screen if new) |
@@ -453,6 +456,7 @@ binds {
     "Mod+Shift+Tab" cycle-tab "prev"
     "Mod+S" split
     "Mod+Shift+S" toggle-stacking
+    "Mod+F" toggle-fullscreen                // the focused window over its whole screen, and back
     "Mod+Ctrl+1" layout "wall"
     "Mod+Ctrl+2" layout "halves"
     "Mod+bracketright" cycle-layout "next"   // the layouts in the order written, round and round
@@ -770,6 +774,29 @@ scheme, accent colour, the chooser's size and kitty options) are in `~/.config/k
 `/usr/lib/xdg-desktop-portal -r -v` (the path varies by distribution) logs which backend the portal picks for what,
 and why.
 
+## Fullscreen
+
+`Super+F` (`toggle-fullscreen`) puts the focused window over its whole screen, and back into its slot. A program
+asking for it itself (a video's fullscreen button, `F11` in a browser, `mpv --fs`) gets the same, and leaves it the
+same way; one asking before its window opens, opens fullscreen. Which output a program names does not matter:
+fullscreen is always the screen the window is on.
+
+- The window is configured to the screen's size with the `fullscreen` state, and drawn alone on black: the bar and
+  everything else under it are covered, the other slots of that workspace are not drawn (their windows get no
+  frame callbacks, so they stop drawing), and there is no focus border, badge or tab strip. The layout still divides
+  what the bar leaves, so nothing has moved when the window goes back.
+- Over it show only `overlay` layer surfaces, and `top` ones that take the keyboard for themselves (`exclusive`: a
+  launcher, a prompt), so what has the keyboard is never hidden. The pointer hits what is drawn: the whole screen
+  is the window's.
+- Fullscreen belongs to the window, and to the top of its workspace's focused slot only: it ends by itself, the
+  window told so, as soon as that changes. A new window opening on top or as a tab there, another tab shown,
+  the focus moved to another slot of that workspace (keys, a click, or a new window launched into one): all give
+  the tiles back. A request from a window that is not the focused slot's top is refused.
+- It stays through everything else: the focus on another screen (a film on one screen, work on the other), another
+  workspace shown on its screen and back, a new layout, and a move that keeps it the focused top (`move` to a
+  neighbour, `swap-slot`, or `move-to-workspace`: fullscreen there, when that workspace is shown).
+- `state` marks the window `"fullscreen": true` (absent otherwise).
+
 ## Menus (popup grabs)
 
 A menu a client opens on a click (an `xdg_popup` with a grab) takes the keyboard and the pointer while it is open,
@@ -798,7 +825,8 @@ orrery's frame, never put on a monitor plane directly; implicit synchronization 
 - No clipboard bridge to the host: copy and paste work between clients inside orrery, not across.
 - Nested, the host's cursor stands for orrery's own pointer: orrery draws a cursor only for a pointer moved from
   another machine. Bare metal it always draws it (see Bare metal).
-- Maximize and fullscreen requests are ignored: a window is always its slot's size.
+- Maximize requests are ignored: a window is its slot's size, or its whole screen's ([Fullscreen](#fullscreen)).
+- A fullscreen window is composited like any other (no direct scanout onto a plane yet).
 - A layout round trip is not an identity: switching to a layout with fewer slots appends the extra slots' tabs to
   its last slot, and they stay there when switching back.
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
@@ -952,6 +980,20 @@ Nested first (inside your desktop), then bare metal (the Bare metal checklist's 
 - [ ] Switch workspaces and back, move a GPU client's stack to another slot, resize by switching layouts: its
       content follows, never black or garbled.
 - [ ] Bare metal: switch consoles away and back (`Ctrl+Alt+F<n>`) while `vkcube` runs: it keeps spinning after.
+
+## Fullscreen: checklist
+
+- [ ] `Super+F` on a terminal: it covers the whole screen, bar included, with no border; `Super+F` again: back in
+      its slot, the bar back, the other windows as they were.
+- [ ] A video in the browser, its fullscreen button (or `F11`): the whole screen; Escape (or the button) gives the
+      tiles back. `mpv --fs FILE` opens fullscreen; `f` in mpv leaves and enters it.
+- [ ] With a window fullscreen on one screen, the pointer and focus go to the other screen and back: it stays
+      fullscreen, and moving the pointer across it (top edge too, where the bar is) changes nothing.
+- [ ] `Super+D` over a fullscreen window: the launcher shows over it and takes the keys; starting a program from it
+      ends the fullscreen (the new window is on top or in another slot).
+- [ ] `Super+2` then `Super+1` (workspaces): the other workspace is tiled with its bar; back, the window is
+      fullscreen still.
+- [ ] `Super+H`/`J`/`K`/`L` to another slot of the same workspace: the tiles are back.
 
 ## Layouts: checklist
 

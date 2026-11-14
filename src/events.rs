@@ -371,6 +371,7 @@ mod tests {
             id,
             app_id: Some(format!("app{id}")),
             title: Some(title.into()),
+            fullscreen: false,
         }
     }
 

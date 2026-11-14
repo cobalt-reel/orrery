@@ -619,6 +619,7 @@ impl Orrery {
         if let Some(layout) = layout_for_output(&self.config, &output.name()) {
             let usable = self.usable_area_of(&output, area);
             self.stacks.add_monitor(&output.name(), usable, layout);
+            self.stacks.set_screen(&output.name(), area);
         }
         self.outputs.push(output);
         self.arrange();
@@ -703,6 +704,7 @@ impl Orrery {
     pub fn resize_output(&mut self, name: &str, area: Rect) {
         let usable = self.output_named(name).map_or(area, |o| self.usable_area_of(&o, area));
         self.stacks.set_area(name, usable);
+        self.stacks.set_screen(name, area);
         self.arrange();
     }
 
@@ -906,21 +908,50 @@ impl Orrery {
         self.id_of_surface(surface).and_then(|id| self.windows.get(&id))
     }
 
-    /// The slot rectangle a window lives in, or would open into while it waits.
+    /// The slot rectangle a window lives in (its whole screen, fullscreen), or would open into while it waits.
     pub fn slot_rect_of(&self, id: WinId) -> Option<Rect> {
         self.stacks
             .placements()
             .find(|p| p.win == id)
             .map(|p| p.rect)
-            .or_else(|| self.stacks.focused_rect())
+            .or_else(|| self.waiting_rect(id))
+    }
+
+    /// Where a window not placed yet would open: the focused slot, or the focused screen when it asked to open
+    /// fullscreen.
+    fn waiting_rect(&self, id: WinId) -> Option<Rect> {
+        if self.stacks.is_fullscreen(id) {
+            self.stacks.focused_screen()
+        } else {
+            self.stacks.focused_rect()
+        }
+    }
+
+    /// A client asked for `surface`'s window to be fullscreen (`on`) or not. Granted to the focused slot's top
+    /// window and to one still waiting to open (`Stacks::set_fullscreen`); any other keeps its slot. The protocol
+    /// wants a configure in answer either way, but none may go out before the initial commit.
+    pub fn fullscreen_requested(&mut self, surface: &ToplevelSurface, on: bool) {
+        let Some(id) = self.id_of_surface(surface.wl_surface()) else {
+            return;
+        };
+        let was = self.stacks.is_fullscreen(id);
+        let is = self.stacks.set_fullscreen(id, on);
+        self.arrange();
+        // A change went out with arrange's configure; no change still needs its answer.
+        if was == is && surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
     }
 
     /// Makes Wayland match the stacks, in one pass over `placements()`: the top of a slot's current tab in a shown
     /// workspace is mapped at the slot's rectangle; every other window (hidden workspaces' too) is unmapped but
     /// stays alive. Both are configured to the slot's size (so showing one later needs no round trip), tiled on
-    /// every edge, activated only when focused. Waiting windows (no buffer yet) are unmapped and configured to where
-    /// they would open (the focused slot). Opened windows in no slot (pending without a monitor) are unmapped and
-    /// keep their size; they are neither drawn nor focused. Keyboard and pointer focus then follow.
+    /// every edge, activated only when focused. A fullscreen window is mapped at its whole screen and configured
+    /// to it, fullscreen; the others of its workspace are covered, so unmapped (they get no frame callbacks and
+    /// stop drawing). Waiting windows (no buffer yet) are unmapped and configured to where they would open (the
+    /// focused slot, or the focused screen for one that asked to open fullscreen). Opened windows in no slot
+    /// (pending without a monitor) are unmapped and keep their size; they are neither drawn nor focused. Keyboard
+    /// and pointer focus then follow.
     pub fn arrange(&mut self) {
         let mut placed = HashSet::with_capacity(self.windows.len());
         for p in self.stacks.placements() {
@@ -928,8 +959,8 @@ impl Orrery {
                 continue;
             };
             placed.insert(p.win);
-            configure(window, p.rect, p.focused);
-            if p.shown && p.on_top {
+            configure(window, p.rect, p.focused, p.fullscreen);
+            if p.shown && p.on_top && !p.covered {
                 let at = (p.rect.x, p.rect.y).into();
                 if self.space.element_location(window) != Some(at) {
                     self.space.map_element(window.clone(), at, false);
@@ -938,12 +969,11 @@ impl Orrery {
                 self.space.unmap_elem(window);
             }
         }
-        let waiting_rect = self.stacks.focused_rect();
         for (id, window) in &self.windows {
             if !placed.contains(id) {
                 self.space.unmap_elem(window);
-                if let Some(rect) = waiting_rect.filter(|_| !self.opened.contains(id)) {
-                    configure(window, rect, false);
+                if let Some(rect) = self.waiting_rect(*id).filter(|_| !self.opened.contains(id)) {
+                    configure(window, rect, false, self.stacks.is_fullscreen(*id));
                 }
             }
         }
@@ -1273,7 +1303,7 @@ impl Orrery {
 
 /// Sets a toplevel's pending size and states and sends them if they changed. Before the initial commit the
 /// protocol forbids configures; `toplevel_committed` sends the first.
-fn configure(window: &Window, rect: Rect, focused: bool) {
+fn configure(window: &Window, rect: Rect, focused: bool, fullscreen: bool) {
     let Some(toplevel) = window.toplevel() else {
         return;
     };
@@ -1281,6 +1311,11 @@ fn configure(window: &Window, rect: Rect, focused: bool) {
         s.size = Some(configure_size(rect).into());
         for edge in TILED {
             s.states.set(edge);
+        }
+        if fullscreen {
+            s.states.set(xdg_toplevel::State::Fullscreen);
+        } else {
+            s.states.unset(xdg_toplevel::State::Fullscreen);
         }
         if focused {
             s.states.set(xdg_toplevel::State::Activated);
