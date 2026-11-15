@@ -19,6 +19,14 @@
   <img alt="Built on Smithay" src="https://img.shields.io/badge/built%20on-Smithay-8a2be2">
 </p>
 
+<p align="center">
+  <img src="docs/images/desktop.png" width="900" alt="orrery with the kitty desktop: a bar along the top, an editor in the main slot with its tab strip showing, and three terminals stacked on the right">
+</p>
+<p align="center">
+  <sub>The <code>tall</code> layout under the kitty desktop's bar. The main slot holds three tabs; holding
+  <code>Mod+Space</code> shows its tab strip.</sub>
+</p>
+
 ---
 
 orrery is a Wayland compositor and tiling window manager written in Rust on
@@ -202,6 +210,10 @@ one in [`examples/kitty/`](examples/kitty) is built from [kitty](https://sw.kovi
 - a **launcher** on `Mod+D`: fzf over your desktop applications and the commands on `PATH`;
 - a **layout picker** on `Mod+backslash`: fzf over the layouts, each drawn to the screen's proportions.
 
+<p align="center">
+  <img src="docs/images/layout-picker.png" width="900" alt="The layout picker over the desktop: a list of layouts on the left, the centre layout drawn with its five numbered slots on the right">
+</p>
+
 ```kdl
 include "/path/to/orrery/examples/kitty/orrery.kdl"
 include "/path/to/orrery/examples/layouts.kdl"
@@ -235,7 +247,8 @@ secret. See [Linking machines](docs/manual.md#linking-machines) and
 orrery is young: version 0.1. It runs a desktop on bare metal, and these are the things it does not do yet:
 
 - no Xwayland: Wayland clients only;
-- no screen capture protocol, so no screenshots or screen sharing;
+- no screen capture protocol, so no screenshots or screen sharing (the pictures here were taken by the host of a
+  nested orrery);
 - no screen lock and no idle handling;
 - scale 1 only, each monitor at its preferred mode, one GPU;
 - no hardware cursor planes and no direct scanout: everything is composited;
