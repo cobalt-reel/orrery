@@ -1,24 +1,10 @@
-<h1 align="center">orrery</h1>
+# orrery
 
-<p align="center">
-  <b>A static tiling Wayland compositor that spans machines.</b><br>
-  Windows stay where you put them, windows that belong together stack in one place,<br>
-  and one keyboard and mouse drive every screen of every machine on your desk.
-</p>
+A tiling Wayland compositor I wrote for the way I use a desk: windows stay where I put them, windows that belong
+together pile up in one place, and one keyboard and mouse drive every machine in front of me.
 
-<p align="center">
-  <a href="#what-orrery-is">What it is</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="docs/manual.md">Manual</a> ·
-  <a href="examples/config.kdl">Example config</a> ·
-  <a href="docs/plans/">Design notes</a>
-</p>
-
-<p align="center">
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue">
-  <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange">
-  <img alt="Built on Smithay" src="https://img.shields.io/badge/built%20on-Smithay-8a2be2">
-</p>
+[Manual](docs/manual.md) · [Example config](examples/config.kdl) · [Design notes](docs/plans/) ·
+[Quick start](#quick-start)
 
 <p align="center">
   <img src="docs/images/desktop.png" width="900" alt="orrery with the kitty desktop: a bar along the top, an editor in the main slot with its tab strip showing, and three terminals stacked on the right">
@@ -28,9 +14,34 @@
   holding <code>Mod+Space</code> shows its tab strip.</sub>
 </p>
 
----
+## Why this exists
 
-## What orrery is
+This is a personal project. I know how I want my windows to behave, and orrery is that, written down as a
+compositor: it does what I want from a window manager and not much more. It is not trying to replace the one you
+use. I run it on my own desk, it has held up, and keeping it to myself seemed a waste. If the ideas below sound
+like the way you work, you may like it too.
+
+## How it was made
+
+I did not type most of this code. orrery was built with Claude, Anthropic's coding model, as the programmer, and
+me as the one who designs it and has to live in it: I say how it should behave, read what comes back, run it on my
+desk, and send it back when it is wrong. That is the only reason it exists. One person does not usually write a
+compositor just to get their windows the way they like them. Now one can, and I think that is worth showing.
+
+It is not thrown together, though, and you can check:
+
+- **Every milestone was designed before it was built.** [`docs/plans/`](docs/plans) has a dated design, plan and
+  as-built note for each one, including what changed along the way.
+- **About 500 automated tests**, most of them end to end: a headless orrery driven through real Wayland client
+  connections and its control socket. The window logic is also put through seeded random walks that check its
+  invariants after every step.
+- **Checked by hand on real hardware.** What needs a real screen and real keys has a list in
+  [`docs/checklists.md`](docs/checklists.md), and I go through it.
+- **Clean under `cargo fmt` and `cargo clippy -D warnings`**, and the commits say who wrote them.
+
+The code is MIT. Read it and judge for yourself.
+
+## How it works
 
 orrery is a Wayland compositor and tiling window manager, written in Rust on
 [Smithay](https://github.com/Smithay/smithay). All of it in one paragraph:
@@ -45,10 +56,10 @@ Those are three ideas. One at a time:
 
 ### 1. Nothing moves unless you move it
 
-Most tiling window managers are *dynamic*: open or close a window and the others shuffle and resize to make room.
-orrery is *static*. You write each **layout** once, as a grid of **slots**, and a slot stays where it is whatever
-opens or closes. A window is the size of its slot, or of its whole screen when you ask for fullscreen. Nothing
-floats, and nothing is resized by its neighbours.
+I do not want my windows to shuffle and resize every time one opens or closes, so in orrery they never do. You
+write each **layout** once, as a grid of **slots**, and a slot stays where it is whatever opens or closes. A
+window is the size of its slot, or of its whole screen when you ask for fullscreen. Nothing floats, and nothing is
+resized by its neighbours.
 
 In the picture above the screen is in the `tall` layout: a main slot on the left and three slots on the right.
 A layout is a few lines of config, a [library of eight](examples/layouts.kdl) comes ready to include, and a key
@@ -103,12 +114,12 @@ Run orrery on each machine on your desk, give them one shared secret, and they j
   machine's own keyboard and mouse keep working all along.
 - **Windows stay on their machine.** Every machine runs and draws its own programs. Only input and commands travel
   (`orrery msg --to side spawn kitty` starts a terminal on the other machine); no pixels cross the network, so
-  nothing is streamed. It is the sharing a software KVM gives you, built into the compositor.
+  nothing is streamed. Think of a software KVM, built into the compositor.
 - **Nothing to set up but the secret.** The link is encrypted and authenticated with it (Noise over TCP). orrery is
   the compositor at both ends, so it needs no portal, no virtual input device and no extra permission. A machine
   that drops off keeps working by itself and rejoins when it can.
 
-On one machine none of this is in the way: orrery is then simply a static tiling compositor.
+On one machine none of this is in the way.
 
 ### And the rest
 
@@ -124,11 +135,9 @@ On one machine none of this is in the way: orrery is then simply a static tiling
 - **A desktop made of kitty.** [`examples/kitty/`](examples/kitty) adds a bar on every screen, a drop-down
   terminal, an application launcher and a layout picker that draws each layout, all as small scripts driven by
   `orrery msg`. One `include` line brings it in.
-- **The protocols a desktop needs:** xdg-shell with popups and menu grabs, fullscreen, layer-shell (bars,
+- **The protocols my desktop needs:** xdg-shell with popups and menu grabs, fullscreen, layer-shell (bars,
   launchers, wallpapers), xdg-activation (a window asking for attention is marked, never raised),
   xdg-decoration, linux-dmabuf (OpenGL and Vulkan clients render on the GPU), and copy and paste between clients.
-- **Tested without a screen:** about 500 tests, most of them end to end: a headless orrery driven through real
-  Wayland client connections and its control socket.
 
 ## Quick start
 
@@ -285,7 +294,8 @@ machine.
 
 ## Status
 
-orrery is young: version 0.1. It runs a desktop on bare metal, and these are the things it does not do yet:
+orrery is young: version 0.1. It runs my own desktop on bare metal, across two monitors. It does what I have
+needed so far, and these are the things I have not needed yet or have not got to:
 
 - no Xwayland: Wayland clients only;
 - no screen capture protocol, so no screenshots or screen sharing (the pictures here were taken by the host of a
@@ -296,7 +306,8 @@ orrery is young: version 0.1. It runs a desktop on bare metal, and these are the
 - no hardware cursor planes and no direct scanout: everything is composited;
 - touchscreens and tablets are ignored; touchpads keep libinput's defaults.
 
-The manual lists the [limits](docs/manual.md#limits) in full.
+The manual lists the [limits](docs/manual.md#limits) in full. If you try it and something breaks, open an issue: I
+would like to know. I make no promises about what gets built next, since it follows what I need on my own desk.
 
 ## Documentation
 
