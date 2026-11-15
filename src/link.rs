@@ -1,4 +1,4 @@
-//! The link between the primary and a satellite: one TCP connection, opened by the satellite (the Noise initiator),
+//! The link between the sun and a planet: one TCP connection, opened by the planet (the Noise initiator),
 //! carrying `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` keyed by a pre-shared secret file. Every frame is a u32
 //! big-endian length and that many bytes: first the two handshake messages, then each `Message` as JSON in one Noise
 //! transport message.
@@ -10,7 +10,7 @@
 //! stopped reading) closes the link with a reason.
 //!
 //! Trust: NN gives neither end an identity. The secret is the only authentication, and holding it is a shell on
-//! every machine in the session (a `Command` can spawn programs). Generate it from /dev/urandom, never from a
+//! every machine in the orrery (a `Command` can spawn programs). Generate it from /dev/urandom, never from a
 //! passphrase, and guard it like a private key.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -30,10 +30,10 @@ use zeroize::{Zeroize as _, Zeroizing};
 use crate::NAME;
 use crate::crossing::{Edge, Entry, RawKey};
 use crate::ipc::{Request, Response};
-use crate::session::{Renames, Role, Screen};
+use crate::system::{Renames, Role, Screen};
 
-/// The link protocol's version: both ends must speak the same one (the primary refuses a satellite's other one).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// The link protocol's version: both ends must speak the same one (the sun refuses a planet's other one).
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// The largest frame, its length prefix aside: Noise's largest message.
 pub const MAX_FRAME: usize = 65535;
@@ -41,13 +41,13 @@ pub const MAX_FRAME: usize = 65535;
 pub const MAX_MESSAGE: usize = MAX_FRAME - TAG;
 /// Bytes queued and not yet written, at most: one more message fails the link (`Closed::Stalled`).
 pub const MAX_OUTPUT: usize = 1 << 20;
-/// Input messages the primary has sent a satellite and that it has not acknowledged (`Message::InputAck`), at most:
-/// the rest wait on the primary, where motion merges. A few dozen milliseconds of a fast mouse.
+/// Input messages the sun has sent a planet and that it has not acknowledged (`Message::InputAck`), at most:
+/// the rest wait on the sun, where motion merges. A few dozen milliseconds of a fast mouse.
 pub const INPUT_WINDOW: u32 = 32;
 /// What the other end sent, quoted in a close reason, is cut to this many bytes.
 pub const MAX_REASON: usize = 200;
 /// A link not open this long after its connection was made is closed (`Link::expire`): the driver keeps the time.
-/// It covers the handshake and, on the primary, the Hello.
+/// It covers the handshake and, on the sun, the Hello.
 pub const OPEN_DEADLINE: Duration = Duration::from_secs(5);
 /// A secret file holds this many bytes or more (whitespace at either end aside), and at most `SECRET_MAX` in all.
 pub const SECRET_MIN: usize = 32;
@@ -157,24 +157,24 @@ impl Secret {
     }
 }
 
-/// What crosses the link, each in one frame. Hello first (satellite), then Welcome or Refused (primary); then
+/// What crosses the link, each in one frame. Hello first (planet), then Welcome or Refused (sun); then
 /// either end sends its others as things happen. A message to the wrong end, or a first one other than these,
 /// closes the link (`Closed::Protocol`).
 ///
-/// Input (milestone 5) goes from the primary to the satellite holding the session's focus marker: a Keymap when it
+/// Input (milestone 5) goes from the sun to the planet holding the orrery's focus marker: a Keymap when it
 /// changed, a Handoff, then Key, Motion, Button and Axis, until a Release. Keycodes never show in Debug.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "kebab-case")]
 pub enum Message {
-    /// Satellite, first and once: its version (`PROTOCOL_VERSION`), name, screens and workspace numbers, as for
-    /// `Session::join`.
+    /// Planet, first and once: its version (`PROTOCOL_VERSION`), name, screens and workspace numbers, as for
+    /// `Orrery::join`.
     Hello {
         version: u32,
         name: String,
         screens: Vec<Screen>,
         workspaces: BTreeSet<u8>,
     },
-    /// Primary, first and once: joined. The renames and foreign numbers for the satellite's `Stacks::apply_session`.
+    /// Sun, first and once: joined. The renames and foreign numbers for the planet's `Stacks::apply_system`.
     Welcome {
         renames: Renames,
         foreign: BTreeSet<u8>,
@@ -184,22 +184,22 @@ pub enum Message {
     Refused {
         reason: String,
     },
-    /// Satellite: what it has now, after a change, as for `Session::report`.
+    /// Planet: what it has now, after a change, as for `Orrery::report`.
     WorkspaceState {
         screens: Vec<Screen>,
         workspaces: BTreeSet<u8>,
     },
-    /// Primary: the answer to a report (or the session changed): renames and foreign numbers to apply.
+    /// Sun: the answer to a report (or the orrery changed): renames and foreign numbers to apply.
     Renames {
         renames: Renames,
         foreign: BTreeSet<u8>,
     },
-    /// Primary: run `request` there (`workspace N` routed there, `orrery msg --to`).
+    /// Sun: run `request` there (`workspace N` routed there, `orrery msg --to`).
     Command {
         id: u64,
         request: Request,
     },
-    /// Satellite: the answer to command `id`.
+    /// Planet: the answer to command `id`.
     CommandAnswer {
         id: u64,
         response: Response,
@@ -211,36 +211,36 @@ pub enum Message {
     Pong {
         nonce: u64,
     },
-    /// Primary: the keymap input is typed with from now on, as xkb keymap text (`KEYMAP_FORMAT_TEXT_V1`), so the
+    /// Sun: the keymap input is typed with from now on, as xkb keymap text (`KEYMAP_FORMAT_TEXT_V1`), so the
     /// user's layout follows them. Sent before a Handoff when it changed.
     Keymap {
         xkb: Xkb,
     },
-    /// Primary: input comes here now. `mods`: the modifier keys held, to press. `pointer`: where the pointer
-    /// enters; none: its cursor stays where it is. `layout`: the keymap's layout the primary is on (its index).
+    /// Sun: input comes here now. `mods`: the modifier keys held, to press. `pointer`: where the pointer
+    /// enters; none: its cursor stays where it is. `layout`: the keymap's layout the sun is on (its index).
     Handoff {
         mods: Vec<RawKey>,
         pointer: Option<Entry>,
         #[serde(default)]
         layout: u32,
     },
-    /// Primary: a key went down or up; `time` in milliseconds, the sender's clock.
+    /// Sun: a key went down or up; `time` in milliseconds, the sender's clock.
     Key {
         keycode: RawKey,
         pressed: bool,
         time: u32,
     },
-    /// Primary: relative pointer motion, in logical pixels.
+    /// Sun: relative pointer motion, in logical pixels.
     Motion {
         dx: f64,
         dy: f64,
     },
-    /// Primary: a pointer button (its evdev code) went down or up.
+    /// Sun: a pointer button (its evdev code) went down or up.
     Button {
         code: u32,
         pressed: bool,
     },
-    /// Primary: scroll, horizontal and vertical: the amounts, and wheel steps in 120ths of a notch (0: none).
+    /// Sun: scroll, horizontal and vertical: the amounts, and wheel steps in 120ths of a notch (0: none).
     Axis {
         source: ScrollSource,
         h: f64,
@@ -248,22 +248,22 @@ pub enum Message {
         v120_h: i32,
         v120_v: i32,
     },
-    /// Primary: input leaves; release everything down.
+    /// Sun: input leaves; release everything down.
     Release,
-    /// Satellite: its pointer left its screens past `edge` (the left of its first, the right of its last) at height
-    /// `y` (a fraction); the primary hands it to the machine beside it there (`crossing::landing`).
+    /// Planet: its pointer left its screens past `edge` (the left of its first, the right of its last) at height
+    /// `y` (a fraction); the sun hands it to the machine beside it there (`crossing::landing`).
     InputExit {
         edge: Edge,
         y: f64,
     },
-    /// Satellite: it ran `count` more input messages. The primary keeps only a few unanswered (`INPUT_WINDOW`), so
-    /// input a stalled satellite has not run waits on the primary, where motion merges, and never arrives late.
+    /// Planet: it ran `count` more input messages. The sun keeps only a few unanswered (`INPUT_WINDOW`), so
+    /// input a stalled planet has not run waits on the sun, where motion merges, and never arrives late.
     InputAck {
         count: u32,
     },
-    /// Satellite: `request` changes the session (`workspace N` for a number another machine has, from its keys or
-    /// its control socket): the primary routes it as its own.
-    SessionRequest {
+    /// Planet: `request` changes the orrery (`workspace N` for a number another machine has, from its keys or
+    /// its control socket): the sun routes it as its own.
+    OrreryRequest {
         request: Request,
     },
 }
@@ -290,7 +290,7 @@ pub enum ScrollSource {
 }
 
 impl Message {
-    /// Input the primary sends a satellite: Keymap, Handoff, Key, Motion, Button, Axis or Release.
+    /// Input the sun sends a planet: Keymap, Handoff, Key, Motion, Button, Axis or Release.
     #[must_use]
     pub fn is_input(&self) -> bool {
         matches!(
@@ -326,7 +326,7 @@ impl Message {
             Self::Release => "release",
             Self::InputExit { .. } => "input-exit",
             Self::InputAck { .. } => "input-ack",
-            Self::SessionRequest { .. } => "session-request",
+            Self::OrreryRequest { .. } => "orrery-request",
         }
     }
 }
@@ -372,12 +372,12 @@ pub enum SendError {
     TooLarge { len: usize },
 }
 
-/// One end of a link, without its connection: the satellite's (`Role::Satellite`, the initiator) or the primary's.
+/// One end of a link, without its connection: the planet's (`Role::Planet`, the initiator) or the sun's.
 pub struct Link {
     role: Role,
     noise: Noise,
-    /// The other end has shown it holds the secret: a frame it sent decrypted after the handshake (primary), or the
-    /// handshake's answer did (satellite). NNpsk0's first message can be replayed, so the primary waits for more.
+    /// The other end has shown it holds the secret: a frame it sent decrypted after the handshake (sun), or the
+    /// handshake's answer did (planet). NNpsk0's first message can be replayed, so the sun waits for more.
     proven: bool,
     /// Read and not yet a whole frame.
     input: Vec<u8>,
@@ -387,7 +387,7 @@ pub struct Link {
     /// Messages' JSON queued during the handshake.
     waiting: Vec<Vec<u8>>,
     received: VecDeque<Message>,
-    /// Whether a message came in yet: the first must be the Hello (primary) or the Welcome (satellite).
+    /// Whether a message came in yet: the first must be the Hello (sun) or the Welcome (planet).
     first_in: bool,
     closed: Option<Closed>,
 }
@@ -400,7 +400,7 @@ enum Noise {
 }
 
 impl Link {
-    /// A link on `secret`; a satellite's has its first handshake message ready to write at once.
+    /// A link on `secret`; a planet's has its first handshake message ready to write at once.
     #[must_use]
     pub fn new(role: Role, secret: &Secret) -> Self {
         let params: NoiseParams = NOISE_PARAMS.parse().expect("valid Noise parameters");
@@ -408,8 +408,8 @@ impl Link {
             .and_then(|b| b.psk(0, &secret.0))
             .expect("a prologue and a 32-byte PSK");
         let handshake = match role {
-            Role::Satellite => builder.build_initiator(),
-            Role::Primary => builder.build_responder(),
+            Role::Planet => builder.build_initiator(),
+            Role::Sun => builder.build_responder(),
         };
         let mut link = Self {
             role,
@@ -433,7 +433,7 @@ impl Link {
     }
 
     /// The handshake is done, the other end has shown it holds the secret, and the link is not closed. On the
-    /// primary that takes the satellite's first message, its Hello (decoded and of this version): a replayed
+    /// sun that takes the planet's first message, its Hello (decoded and of this version): a replayed
     /// handshake never gets this far. The driver closes a link not open within `OPEN_DEADLINE` (`expire`).
     #[must_use]
     pub fn is_open(&self) -> bool {
@@ -617,7 +617,7 @@ impl Link {
         let Noise::Handshake(h) = &mut self.noise else {
             return;
         };
-        // NN takes two messages: the satellite's, then the primary's (`is_my_turn` stays true once finished).
+        // NN takes two messages: the planet's, then the sun's (`is_my_turn` stays true once finished).
         if !h.is_handshake_finished() && h.is_my_turn() {
             let mut msg = [0; 64];
             let n = (h.write_message(&[], &mut msg)).expect("an empty handshake payload");
@@ -630,15 +630,15 @@ impl Link {
             unreachable!()
         };
         self.noise = Noise::Transport(Box::new(h.into_transport_mode().expect("a finished handshake")));
-        // The primary's answer decrypted at the satellite: only the secret's holder could have made it.
-        self.proven = self.role == Role::Satellite;
+        // The sun's answer decrypted at the planet: only the secret's holder could have made it.
+        self.proven = self.role == Role::Planet;
         for json in std::mem::take(&mut self.waiting) {
             self.queue(json);
         }
     }
 
-    /// One message's JSON, decrypted. The primary checks the first one's version before anything else, so a
-    /// satellite of another version is refused for that even when its Hello does not decode here.
+    /// One message's JSON, decrypted. The sun checks the first one's version before anything else, so a
+    /// planet of another version is refused for that even when its Hello does not decode here.
     fn decode(&mut self, json: &[u8]) {
         /// What every version's Hello has.
         #[derive(Deserialize)]
@@ -647,12 +647,12 @@ impl Link {
         }
         let first = std::mem::replace(&mut self.first_in, false);
         if first
-            && self.role == Role::Primary
+            && self.role == Role::Sun
             && let Ok(Versioned { version }) = serde_json::from_slice(json)
             && version != PROTOCOL_VERSION
         {
             return self.refuse(format!(
-                "the satellite speaks link protocol {version}, the primary {PROTOCOL_VERSION}: run the same {NAME} \
+                "the planet speaks link protocol {version}, the sun {PROTOCOL_VERSION}: run the same {NAME} \
                  release on both"
             ));
         }
@@ -679,22 +679,22 @@ impl Link {
     fn misplaced(&self, msg: &Message, first: bool) -> Option<String> {
         use Message as M;
         let (opening, end) = match self.role {
-            Role::Primary => ("hello", "the primary"),
-            Role::Satellite => ("welcome", "a satellite"),
+            Role::Sun => ("hello", "the sun"),
+            Role::Planet => ("welcome", "a planet"),
         };
         let fits = match (self.role, msg) {
-            (Role::Primary, M::Hello { .. }) | (Role::Satellite, M::Welcome { .. }) => first,
-            (Role::Primary, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputExit { .. })
-            | (Role::Primary, M::SessionRequest { .. } | M::InputAck { .. })
-            | (Role::Satellite, M::Renames { .. } | M::Command { .. })
-            | (Role::Satellite, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
-            | (Role::Satellite, M::Button { .. } | M::Axis { .. } | M::Release)
+            (Role::Sun, M::Hello { .. }) | (Role::Planet, M::Welcome { .. }) => first,
+            (Role::Sun, M::WorkspaceState { .. } | M::CommandAnswer { .. } | M::InputExit { .. })
+            | (Role::Sun, M::OrreryRequest { .. } | M::InputAck { .. })
+            | (Role::Planet, M::Renames { .. } | M::Command { .. })
+            | (Role::Planet, M::Keymap { .. } | M::Handoff { .. } | M::Key { .. } | M::Motion { .. })
+            | (Role::Planet, M::Button { .. } | M::Axis { .. } | M::Release)
             | (_, M::Ping { .. } | M::Pong { .. }) => !first,
             _ => false,
         };
         (!fits).then(|| match first {
             true => format!("the first message to {end} must be a {opening}, not a {}", msg.kind()),
-            false => format!("a {} to {end}", msg.kind()),
+            false => format!("`{}` sent to {end}", msg.kind()),
         })
     }
 }
@@ -732,10 +732,7 @@ mod tests {
 
     fn pair() -> (Link, Link) {
         let s = "the shared secret of these two ends, at least 32 bytes";
-        (
-            Link::new(Role::Satellite, &secret(s)),
-            Link::new(Role::Primary, &secret(s)),
-        )
+        (Link::new(Role::Planet, &secret(s)), Link::new(Role::Sun, &secret(s)))
     }
 
     fn hello(version: u32, name: &str) -> Message {
@@ -768,14 +765,14 @@ mod tests {
         moved
     }
 
-    /// A satellite and a primary through the handshake and the Hello, both open.
+    /// A planet and a sun through the handshake and the Hello, both open.
     fn joined() -> (Link, Link) {
-        let (mut sat, mut pri) = pair();
-        sat.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut pri), [hello(PROTOCOL_VERSION, "s")]);
-        assert!(sat.is_open() && pri.is_open());
-        (sat, pri)
+        let (mut planet, mut sun) = pair();
+        planet.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sun), [hello(PROTOCOL_VERSION, "s")]);
+        assert!(planet.is_open() && sun.is_open());
+        (planet, sun)
     }
 
     /// Both ways until neither end has anything to write.
@@ -789,13 +786,13 @@ mod tests {
 
     /// Every message both ways: Hello queued before the handshake, then the rest; returns what crossed.
     fn converse(chunk: usize) -> Vec<u8> {
-        let (mut sat, mut pri) = pair();
+        let (mut planet, mut sun) = pair();
         let mut wire = Vec::new();
-        assert!(!sat.is_open() && !pri.is_open());
-        sat.send(&hello(PROTOCOL_VERSION, MARKER)).expect("queued");
-        pump(&mut sat, &mut pri, &mut wire, chunk);
-        assert!(sat.is_open() && pri.is_open());
-        assert_eq!(drain(&mut pri), [hello(PROTOCOL_VERSION, MARKER)]);
+        assert!(!planet.is_open() && !sun.is_open());
+        planet.send(&hello(PROTOCOL_VERSION, MARKER)).expect("queued");
+        pump(&mut planet, &mut sun, &mut wire, chunk);
+        assert!(planet.is_open() && sun.is_open());
+        assert_eq!(drain(&mut sun), [hello(PROTOCOL_VERSION, MARKER)]);
 
         let to_sat = [
             Message::Welcome {
@@ -814,9 +811,9 @@ mod tests {
             },
             Message::Ping { nonce: 9 },
         ];
-        to_sat.iter().for_each(|m| pri.send(m).expect("sent"));
-        pump(&mut sat, &mut pri, &mut wire, chunk);
-        assert_eq!(drain(&mut sat), to_sat);
+        to_sat.iter().for_each(|m| sun.send(m).expect("sent"));
+        pump(&mut planet, &mut sun, &mut wire, chunk);
+        assert_eq!(drain(&mut planet), to_sat);
 
         let to_pri = [
             Message::WorkspaceState {
@@ -830,10 +827,10 @@ mod tests {
             Message::Pong { nonce: 9 },
             Message::Ping { nonce: 10 },
         ];
-        to_pri.iter().for_each(|m| sat.send(m).expect("sent"));
-        pump(&mut sat, &mut pri, &mut wire, chunk);
-        assert_eq!(drain(&mut pri), to_pri);
-        assert!(sat.closed().is_none() && pri.closed().is_none());
+        to_pri.iter().for_each(|m| planet.send(m).expect("sent"));
+        pump(&mut planet, &mut sun, &mut wire, chunk);
+        assert_eq!(drain(&mut sun), to_pri);
+        assert!(planet.closed().is_none() && sun.closed().is_none());
         wire
     }
 
@@ -851,23 +848,20 @@ mod tests {
 
     #[test]
     fn a_wrong_secret_fails_the_handshake_with_nothing_in_clear() {
-        let mut sat = Link::new(
-            Role::Satellite,
-            &secret("the satellite's secret, at least 32 bytes long"),
-        );
-        let mut pri = Link::new(Role::Primary, &secret("the primary's secret, also at least 32 bytes"));
+        let mut planet = Link::new(Role::Planet, &secret("the planet's secret, at least 32 bytes long"));
+        let mut sun = Link::new(Role::Sun, &secret("the sun's secret, also at least 32 bytes"));
         let mut wire = Vec::new();
-        sat.send(&hello(PROTOCOL_VERSION, MARKER)).expect("queued");
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(pri.closed(), Some(&Closed::Handshake));
-        assert!(pri.is_finished(), "nothing to say without a key");
-        assert!(drain(&mut pri).is_empty());
-        // The primary drops the connection; the satellite sees it go.
-        assert!(sat.closed().is_none() && !sat.is_open());
-        sat.eof();
-        assert_eq!(sat.closed(), Some(&Closed::EofInHandshake));
-        assert!(sat.is_finished());
-        assert_eq!(sat.send(&Message::Ping { nonce: 1 }), Err(SendError::Closed));
+        planet.send(&hello(PROTOCOL_VERSION, MARKER)).expect("queued");
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(sun.closed(), Some(&Closed::Handshake));
+        assert!(sun.is_finished(), "nothing to say without a key");
+        assert!(drain(&mut sun).is_empty());
+        // The sun drops the connection; the planet sees it go.
+        assert!(planet.closed().is_none() && !planet.is_open());
+        planet.eof();
+        assert_eq!(planet.closed(), Some(&Closed::EofInHandshake));
+        assert!(planet.is_finished());
+        assert_eq!(planet.send(&Message::Ping { nonce: 1 }), Err(SendError::Closed));
         assert!(
             !wire.is_empty() && !contains(&wire, MARKER.as_bytes()),
             "only the first handshake message"
@@ -877,49 +871,49 @@ mod tests {
 
     #[test]
     fn a_version_mismatch_is_refused_with_the_reason_on_both_ends() {
-        let (mut sat, mut pri) = pair();
+        let (mut planet, mut sun) = pair();
         let mut wire = Vec::new();
-        sat.send(&hello(PROTOCOL_VERSION + 1, "s")).expect("queued");
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        let Some(Closed::WeRefused(reason)) = pri.closed() else {
-            panic!("refused: {:?}", pri.closed());
+        planet.send(&hello(PROTOCOL_VERSION + 1, "s")).expect("queued");
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        let Some(Closed::WeRefused(reason)) = sun.closed() else {
+            panic!("refused: {:?}", sun.closed());
         };
         assert!(reason.contains(&format!("{}", PROTOCOL_VERSION + 1)), "{reason}");
-        assert_eq!(sat.closed(), Some(&Closed::Refused(reason.clone())));
-        assert!(drain(&mut pri).is_empty() && drain(&mut sat).is_empty());
-        assert!(sat.is_finished() && pri.is_finished());
+        assert_eq!(planet.closed(), Some(&Closed::Refused(reason.clone())));
+        assert!(drain(&mut sun).is_empty() && drain(&mut planet).is_empty());
+        assert!(planet.is_finished() && sun.is_finished());
 
         // A later version's Hello that does not even decode here is still refused for its version.
-        let (mut sat, mut pri) = pair();
-        sat.queue(br#"{"msg":"hello","version":99,"shape":"new"}"#.to_vec());
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
+        let (mut planet, mut sun) = pair();
+        planet.queue(br#"{"msg":"hello","version":99,"shape":"new"}"#.to_vec());
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
         assert!(
-            matches!(pri.closed(), Some(Closed::WeRefused(r)) if r.contains("99")),
+            matches!(sun.closed(), Some(Closed::WeRefused(r)) if r.contains("99")),
             "{:?}",
-            pri.closed()
+            sun.closed()
         );
-        assert!(matches!(sat.closed(), Some(Closed::Refused(r)) if r.contains("99")));
+        assert!(matches!(planet.closed(), Some(Closed::Refused(r)) if r.contains("99")));
     }
 
     #[test]
     fn a_refusal_is_written_then_the_link_closes() {
-        let (mut sat, mut pri) = pair();
+        let (mut planet, mut sun) = pair();
         let mut wire = Vec::new();
-        sat.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut pri), [hello(PROTOCOL_VERSION, "s")]);
-        pri.refuse("a machine named \"s\" is already in the session");
-        assert!(!pri.is_finished(), "the refusal still to write");
-        assert_eq!(pri.send(&Message::Ping { nonce: 1 }), Err(SendError::Closed));
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        let why = Closed::Refused("a machine named \"s\" is already in the session".into());
-        assert_eq!(sat.closed(), Some(&why));
-        assert!(pri.is_finished());
+        planet.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut sun), [hello(PROTOCOL_VERSION, "s")]);
+        sun.refuse("a machine named \"s\" is already in the orrery");
+        assert!(!sun.is_finished(), "the refusal still to write");
+        assert_eq!(sun.send(&Message::Ping { nonce: 1 }), Err(SendError::Closed));
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        let why = Closed::Refused("a machine named \"s\" is already in the orrery".into());
+        assert_eq!(planet.closed(), Some(&why));
+        assert!(sun.is_finished());
     }
 
     #[test]
     fn an_oversize_frame_or_one_that_does_not_decrypt_closes_the_link() {
-        let (mut sat, mut pri) = joined();
+        let (mut planet, mut sun) = joined();
         let mut wire = Vec::new();
 
         // Too big to send: refused, the link stays open.
@@ -927,67 +921,67 @@ mod tests {
             id: 1,
             response: Response::error("x".repeat(MAX_MESSAGE)),
         };
-        assert!(matches!(sat.send(&big), Err(SendError::TooLarge { .. })));
-        assert!(sat.is_open() && sat.outgoing().is_empty());
+        assert!(matches!(planet.send(&big), Err(SendError::TooLarge { .. })));
+        assert!(planet.is_open() && planet.outgoing().is_empty());
         // The largest that fits goes.
         let json_len = serde_json::to_vec(&big).expect("json").len();
         let fits = Message::CommandAnswer {
             id: 1,
             response: Response::error("x".repeat(2 * MAX_MESSAGE - json_len)),
         };
-        sat.send(&fits).expect("fits one frame");
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut pri), [fits]);
+        planet.send(&fits).expect("fits one frame");
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut sun), [fits]);
 
         // Too big to read: the length alone closes it.
-        pri.feed(&u32::try_from(MAX_FRAME + 1).expect("u32").to_be_bytes());
-        assert_eq!(pri.closed(), Some(&Closed::Oversize { len: MAX_FRAME + 1 }));
-        pri.feed(&[0; 64]);
+        sun.feed(&u32::try_from(MAX_FRAME + 1).expect("u32").to_be_bytes());
+        assert_eq!(sun.closed(), Some(&Closed::Oversize { len: MAX_FRAME + 1 }));
+        sun.feed(&[0; 64]);
         assert_eq!(
-            pri.closed(),
+            sun.closed(),
             Some(&Closed::Oversize { len: MAX_FRAME + 1 }),
             "ignored once closed"
         );
 
         // A flipped bit: the frame does not decrypt.
-        let (mut sat, mut pri) = joined();
-        sat.send(&Message::Ping { nonce: 1 }).expect("sent");
-        let mut frame = sat.outgoing().to_vec();
+        let (mut planet, mut sun) = joined();
+        planet.send(&Message::Ping { nonce: 1 }).expect("sent");
+        let mut frame = planet.outgoing().to_vec();
         *frame.last_mut().expect("a frame") ^= 1;
-        pri.feed(&frame);
-        assert_eq!(pri.closed(), Some(&Closed::Decrypt));
-        assert!(drain(&mut pri).is_empty());
+        sun.feed(&frame);
+        assert_eq!(sun.closed(), Some(&Closed::Decrypt));
+        assert!(drain(&mut sun).is_empty());
     }
 
     #[test]
     fn a_message_that_does_not_decode_closes_the_link() {
-        let (mut sat, mut pri) = pair();
+        let (mut planet, mut sun) = pair();
         let mut wire = Vec::new();
-        sat.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
-        sat.queue(br#"{"msg":"teleport"}"#.to_vec());
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut pri), [hello(PROTOCOL_VERSION, "s")]);
-        assert!(matches!(pri.closed(), Some(Closed::Undecodable(e)) if e.contains("teleport")));
+        planet.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
+        planet.queue(br#"{"msg":"teleport"}"#.to_vec());
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut sun), [hello(PROTOCOL_VERSION, "s")]);
+        assert!(matches!(sun.closed(), Some(Closed::Undecodable(e)) if e.contains("teleport")));
 
         // What the other end sent is cut short in the reason.
-        let (mut sat, mut pri) = joined();
-        sat.queue(format!(r#"{{"msg":"{}"}}"#, "é".repeat(5000)).into_bytes());
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        let Some(Closed::Undecodable(e)) = pri.closed() else {
-            panic!("{:?}", pri.closed());
+        let (mut planet, mut sun) = joined();
+        planet.queue(format!(r#"{{"msg":"{}"}}"#, "é".repeat(5000)).into_bytes());
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        let Some(Closed::Undecodable(e)) = sun.closed() else {
+            panic!("{:?}", sun.closed());
         };
         assert!(e.len() <= MAX_REASON + 3 && e.ends_with('…'), "{} bytes", e.len());
     }
 
     #[test]
     fn the_first_message_is_the_hello_or_the_welcome_and_messages_go_one_way() {
-        // To the primary: a Hello first, then only a satellite's messages; to the satellite: a Welcome first.
+        // To the sun: a Hello first, then only a planet's messages; to the planet: a Welcome first.
         let wrong_first = |role, first: Message| {
-            let (mut sat, mut pri) = pair();
-            let (from, to) = if role == Role::Primary {
-                (&mut sat, &mut pri)
+            let (mut planet, mut sun) = pair();
+            let (from, to) = if role == Role::Sun {
+                (&mut planet, &mut sun)
             } else {
-                (&mut pri, &mut sat)
+                (&mut sun, &mut planet)
             };
             from.send(&first).expect("queued");
             pump(from, to, &mut Vec::new(), usize::MAX);
@@ -998,22 +992,22 @@ mod tests {
             );
             assert!(!to.is_open() && drain(to).is_empty());
         };
-        wrong_first(Role::Primary, Message::Ping { nonce: 1 });
+        wrong_first(Role::Sun, Message::Ping { nonce: 1 });
         wrong_first(
-            Role::Primary,
+            Role::Sun,
             Message::WorkspaceState {
                 screens: vec![],
                 workspaces: BTreeSet::new(),
             },
         );
         wrong_first(
-            Role::Satellite,
+            Role::Planet,
             Message::Command {
                 id: 1,
                 request: Request::State,
             },
         );
-        wrong_first(Role::Satellite, Message::Ping { nonce: 1 });
+        wrong_first(Role::Planet, Message::Ping { nonce: 1 });
 
         let welcome = Message::Welcome {
             renames: vec![],
@@ -1036,30 +1030,30 @@ mod tests {
             workspaces: BTreeSet::new(),
         };
         for wrong in [hello(PROTOCOL_VERSION, "s"), welcome.clone(), renames, command] {
-            let (mut sat, mut pri) = joined();
-            sat.send(&wrong).expect("queued");
-            pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+            let (mut planet, mut sun) = joined();
+            planet.send(&wrong).expect("queued");
+            pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
             assert!(
-                matches!(pri.closed(), Some(Closed::Protocol(_))),
+                matches!(sun.closed(), Some(Closed::Protocol(_))),
                 "{wrong:?}: {:?}",
-                pri.closed()
+                sun.closed()
             );
         }
         for wrong in [hello(PROTOCOL_VERSION, "s"), welcome.clone(), state, answer] {
-            let (mut sat, mut pri) = joined();
-            pri.send(&welcome).expect("sent");
-            pri.send(&wrong).expect("sent");
-            pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-            assert_eq!(drain(&mut sat), std::slice::from_ref(&welcome));
+            let (mut planet, mut sun) = joined();
+            sun.send(&welcome).expect("sent");
+            sun.send(&wrong).expect("sent");
+            pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+            assert_eq!(drain(&mut planet), std::slice::from_ref(&welcome));
             assert!(
-                matches!(sat.closed(), Some(Closed::Protocol(_))),
+                matches!(planet.closed(), Some(Closed::Protocol(_))),
                 "{wrong:?}: {:?}",
-                sat.closed()
+                planet.closed()
             );
         }
     }
 
-    /// Every input message, as the primary sends them.
+    /// Every input message, as the sun sends them.
     fn input() -> Vec<Message> {
         vec![
             Message::Keymap {
@@ -1100,17 +1094,17 @@ mod tests {
     }
 
     #[test]
-    fn input_goes_to_a_satellite_and_comes_back_from_it() {
-        let (mut sat, mut pri) = joined();
+    fn input_goes_to_a_planet_and_comes_back_from_it() {
+        let (mut planet, mut sun) = joined();
         let welcome = Message::Welcome {
             renames: vec![],
             foreign: BTreeSet::new(),
         };
-        pri.send(&welcome).expect("sent");
+        sun.send(&welcome).expect("sent");
         let mut wire = Vec::new();
-        input().iter().for_each(|m| pri.send(m).expect("sent"));
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut sat)[1..], input());
+        input().iter().for_each(|m| sun.send(m).expect("sent"));
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut planet)[1..], input());
         let exits = [
             Message::InputExit {
                 edge: Edge::Left,
@@ -1121,121 +1115,121 @@ mod tests {
                 y: 0.0,
             },
         ];
-        exits.iter().for_each(|m| sat.send(m).expect("sent"));
-        pump(&mut sat, &mut pri, &mut wire, usize::MAX);
-        assert_eq!(drain(&mut pri), exits);
-        assert!(sat.is_open() && pri.is_open());
+        exits.iter().for_each(|m| planet.send(m).expect("sent"));
+        pump(&mut planet, &mut sun, &mut wire, usize::MAX);
+        assert_eq!(drain(&mut sun), exits);
+        assert!(planet.is_open() && sun.is_open());
         assert!(!contains(&wire, b"xkb_keymap"), "nothing in clear");
 
-        // Input never goes the other way, nor InputExit to a satellite.
+        // Input never goes the other way, nor InputExit to a planet.
         for wrong in input() {
-            let (mut sat, mut pri) = joined();
-            sat.send(&wrong).expect("queued");
-            pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
+            let (mut planet, mut sun) = joined();
+            planet.send(&wrong).expect("queued");
+            pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
             assert!(
-                matches!(pri.closed(), Some(Closed::Protocol(_))),
+                matches!(sun.closed(), Some(Closed::Protocol(_))),
                 "{wrong:?}: {:?}",
-                pri.closed()
+                sun.closed()
             );
         }
-        let (mut sat, mut pri) = joined();
-        pri.send(&welcome).expect("sent");
-        pri.send(&exits[0]).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut sat), [welcome]);
-        let Some(Closed::Protocol(why)) = sat.closed() else {
-            panic!("{:?}", sat.closed());
+        let (mut planet, mut sun) = joined();
+        sun.send(&welcome).expect("sent");
+        sun.send(&exits[0]).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut planet), [welcome]);
+        let Some(Closed::Protocol(why)) = planet.closed() else {
+            panic!("{:?}", planet.closed());
         };
-        assert_eq!(why, "a input-exit to a satellite");
+        assert_eq!(why, "`input-exit` sent to a planet");
         // Nor before the Welcome.
-        let (mut sat, mut pri) = joined();
-        pri.send(&Message::Release).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert!(matches!(sat.closed(), Some(Closed::Protocol(_))));
+        let (mut planet, mut sun) = joined();
+        sun.send(&Message::Release).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert!(matches!(planet.closed(), Some(Closed::Protocol(_))));
     }
 
     #[test]
     fn a_message_this_end_cannot_act_on_closes_the_link_and_drops_what_came_after() {
-        let (mut sat, mut pri) = joined();
+        let (mut planet, mut sun) = joined();
         let welcome = Message::Welcome {
             renames: Vec::new(),
             foreign: BTreeSet::new(),
         };
-        pri.send(&welcome).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut sat), [welcome]);
-        pri.send(&Message::Keymap {
+        sun.send(&welcome).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut planet), [welcome]);
+        sun.send(&Message::Keymap {
             xkb: Xkb("nonsense".into()),
         })
         .expect("sent");
-        pri.send(&Message::Release).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert!(matches!(sat.recv(), Some(Message::Keymap { .. })));
-        sat.protocol_error("a keymap that does not compile");
+        sun.send(&Message::Release).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert!(matches!(planet.recv(), Some(Message::Keymap { .. })));
+        planet.protocol_error("a keymap that does not compile");
         assert_eq!(
-            sat.closed(),
+            planet.closed(),
             Some(&Closed::Protocol("a keymap that does not compile".into()))
         );
-        assert_eq!(sat.recv(), None, "the Release after it is dropped");
-        assert!(sat.is_finished());
-        sat.protocol_error("again");
+        assert_eq!(planet.recv(), None, "the Release after it is dropped");
+        assert!(planet.is_finished());
+        planet.protocol_error("again");
         assert_eq!(
-            sat.closed(),
+            planet.closed(),
             Some(&Closed::Protocol("a keymap that does not compile".into())),
             "the first reason stays"
         );
     }
 
     #[test]
-    fn a_session_request_goes_from_a_satellite_to_the_primary_only() {
-        let request = Message::SessionRequest {
+    fn a_system_request_goes_from_a_planet_to_the_sun_only() {
+        let request = Message::OrreryRequest {
             request: Request::Workspace { number: 3 },
         };
-        let (mut sat, mut pri) = joined();
-        sat.send(&request).expect("queued");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut pri), std::slice::from_ref(&request));
-        assert!(pri.is_open() && !request.is_input());
+        let (mut planet, mut sun) = joined();
+        planet.send(&request).expect("queued");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sun), std::slice::from_ref(&request));
+        assert!(sun.is_open() && !request.is_input());
         // Never the other way, nor first.
-        let (mut sat, mut pri) = joined();
+        let (mut planet, mut sun) = joined();
         let welcome = Message::Welcome {
             renames: vec![],
             foreign: BTreeSet::new(),
         };
-        pri.send(&welcome).expect("sent");
-        pri.send(&request).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut sat), [welcome]);
-        let Some(Closed::Protocol(why)) = sat.closed() else {
-            panic!("{:?}", sat.closed());
+        sun.send(&welcome).expect("sent");
+        sun.send(&request).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut planet), [welcome]);
+        let Some(Closed::Protocol(why)) = planet.closed() else {
+            panic!("{:?}", planet.closed());
         };
-        assert_eq!(why, "a session-request to a satellite");
-        let (mut sat, mut pri) = pair();
-        sat.send(&request).expect("queued");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert!(matches!(pri.closed(), Some(Closed::Protocol(_))));
+        assert_eq!(why, "`orrery-request` sent to a planet");
+        let (mut planet, mut sun) = pair();
+        planet.send(&request).expect("queued");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert!(matches!(sun.closed(), Some(Closed::Protocol(_))));
     }
 
     #[test]
-    fn an_input_ack_goes_from_a_satellite_to_the_primary_only() {
+    fn an_input_ack_goes_from_a_planet_to_the_sun_only() {
         let ack = Message::InputAck { count: 7 };
-        let (mut sat, mut pri) = joined();
-        sat.send(&ack).expect("queued");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert_eq!(drain(&mut pri), std::slice::from_ref(&ack));
+        let (mut planet, mut sun) = joined();
+        planet.send(&ack).expect("queued");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert_eq!(drain(&mut sun), std::slice::from_ref(&ack));
         assert!(!ack.is_input(), "it answers input");
-        let (mut sat, mut pri) = joined();
+        let (mut planet, mut sun) = joined();
         let welcome = Message::Welcome {
             renames: vec![],
             foreign: BTreeSet::new(),
         };
-        pri.send(&welcome).expect("sent");
-        pri.send(&ack).expect("sent");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        let Some(Closed::Protocol(why)) = sat.closed() else {
-            panic!("{:?}", sat.closed());
+        sun.send(&welcome).expect("sent");
+        sun.send(&ack).expect("sent");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        let Some(Closed::Protocol(why)) = planet.closed() else {
+            panic!("{:?}", planet.closed());
         };
-        assert_eq!(why, "a input-ack to a satellite");
+        assert_eq!(why, "`input-ack` sent to a planet");
     }
 
     #[test]
@@ -1262,7 +1256,7 @@ mod tests {
         let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
         let keymap = xkb::Keymap::new_from_names(&context, "", "", "us,de,ru", "", None, flags).expect("a keymap");
         let xkb = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-        let (_, mut pri) = joined();
+        let (_, mut sun) = joined();
         let len = xkb.len();
         let msg = Message::Keymap { xkb: Xkb(xkb) };
         assert_eq!(
@@ -1275,23 +1269,23 @@ mod tests {
                 .expect("json")
                 .starts_with(r#"{"msg":"keymap","xkb":"xkb_keymap"#)
         );
-        pri.send(&msg).expect("fits");
+        sun.send(&msg).expect("fits");
     }
 
     #[test]
-    fn a_replayed_first_handshake_message_never_opens_the_primary() {
-        // Recorded from a real exchange: the satellite's first handshake frame, then its Hello.
-        let (mut sat, mut pri) = pair();
-        let first = sat.outgoing().to_vec();
-        sat.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
-        pump(&mut sat, &mut pri, &mut Vec::new(), usize::MAX);
-        assert!(pri.is_open());
-        sat.send(&Message::Ping { nonce: 1 }).expect("sent");
-        let later = sat.outgoing().to_vec();
+    fn a_replayed_first_handshake_message_never_opens_the_sun() {
+        // Recorded from a real exchange: the planet's first handshake frame, then its Hello.
+        let (mut planet, mut sun) = pair();
+        let first = planet.outgoing().to_vec();
+        planet.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
+        pump(&mut planet, &mut sun, &mut Vec::new(), usize::MAX);
+        assert!(sun.is_open());
+        planet.send(&Message::Ping { nonce: 1 }).expect("sent");
+        let later = planet.outgoing().to_vec();
 
-        // Replayed to a fresh primary: it answers (it cannot tell yet), but the link is not open...
+        // Replayed to a fresh sun: it answers (it cannot tell yet), but the link is not open...
         let s = "the shared secret of these two ends, at least 32 bytes";
-        let mut replayed = Link::new(Role::Primary, &secret(s));
+        let mut replayed = Link::new(Role::Sun, &secret(s));
         replayed.feed(&first);
         assert!(!replayed.outgoing().is_empty() && replayed.closed().is_none());
         assert!(!replayed.is_open(), "the other end has not shown the secret");
@@ -1301,46 +1295,46 @@ mod tests {
         assert!(!replayed.is_open() && drain(&mut replayed).is_empty());
 
         // The driver's deadline: a link not open by then is closed for it; an open one is left alone.
-        let mut stalled = Link::new(Role::Primary, &secret(s));
+        let mut stalled = Link::new(Role::Sun, &secret(s));
         stalled.feed(&first);
         stalled.expire();
         assert_eq!(stalled.closed(), Some(&Closed::Timeout));
-        let (mut sat, mut pri) = joined();
-        sat.expire();
-        pri.expire();
-        assert!(sat.is_open() && pri.is_open());
+        let (mut planet, mut sun) = joined();
+        planet.expire();
+        sun.expire();
+        assert!(planet.is_open() && sun.is_open());
         assert!(OPEN_DEADLINE >= Duration::from_secs(1));
     }
 
     #[test]
     fn a_stalled_reader_fails_the_link() {
-        let (_sat, mut pri) = joined();
+        let (_sat, mut sun) = joined();
         let mut sent = 0;
-        while pri.send(&Message::Ping { nonce: sent }).is_ok() {
+        while sun.send(&Message::Ping { nonce: sent }).is_ok() {
             sent += 1;
-            assert!(pri.outgoing().len() <= MAX_OUTPUT);
+            assert!(sun.outgoing().len() <= MAX_OUTPUT);
         }
-        assert_eq!(pri.closed(), Some(&Closed::Stalled));
-        assert!(pri.is_finished(), "nothing more to write");
+        assert_eq!(sun.closed(), Some(&Closed::Stalled));
+        assert!(sun.is_finished(), "nothing more to write");
         assert!(sent > 1000, "{sent}");
 
         // Queued during the handshake counts too.
-        let (mut sat, _) = pair();
+        let (mut planet, _) = pair();
         let big = Message::CommandAnswer {
             id: 1,
             response: Response::error("z".repeat(60_000)),
         };
         let mut n = 0;
-        while sat.send(&big).is_ok() {
+        while planet.send(&big).is_ok() {
             n += 1;
         }
-        assert_eq!(sat.closed(), Some(&Closed::Stalled));
+        assert_eq!(planet.closed(), Some(&Closed::Stalled));
         assert!((15..=18).contains(&n), "{n}");
     }
 
     #[test]
     fn a_refusal_during_the_handshake_writes_nothing() {
-        for role in [Role::Satellite, Role::Primary] {
+        for role in [Role::Planet, Role::Sun] {
             let mut l = Link::new(role, &secret("the shared secret of these two ends, at least 32 bytes"));
             l.refuse("no");
             assert_eq!(l.closed(), Some(&Closed::WeRefused("no".into())));
@@ -1351,22 +1345,22 @@ mod tests {
     #[test]
     #[should_panic(expected = "outgoing")]
     fn writing_more_than_outgoing_is_a_bug() {
-        let (mut sat, _) = pair();
-        sat.wrote(sat.outgoing().len() + 1);
+        let (mut planet, _) = pair();
+        planet.wrote(planet.outgoing().len() + 1);
     }
 
     #[test]
     fn the_other_end_going_is_a_close() {
-        let (mut sat, mut pri) = pair();
-        pri.eof();
-        assert_eq!(pri.closed(), Some(&Closed::EofInHandshake));
+        let (mut planet, mut sun) = pair();
+        sun.eof();
+        assert_eq!(sun.closed(), Some(&Closed::EofInHandshake));
         let (mut s2, mut p2) = pair();
         pump(&mut s2, &mut p2, &mut Vec::new(), usize::MAX);
         s2.eof();
         assert_eq!(s2.closed(), Some(&Closed::Eof));
-        sat.eof();
-        sat.eof();
-        assert_eq!(sat.closed(), Some(&Closed::EofInHandshake), "the first reason stays");
+        planet.eof();
+        planet.eof();
+        assert_eq!(planet.closed(), Some(&Closed::EofInHandshake), "the first reason stays");
     }
 
     /// One non-blocking pass over `sock`: write what `link` has, feed it what arrived.
@@ -1410,11 +1404,11 @@ mod tests {
         let (mut p_sock, _) = listener.accept().expect("accept");
         s_sock.set_nonblocking(true).expect("non-blocking");
         p_sock.set_nonblocking(true).expect("non-blocking");
-        let (mut sat, mut pri) = pair();
-        sat.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
+        let (mut planet, mut sun) = pair();
+        planet.send(&hello(PROTOCOL_VERSION, "s")).expect("queued");
 
         let mut got = Vec::new();
-        let mut ends = [(&mut sat, &mut s_sock), (&mut pri, &mut p_sock)];
+        let mut ends = [(&mut planet, &mut s_sock), (&mut sun, &mut p_sock)];
         until(&mut ends, |_, p| {
             got.extend(drain(p));
             !got.is_empty()
@@ -1447,15 +1441,15 @@ mod tests {
         });
         assert_eq!(got, [welcome, Message::Ping { nonce: 4 }]);
 
-        // The primary goes: the satellite sees the connection close.
+        // The sun goes: the planet sees the connection close.
         drop(p_sock);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while sat.closed().is_none() {
-            drive(&mut sat, &mut s_sock);
+        while planet.closed().is_none() {
+            drive(&mut planet, &mut s_sock);
             assert!(Instant::now() < deadline, "timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(sat.closed(), Some(&Closed::Eof));
+        assert_eq!(planet.closed(), Some(&Closed::Eof));
     }
 
     #[test]

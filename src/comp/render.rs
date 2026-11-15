@@ -3,7 +3,7 @@
 //! that into render elements for the GL renderer, between the screen's layer surfaces (background and bottom
 //! behind, top and overlay in front; a fullscreen window alone on black, under only the layer surfaces
 //! `over_fullscreen` names), with the pointer in front of everything where orrery draws it
-//! (`cursor_draw`): while input from the primary moves it, and on bare metal, where no host cursor stands for this
+//! (`cursor_draw`): while input from the sun moves it, and on bare metal, where no host cursor stands for this
 //! machine's own. `render_output` draws them into a framebuffer (nested); bare metal hands them to its
 //! `DrmCompositor`.
 

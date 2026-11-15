@@ -1,17 +1,17 @@
-//! Input crossing: the primary's keyboard and pointer go where the session's focus marker is. Input a satellite is
+//! Input crossing: the sun's keyboard and pointer go where the orrery's focus marker is. Input a planet is
 //! sent runs through its own input path (binds included) to its clients, and is all released when it leaves; the
-//! primary forwards its own devices' input there, takes it back with the escape key, on a link drop, or when the
+//! sun forwards its own devices' input there, takes it back with the escape key, on a link drop, or when the
 //! pointer crosses back. `inject` (`--debug-inject` only) stands in for a machine's own devices; `inject-remote`
-//! sends a satellite input messages as they are.
+//! sends a planet input messages as they are.
 
 mod support;
 
 use orrery_wm::config;
 use serde_json::{Value, json};
 use support::client::Client;
-use support::session::{
-    SIZE, connected, joined, port, primary_env, primary_with, random_secret, satellite_env, satellite_with,
-    secret_file, wait, wait_log,
+use support::system::{
+    SIZE, connected, joined, planet_env, planet_with, port, random_secret, secret_file, sun_env, sun_with, wait,
+    wait_log,
 };
 use support::{Compositor, TIMEOUT};
 use tempfile::TempDir;
@@ -31,7 +31,7 @@ const LEFT_BUTTON: u32 = 272;
 /// Super's bit in wl_keyboard.modifiers (Mod4).
 const MOD4: u32 = 0x40;
 
-/// A German layout, as keymap text a primary would send (includes resolved where it compiles).
+/// A German layout, as keymap text a sun would send (includes resolved where it compiles).
 const KEYMAP_DE: &str = r#"xkb_keymap {
     xkb_keycodes { include "evdev+aliases(qwertz)" };
     xkb_types { include "complete" };
@@ -43,17 +43,17 @@ fn evdev(xkb: u32) -> u32 {
     xkb - 8
 }
 
-/// A primary ("desk") and a satellite ("side"), both with `--debug-inject`, linked.
+/// A sun ("desk") and a planet ("side"), both with `--debug-inject`, linked.
 fn pair() -> (TempDir, Compositor, Compositor) {
     let (dir, secret) = secret_file(&random_secret());
-    let p = primary_with("desk", 0, &secret, INJECT);
-    let s = satellite_with("side", port(&p), &secret, INJECT);
-    wait("the satellite to join", &p, joined);
-    wait("the satellite to see it", &s, connected);
+    let p = sun_with("desk", 0, &secret, INJECT);
+    let s = planet_with("side", port(&p), &secret, INJECT);
+    wait("the planet to join", &p, joined);
+    wait("the planet to see it", &s, connected);
     (dir, p, s)
 }
 
-/// `message` (a link input message, as JSON) sent by the primary to "side".
+/// `message` (a link input message, as JSON) sent by the sun to "side".
 fn send(p: &Compositor, message: Value) {
     let request = json!({"cmd": "inject-remote", "machine": "side", "message": message});
     p.msg_ok(&[&request.to_string()]);
@@ -83,13 +83,13 @@ fn inject_raw(o: &Compositor, input: &Value) {
     assert!(answer.contains(r#""ok":true"#), "{answer}");
 }
 
-/// Where the primary's keyboard and pointer go, and which machine holds the focus marker.
+/// Where the sun's keyboard and pointer go, and which machine holds the focus marker.
 fn input(state: &Value) -> String {
-    state["session"]["input"].as_str().expect("input").to_owned()
+    state["orrery"]["input"].as_str().expect("input").to_owned()
 }
 
 fn marker(state: &Value) -> String {
-    let machines = state["session"]["machines"].as_array().expect("machines");
+    let machines = state["orrery"]["machines"].as_array().expect("machines");
     let focused = machines
         .iter()
         .find(|m| m["focused"] == true)
@@ -102,9 +102,9 @@ fn at(machine: &str) -> impl Fn(&Value) -> bool {
     move |st| input(st) == machine && marker(st) == machine
 }
 
-/// The input waiting on the primary for its link to the satellite to take more.
+/// The input waiting on the sun for its link to the planet to take more.
 fn queued(state: &Value) -> u64 {
-    state["session"]["machines"][1]["queued"].as_u64().expect("queued")
+    state["orrery"]["machines"][1]["queued"].as_u64().expect("queued")
 }
 
 fn signal(o: &Compositor, sig: &str) {
@@ -218,12 +218,12 @@ fn injected_input_runs_as_this_machines_own() {
 }
 
 #[test]
-fn a_satellite_runs_what_the_primary_sends_and_release_lets_it_all_go() {
+fn a_planet_runs_what_the_sun_sends_and_release_lets_it_all_go() {
     let (_dir, p, s) = pair();
     let (mut c, w) = focused_window(&s);
     let local = *c.state.keymaps.last().expect("a keymap");
 
-    // The primary's keymap, then a handoff with Super held and the pointer entering beside the window.
+    // The sun's keymap, then a handoff with Super held and the pointer entering beside the window.
     send(&p, json!({"msg": "keymap", "xkb": KEYMAP_DE}));
     assert!(c.wait_for(|st| st.keymaps.len() == 2), "{:?}", c.state.keymaps);
     assert_ne!(c.state.keymaps[1], local, "another layout");
@@ -286,14 +286,14 @@ fn a_satellite_runs_what_the_primary_sends_and_release_lets_it_all_go() {
 }
 
 #[test]
-fn binds_typed_on_the_primary_run_on_the_satellite() {
+fn binds_typed_on_the_sun_run_on_the_planet() {
     let (_dir, p, s) = pair();
     let (mut c, _) = focused_window(&s);
     send(&p, json!({"msg": "handoff", "mods": [SUPER, CTRL], "pointer": null}));
     send_words(&p, &["key", &TWO.to_string(), "down"]);
     send_words(&p, &["key", &TWO.to_string(), "up"]);
     wait("the halves layout", &s, |st| layout(st) == "halves");
-    assert_eq!(layout(&p.state()), "wall", "not on the primary");
+    assert_eq!(layout(&p.state()), "wall", "not on the sun");
     assert!(c.wait_for(|st| st.keys.len() == 2), "{:?}", c.state.keys);
     assert!(
         !c.state.keys.iter().any(|(k, _)| *k == evdev(TWO)),
@@ -303,7 +303,7 @@ fn binds_typed_on_the_primary_run_on_the_satellite() {
 }
 
 #[test]
-fn a_link_drop_releases_what_the_primary_had_down() {
+fn a_link_drop_releases_what_the_sun_had_down() {
     let (_dir, p, s) = pair();
     let (mut c, _) = focused_window(&s);
     send(&p, json!({"msg": "keymap", "xkb": KEYMAP_DE}));
@@ -323,11 +323,11 @@ fn a_link_drop_releases_what_the_primary_had_down() {
         "{:?}",
         c.state.keymaps
     );
-    wait("the satellite to notice", &s, |st| !connected(st));
+    wait("the planet to notice", &s, |st| !connected(st));
 }
 
 #[test]
-fn a_keyboard_reloaded_while_the_primarys_keymap_is_in_use_comes_after_it() {
+fn a_keyboard_reloaded_while_the_suns_keymap_is_in_use_comes_after_it() {
     let (_dir, p, s) = pair();
     let (mut c, _) = focused_window(&s);
     let local = c.state.keymaps[0];
@@ -335,14 +335,14 @@ fn a_keyboard_reloaded_while_the_primarys_keymap_is_in_use_comes_after_it() {
     send_words(&p, &["handoff"]);
     assert!(c.wait_for(|st| st.keymaps.len() == 2), "{:?}", c.state.keymaps);
 
-    let config = std::fs::read_to_string(s.config_path()).expect("the satellite's config");
+    let config = std::fs::read_to_string(s.config_path()).expect("the planet's config");
     s.write_config(&format!("{config}\nkeyboard {{\n    layout \"fr\"\n}}\n"));
     s.msg_ok(&["reload"]);
     c.roundtrip();
     assert_eq!(
         c.state.keymaps.len(),
         2,
-        "the primary's keymap stays while its input is here"
+        "the sun's keymap stays while its input is here"
     );
     send_words(&p, &["release"]);
     assert!(c.wait_for(|st| st.keymaps.len() == 3), "{:?}", c.state.keymaps);
@@ -356,14 +356,14 @@ fn a_keyboard_reloaded_while_the_primarys_keymap_is_in_use_comes_after_it() {
 #[test]
 fn a_reload_keeping_the_layouts_comes_back_on_the_one_in_use() {
     let (dir, secret) = secret_file(&random_secret());
-    let p = primary_with("desk", 0, &secret, INJECT);
+    let p = sun_with("desk", 0, &secret, INJECT);
     let toggle = "keyboard {\n    layout \"us,de\"\n    options \"grp:caps_toggle\"\n}\n";
-    let s = satellite_with("side", port(&p), &secret, INJECT);
-    let config = std::fs::read_to_string(s.config_path()).expect("the satellite's config");
+    let s = planet_with("side", port(&p), &secret, INJECT);
+    let config = std::fs::read_to_string(s.config_path()).expect("the planet's config");
     s.write_config(&format!("{config}\n{toggle}"));
     s.msg_ok(&["reload"]);
-    wait("the satellite to join", &p, joined);
-    wait("the satellite to see it", &s, connected);
+    wait("the planet to join", &p, joined);
+    wait("the planet to see it", &s, connected);
     let (mut c, _) = focused_window(&s);
     inject(&s, &["key", &CAPS.to_string(), "down"]);
     inject(&s, &["key", &CAPS.to_string(), "up"]);
@@ -375,7 +375,7 @@ fn a_reload_keeping_the_layouts_comes_back_on_the_one_in_use() {
         "{:?}",
         c.state.keymaps
     );
-    // Other options, the same layouts, while the primary's keymap is in use: back on de after.
+    // Other options, the same layouts, while the sun's keymap is in use: back on de after.
     s.write_config(&format!(
         "{config}\n{}",
         toggle.replace("grp:caps_toggle", "grp:caps_toggle,compose:ralt")
@@ -406,13 +406,13 @@ fn a_keymap_that_does_not_compile_closes_the_link() {
         c.state.keys
     );
     assert_eq!(c.state.keymaps.len(), 1, "the local keymap all along");
-    // The satellite joins again.
+    // The planet joins again.
     wait("the rejoin", &s, connected);
     wait("the rejoin", &p, joined);
 }
 
 #[test]
-fn the_pointer_leaving_a_satellite_is_reported_and_holds_still_until_input_comes_back() {
+fn the_pointer_leaving_a_planet_is_reported_and_holds_still_until_input_comes_back() {
     let (_dir, p, _s) = pair();
     let left = "side's pointer left its screens past the left edge";
     send(
@@ -474,22 +474,22 @@ fn release_and_a_link_drop_free_a_pointer_held_after_an_exit() {
 }
 
 #[test]
-fn the_satellites_own_layout_is_back_after_the_primarys_keymap() {
+fn the_planets_own_layout_is_back_after_the_suns_keymap() {
     let (dir, secret) = secret_file(&random_secret());
-    let p = primary_with("desk", 0, &secret, INJECT);
+    let p = sun_with("desk", 0, &secret, INJECT);
     let xkb = [
         ("XKB_DEFAULT_LAYOUT", "us,de"),
         ("XKB_DEFAULT_OPTIONS", "grp:caps_toggle"),
     ];
-    let s = satellite_env("side", port(&p), &secret, INJECT, &xkb);
-    wait("the satellite to join", &p, joined);
-    wait("the satellite to see it", &s, connected);
+    let s = planet_env("side", port(&p), &secret, INJECT, &xkb);
+    wait("the planet to join", &p, joined);
+    wait("the planet to see it", &s, connected);
     let (mut c, _) = focused_window(&s);
     // Its own keyboard to its second layout.
     inject(&s, &["key", &CAPS.to_string(), "down"]);
     inject(&s, &["key", &CAPS.to_string(), "up"]);
     assert!(c.wait_for(|st| st.group == 1), "group {}", c.state.group);
-    // The primary's keymap (one layout) while input is here; this machine's own, on its second layout, after.
+    // The sun's keymap (one layout) while input is here; this machine's own, on its second layout, after.
     send(&p, json!({"msg": "keymap", "xkb": KEYMAP_DE}));
     send_words(&p, &["handoff"]);
     assert!(
@@ -508,18 +508,18 @@ fn the_satellites_own_layout_is_back_after_the_primarys_keymap() {
 }
 
 #[test]
-fn the_satellite_types_on_the_layout_the_primary_is_on() {
+fn the_planet_types_on_the_layout_the_sun_is_on() {
     let (dir, secret) = secret_file(&random_secret());
     let xkb = [
         ("XKB_DEFAULT_LAYOUT", "us,de"),
         ("XKB_DEFAULT_OPTIONS", "grp:caps_toggle"),
     ];
-    let p = primary_env("desk", 0, &secret, INJECT, &xkb);
-    let s = satellite_with("side", port(&p), &secret, INJECT);
-    wait("the satellite to join", &p, joined);
-    wait("the satellite to see it", &s, connected);
+    let p = sun_env("desk", 0, &secret, INJECT, &xkb);
+    let s = planet_with("side", port(&p), &secret, INJECT);
+    wait("the planet to join", &p, joined);
+    wait("the planet to see it", &s, connected);
     let (mut c, _) = focused_window(&s);
-    // The primary's keyboard to its second layout, then input to the satellite: its keymap, on that layout.
+    // The sun's keyboard to its second layout, then input to the planet: its keymap, on that layout.
     keys(&p, &[(CAPS, true), (CAPS, false)]);
     p.msg_ok(&["workspace", "2"]);
     wait("input on side", &p, at("side"));
@@ -529,7 +529,7 @@ fn the_satellite_types_on_the_layout_the_primary_is_on() {
         c.state.keymaps,
         c.state.group
     );
-    // Home, the primary back on its first layout, and there again: the keymap is not sent again, the layout is.
+    // Home, the sun back on its first layout, and there again: the keymap is not sent again, the layout is.
     p.msg_ok(&["workspace", "1"]);
     wait("input home", &p, at("desk"));
     keys(&p, &[(CAPS, true), (CAPS, false)]);
@@ -545,7 +545,7 @@ fn the_satellite_types_on_the_layout_the_primary_is_on() {
 }
 
 #[test]
-fn keys_typed_on_the_primary_go_where_the_marker_is() {
+fn keys_typed_on_the_sun_go_where_the_marker_is() {
     let (_dir, p, s) = pair();
     let (mut here, _) = focused_window(&p);
     let (mut there, _) = focused_window(&s);
@@ -559,7 +559,7 @@ fn keys_typed_on_the_primary_go_where_the_marker_is() {
         there.state.keys
     );
     assert_eq!(p.state()["last_key"], Value::Null, "typing forwarded is never kept");
-    // Back: they go to the primary's client again, and no more to the satellite's.
+    // Back: they go to the sun's client again, and no more to the planet's.
     p.msg_ok(&["workspace", "1"]);
     wait("input home", &p, at("desk"));
     keys(&p, &[(B, true), (B, false)]);
@@ -570,7 +570,7 @@ fn keys_typed_on_the_primary_go_where_the_marker_is() {
     );
     there.roundtrip();
     assert_eq!(there.state.keys.len(), 2, "{:?}", there.state.keys);
-    assert_eq!(input(&s.state()), "side", "a satellite's own devices stay on it");
+    assert_eq!(input(&s.state()), "side", "a planet's own devices stay on it");
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn super_stays_held_across_a_workspace_handoff() {
     let (_dir, p, s) = pair();
     let (mut here, _) = focused_window(&p);
     let (mut there, _) = focused_window(&s);
-    // Super+2 on the primary: workspace 2 is the satellite's, so input goes there with Super still down.
+    // Super+2 on the sun: workspace 2 is the planet's, so input goes there with Super still down.
     keys(&p, &[(SUPER, true), (TWO, true), (TWO, false), (A, true)]);
     wait("input on side", &p, at("side"));
     assert!(
@@ -594,7 +594,7 @@ fn super_stays_held_across_a_workspace_handoff() {
         there.state.keys
     );
     assert_eq!(there.state.keys[2..], [(evdev(A), false), (evdev(SUPER), false)]);
-    // The primary's client saw Super go down and up (released at the handoff), and neither 2 (the bind's) nor A.
+    // The sun's client saw Super go down and up (released at the handoff), and neither 2 (the bind's) nor A.
     assert!(
         here.wait_for(|st| st.keys == [(evdev(SUPER), true), (evdev(SUPER), false)]),
         "{:?}",
@@ -603,7 +603,7 @@ fn super_stays_held_across_a_workspace_handoff() {
 }
 
 #[test]
-fn the_escape_key_brings_input_home_and_lets_go_on_the_satellite() {
+fn the_escape_key_brings_input_home_and_lets_go_on_the_planet() {
     let (_dir, p, s) = pair();
     let (mut here, _) = focused_window(&p);
     let (mut there, _) = focused_window(&s);
@@ -611,7 +611,7 @@ fn the_escape_key_brings_input_home_and_lets_go_on_the_satellite() {
     wait("input on side", &p, at("side"));
     keys(&p, &[(SUPER, true), (A, true)]);
     assert!(there.wait_for(|st| st.keys.len() == 2), "{:?}", there.state.keys);
-    // Super+Escape: never forwarded; the satellite lets go of everything, Super is down here now.
+    // Super+Escape: never forwarded; the planet lets go of everything, Super is down here now.
     keys(&p, &[(ESCAPE, true)]);
     wait("input home", &p, at("desk"));
     assert!(
@@ -638,36 +638,36 @@ fn the_escape_key_brings_input_home_and_lets_go_on_the_satellite() {
 }
 
 #[test]
-fn the_pointer_crosses_to_the_satellite_and_back() {
+fn the_pointer_crosses_to_the_planet_and_back() {
     let (_dir, p, _s) = pair();
-    // Past the primary's right edge: onto the satellite, which takes the marker (and the keyboard) too.
+    // Past the sun's right edge: onto the planet, which takes the marker (and the keyboard) too.
     inject(&p, &["motion", "5000", "100"]);
     wait("input on side", &p, at("side"));
-    // Past the satellite's right edge is past the row's end: it stays there, free to move.
+    // Past the planet's right edge is past the row's end: it stays there, free to move.
     inject(&p, &["motion", "5000", "0"]);
     wait_log(&p, "side's pointer left its screens past the right edge");
-    // Back past its left edge: home, at the primary's right edge.
+    // Back past its left edge: home, at the sun's right edge.
     inject(&p, &["motion", "-5000", "0"]);
     wait("input home", &p, at("desk"));
-    // A step left is on the primary's screen; past its left edge there is nothing.
+    // A step left is on the sun's screen; past its left edge there is nothing.
     inject(&p, &["motion", "-5000", "0"]);
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(at("desk")(&p.state()));
 }
 
 #[test]
-fn an_exit_from_a_satellite_input_already_left_moves_nothing() {
+fn an_exit_from_a_planet_input_already_left_moves_nothing() {
     let (dir, secret) = secret_file(&random_secret());
-    let p = primary_with("desk", 0, &secret, INJECT);
-    let _side = satellite_with("side", port(&p), &secret, INJECT);
+    let p = sun_with("desk", 0, &secret, INJECT);
+    let _side = planet_with("side", port(&p), &secret, INJECT);
     wait("side to join", &p, joined);
-    let _far = satellite_with("far", port(&p), &secret, INJECT);
+    let _far = planet_with("far", port(&p), &secret, INJECT);
     wait("far to join", &p, |st| {
-        st["session"]["machines"].as_array().is_some_and(|m| m.len() == 3)
+        st["orrery"]["machines"].as_array().is_some_and(|m| m.len() == 3)
     });
     p.msg_ok(&["workspace", "3"]);
     wait("input on far", &p, at("far"));
-    // side's pointer leaves past its left edge (input is not there): that would land on the primary.
+    // side's pointer leaves past its left edge (input is not there): that would land on the sun.
     send(
         &p,
         json!({"msg": "handoff", "mods": [], "pointer": {"edge": "left", "y": 0.5}}),
@@ -695,7 +695,7 @@ fn motion_merges_while_the_link_is_stalled_and_keys_all_arrive_in_order() {
     let (mut there, w) = focused_window(&s);
     p.msg_ok(&["workspace", "2"]);
     wait("input on side", &p, at("side"));
-    // The satellite's pointer onto the window: from its top-left corner (where it starts) to the middle.
+    // The planet's pointer onto the window: from its top-left corner (where it starts) to the middle.
     let (x, y, width, height) = slot_of(&s.state(), "typed");
     inject(
         &p,
@@ -712,7 +712,7 @@ fn motion_merges_while_the_link_is_stalled_and_keys_all_arrive_in_order() {
     let wiggle = |i: usize| json!({"msg": "motion", "dx": 0, "dy": if i.is_multiple_of(2) { 1 } else { -1 }});
     let key = |k: u32, pressed: bool| json!({"msg": "key", "keycode": k, "pressed": pressed, "time": 0});
 
-    // The satellite stops reading; motion fills the link until input waits on the primary.
+    // The planet stops reading; motion fills the link until input waits on the sun.
     signal(&s, "-STOP");
     let mut sent = 0;
     while queued(&p.state()) == 0 {
@@ -754,13 +754,13 @@ fn motion_merges_while_the_link_is_stalled_and_keys_all_arrive_in_order() {
 }
 
 #[test]
-fn super_1_typed_while_input_is_on_the_satellite_comes_home_through_the_primary() {
+fn super_1_typed_while_input_is_on_the_planet_comes_home_through_the_sun() {
     let (_dir, p, s) = pair();
     let (mut here, _) = focused_window(&p);
     let (mut there, _) = focused_window(&s);
     keys(&p, &[(SUPER, true), (TWO, true), (TWO, false)]);
     wait("input on side", &p, at("side"));
-    // Super+1 runs on the satellite, whose 1 is the primary's: it asks the primary, which takes input home.
+    // Super+1 runs on the planet, whose 1 is the sun's: it asks the sun, which takes input home.
     keys(&p, &[(ONE, true)]);
     wait("input home", &p, at("desk"));
     assert!(
@@ -780,7 +780,7 @@ fn super_1_typed_while_input_is_on_the_satellite_comes_home_through_the_primary(
         "{:?}",
         here.state.keys
     );
-    // The satellite's own `workspace 1` goes the same way.
+    // The planet's own `workspace 1` goes the same way.
     p.msg_ok(&["workspace", "2"]);
     wait("input on side", &p, at("side"));
     s.msg_ok(&["workspace", "1"]);

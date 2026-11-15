@@ -1,17 +1,17 @@
-//! The link's driver: the primary's listener and one connection per satellite, or a satellite's one connection to
-//! the primary, on calloop beside everything else. `Link` speaks the protocol and `Session` (the primary's) keeps
+//! The link's driver: the sun's listener and one connection per planet, or a planet's one connection to
+//! the sun, on calloop beside everything else. `Link` speaks the protocol and `Orrery` (the sun's) keeps
 //! the numbering; this file moves bytes and applies what they say to `Stacks`.
 //!
-//! Nothing here blocks the loop: sockets are non-blocking, a satellite resolves and connects on a short-lived thread
+//! Nothing here blocks the loop: sockets are non-blocking, a planet resolves and connects on a short-lived thread
 //! of its own, a connection is read when it is readable, and what links queue is written after each loop iteration
 //! (`Orrery::link_tick`), the rest when the socket drains. The tick also reports this machine's workspaces when
-//! they changed (the primary to its own session, a satellite to the primary), hands each machine the numbers the
+//! they changed (the sun to its own orrery, a planet to the sun), hands each machine the numbers the
 //! others own when they changed, and drops closed connections.
 //!
-//! The primary's input on its way to a satellite waits in that connection's `Outbox` and goes into its link one
+//! The sun's input on its way to a planet waits in that connection's `Outbox` and goes into its link one
 //! message at a time, only when the link has written everything before and fewer than `INPUT_WINDOW` input messages
-//! are unacknowledged (the satellite acknowledges what it ran, `InputAck`, once per read): what waits meanwhile
-//! (motion) merges. A stalled satellite or network so holds back only a few messages, never seconds of input to
+//! are unacknowledged (the planet acknowledges what it ran, `InputAck`, once per read): what waits meanwhile
+//! (motion) merges. A stalled planet or network so holds back only a few messages, never seconds of input to
 //! replay late; kernel buffers alone cannot bound that (a stalled receiver's kernel keeps taking data).
 
 use std::cell::Cell;
@@ -32,27 +32,27 @@ use super::{Orrery, ipc_server};
 use crate::NAME;
 use crate::config::{self, Config, LinkConfig, MAX_NAME};
 use crate::crossing::{Crossing, Edge, Landing, Outbox, Place, RowScreen};
-use crate::ipc::{MachineView, Request, Response, SessionView};
+use crate::ipc::{MachineView, Request, Response, SystemView};
 use crate::link::{INPUT_WINDOW, Link, Message, OPEN_DEADLINE, PROTOCOL_VERSION, Secret, SendError};
-use crate::session::{Role, Route, Screen, Session};
 use crate::stacks::Stacks;
+use crate::system::{Role, Route, Screen, System};
 
 /// How often each end pings the other; `state` shows the round trip.
 pub const PING: Duration = Duration::from_secs(2);
 /// A link that hears nothing for this long is dropped: the other end went without closing (a cable, a crash).
 pub const SILENCE: Duration = Duration::from_secs(10);
-/// The primary's connections not yet joined, at most, in all and from one IP address: one more is closed at once.
+/// The sun's connections not yet joined, at most, in all and from one IP address: one more is closed at once.
 pub const MAX_OPENING: usize = 8;
 pub const MAX_OPENING_PER_ADDRESS: usize = 2;
-/// A Hello naming a satellite whose link has been silent this long takes its place (it is gone, its link not yet
+/// A Hello naming a planet whose link has been silent this long takes its place (it is gone, its link not yet
 /// dropped) instead of being refused as a duplicate.
 pub const STALE: Duration = PING.saturating_mul(2);
-/// A satellite waits this long before trying the primary again, doubling each failure up to `BACKOFF_MAX`.
+/// A planet waits this long before trying the sun again, doubling each failure up to `BACKOFF_MAX`.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// A request sent to another machine (`orrery msg --to`) is answered with an error when its answer takes longer.
 pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
-/// One connection attempt to one of the primary's addresses gives up after this long.
+/// One connection attempt to one of the sun's addresses gives up after this long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Read from one connection per wakeup, at most, so a busy link cannot hold the loop.
 const READ_BUDGET: usize = 256 * 1024;
@@ -65,7 +65,7 @@ pub type Reply = Box<dyn FnOnce(Response)>;
 /// A machine's workspaces as it reports them: its screens and the numbers it has.
 type Report = (Vec<Screen>, BTreeSet<u8>);
 
-/// This machine in a session (`listen` or `primary` in the config).
+/// This machine in an orrery (`listen` or `sun` in the config).
 pub struct Net {
     /// This machine's name (`machine_name`).
     name: String,
@@ -82,27 +82,27 @@ pub struct Net {
 }
 
 enum Side {
-    Primary(Primary),
-    Satellite(Satellite),
+    Sun(Sun),
+    Planet(Planet),
 }
 
-struct Primary {
+struct Sun {
     /// The bound address (port 0 resolved); None when listening failed.
     listen: Option<SocketAddr>,
-    session: Session,
-    /// Where this machine's keyboard and pointer go: kept with the session's focus marker.
+    system: System,
+    /// Where this machine's keyboard and pointer go: kept with the orrery's focus marker.
     crossing: Crossing,
-    /// What the primary last told its own session.
+    /// What the sun last told its own orrery.
     reported: Option<Report>,
     /// Commands sent and not answered yet, by id.
     commands: HashMap<u64, Pending>,
     next_command: u64,
 }
 
-struct Satellite {
-    /// The primary's HOST:PORT, as configured.
-    primary: String,
-    /// What this machine last told the primary; None: tell it again.
+struct Planet {
+    /// The sun's HOST:PORT, as configured.
+    sun: String,
+    /// What this machine last told the sun; None: tell it again.
     reported: Option<Report>,
     /// The wait before the next attempt.
     backoff: Duration,
@@ -120,9 +120,9 @@ struct Conn {
     writer: Option<RegistrationToken>,
     /// `OPEN_DEADLINE`'s timer, until it fires.
     deadline: Option<RegistrationToken>,
-    /// Who is at the other end once joined: the satellite's name (primary), the primary's address (satellite).
+    /// Who is at the other end once joined: the planet's name (sun), the sun's address (planet).
     joined: Option<String>,
-    /// The foreign numbers this satellite was last given (primary).
+    /// The foreign numbers this planet was last given (sun).
     foreign: BTreeSet<u8>,
     /// The ping in flight, its nonce and when it went: no other is sent until it is answered, however late.
     ping: Option<(u64, Instant)>,
@@ -131,25 +131,25 @@ struct Conn {
     heard: Instant,
     /// Why the driver gives up on it while its link is still open (the socket failed, or it went silent).
     dropped: Option<String>,
-    /// The primary's input on its way to this satellite, and the keymap (xkb text) it was last sent.
+    /// The sun's input on its way to this planet, and the keymap (xkb text) it was last sent.
     outbox: Outbox,
     keymap: Option<String>,
-    /// Input messages sent and not acknowledged (primary), or run and not acknowledged yet (satellite).
+    /// Input messages sent and not acknowledged (sun), or run and not acknowledged yet (planet).
     unacked: u32,
 }
 
-/// A command sent to a satellite, waiting for its answer.
+/// A command sent to a planet, waiting for its answer.
 struct Pending {
     machine: String,
     /// Where the answer goes; None for a routed `workspace` (a failure is logged).
     reply: Option<Reply>,
     timer: Option<RegistrationToken>,
-    /// A routed `workspace`: if it fails, the satellite is asked to report (`resync`), freeing a number the session
+    /// A routed `workspace`: if it fails, the planet is asked to report (`resync`), freeing a number the orrery
     /// reserved for it that it never made.
     resync: bool,
 }
 
-/// This machine's name in a session: the config's `name`, else the hostname, else `NAME`.
+/// This machine's name in an orrery: the config's `name`, else the hostname, else `NAME`.
 #[must_use]
 pub fn machine_name(config: &Config) -> String {
     (config.name.clone())
@@ -184,7 +184,7 @@ fn report(stacks: &Stacks) -> Report {
     (screens, stacks.workspaces().iter().map(|w| w.number()).collect())
 }
 
-/// Resolves the primary's HOST:PORT and connects to the first address that answers (blocking: a thread's job).
+/// Resolves the sun's HOST:PORT and connects to the first address that answers (blocking: a thread's job).
 fn connect(addr: &str) -> Result<TcpStream, String> {
     let addrs = addr
         .to_socket_addrs()
@@ -243,8 +243,8 @@ fn latency_ms(conn: &Conn) -> Option<u64> {
     }
 }
 
-/// Asks a satellite to report what it has: any `Renames` does (`satellite_got`), and its report replaces what the
-/// session holds for it.
+/// Asks a planet to report what it has: any `Renames` does (`planet_got`), and its report replaces what the
+/// orrery holds for it.
 fn resync(conn: &mut Conn, foreign: BTreeSet<u8>) {
     conn.foreign.clone_from(&foreign);
     let _ = send(
@@ -270,7 +270,7 @@ impl Pending {
 }
 
 impl Orrery {
-    /// Joins or starts the session the config asks for. After the backend: the primary's session starts from its
+    /// Joins or starts the orrery the config asks for. After the backend: the sun's orrery starts from its
     /// screens. A secret file that cannot be read is a `config_error`, and nothing links until a reload reads it.
     pub fn start_link(&mut self) {
         let Some(link) = self.config.link.clone() else {
@@ -287,25 +287,25 @@ impl Orrery {
             }
         };
         let side = match link.role {
-            Role::Primary => {
+            Role::Sun => {
                 let (screens, numbers) = report(&self.stacks);
-                let session = match Session::new(&name, screens.clone(), numbers.iter().copied()) {
+                let system = match System::new(&name, screens.clone(), numbers.iter().copied()) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!("cannot start a session: {e}");
+                        tracing::error!("cannot start an orrery: {e}");
                         return;
                     }
                 };
-                Side::Primary(Primary {
+                Side::Sun(Sun {
                     listen: None,
-                    session,
+                    system,
                     crossing: Crossing::new(&name),
                     reported: Some((screens, numbers)),
                     commands: HashMap::new(),
                     next_command: 1,
                 })
             }
-            Role::Satellite => {
+            Role::Planet => {
                 let (connected, results) = channel::channel();
                 let watched = self.loop_handle.insert_source(results, |event, _, state| {
                     if let channel::Event::Msg(result) = event {
@@ -316,15 +316,15 @@ impl Orrery {
                     tracing::error!("cannot link: {e}");
                     return;
                 }
-                Side::Satellite(Satellite {
-                    primary: link.addr.clone(),
+                Side::Planet(Planet {
+                    sun: link.addr.clone(),
                     reported: None,
                     backoff: BACKOFF_FIRST,
                     connected,
                 })
             }
         };
-        tracing::info!("in a session as {name:?}, the {:?}", link.role);
+        tracing::info!("in an orrery as {name:?}, the {:?}", link.role);
         self.net = Some(Net {
             name,
             secret_file,
@@ -345,13 +345,13 @@ impl Orrery {
             tracing::error!("cannot ping the link: {e}");
         }
         match link.role {
-            Role::Primary => self.link_listen(&link.addr),
-            Role::Satellite => self.link_connect(),
+            Role::Sun => self.link_listen(&link.addr),
+            Role::Planet => self.link_connect(),
         }
     }
 
     /// Reads the secret file again (on reload). A different secret drops every link (opened on the old one): the
-    /// satellites connect again, and get in once they have it too. The error, for `config_error`, when it cannot be
+    /// planets connect again, and get in once they have it too. The error, for `config_error`, when it cannot be
     /// read (the old secret stays).
     pub fn link_reload(&mut self) -> Option<String> {
         let net = self.net.as_mut()?;
@@ -473,11 +473,8 @@ impl Orrery {
         match registered {
             Ok(t) => {
                 own.set(Some(t));
-                tracing::info!("listening for satellites on {local}");
-                if let Some(Net {
-                    side: Side::Primary(p), ..
-                }) = &mut self.net
-                {
+                tracing::info!("listening for planets on {local}");
+                if let Some(Net { side: Side::Sun(p), .. }) = &mut self.net {
                     p.listen = Some(local);
                 }
             }
@@ -505,7 +502,7 @@ impl Orrery {
             );
             return;
         }
-        let link = Link::new(Role::Primary, secret);
+        let link = Link::new(Role::Sun, secret);
         self.link_add(stream, peer, link);
     }
 
@@ -613,13 +610,13 @@ impl Orrery {
             let Some(net) = &mut self.net else {
                 return;
             };
-            let primary = matches!(net.side, Side::Primary(_));
+            let sun = matches!(net.side, Side::Sun(_));
             let Some(conn) = net.conns.get_mut(&id) else {
                 return;
             };
             let Some(msg) = conn.link.recv() else {
-                // A satellite acknowledges the input it ran, once for all it read.
-                if conn.unacked > 0 && !primary {
+                // A planet acknowledges the input it ran, once for all it read.
+                if conn.unacked > 0 && !sun {
                     let count = std::mem::take(&mut conn.unacked);
                     let _ = send(conn, &Message::InputAck { count });
                 }
@@ -640,14 +637,14 @@ impl Orrery {
                         conn.latency = Some(at.elapsed());
                     }
                 }
-                msg if primary => self.primary_got(id, msg),
-                msg => self.satellite_got(id, msg),
+                msg if sun => self.sun_got(id, msg),
+                msg => self.planet_got(id, msg),
             }
         }
     }
 
-    /// A satellite's message, on the primary. Its link has checked it may come here now.
-    fn primary_got(&mut self, id: u64, msg: Message) {
+    /// A planet's message, on the sun. Its link has checked it may come here now.
+    fn sun_got(&mut self, id: u64, msg: Message) {
         let from = (self.net.as_ref())
             .and_then(|n| n.conns.get(&id))
             .and_then(|c| c.joined.clone());
@@ -663,25 +660,25 @@ impl Orrery {
                 );
                 self.input_cross(&from, edge, y);
             }
-            (Message::SessionRequest { request }, Some(from)) => self.session_request(&from, request),
+            (Message::OrreryRequest { request }, Some(from)) => self.system_request(&from, request),
             (Message::InputAck { count }, _) => {
                 if let Some(conn) = self.net.as_mut().and_then(|n| n.conns.get_mut(&id)) {
                     conn.unacked = conn.unacked.saturating_sub(count);
                 }
             }
-            (Message::InputExit { .. } | Message::SessionRequest { .. }, None) => {}
-            (msg, _) => self.primary_got_link(id, msg),
+            (Message::InputExit { .. } | Message::OrreryRequest { .. }, None) => {}
+            (msg, _) => self.sun_got_link(id, msg),
         }
     }
 
-    /// `primary_got` for what the link and the session alone answer.
-    fn primary_got_link(&mut self, id: u64, msg: Message) {
+    /// `sun_got` for what the link and the orrery alone answer.
+    fn sun_got_link(&mut self, id: u64, msg: Message) {
         if let Message::Hello { name, .. } = &msg {
             self.link_take_over(id, name);
         }
         let handle = self.loop_handle.clone();
         let Some(Net {
-            side: Side::Primary(p),
+            side: Side::Sun(p),
             conns,
             error,
             ..
@@ -700,7 +697,7 @@ impl Orrery {
                 ..
             } => {
                 let joined = if config::valid_machine_name(&name) {
-                    p.session.join(&name, screens, workspaces).map_err(|e| e.to_string())
+                    p.system.join(&name, screens, workspaces).map_err(|e| e.to_string())
                 } else {
                     Err(format!(
                         "a machine name is 1 to {MAX_NAME} bytes, no control characters"
@@ -708,7 +705,7 @@ impl Orrery {
                 };
                 match joined {
                     Ok(renames) => {
-                        let foreign = p.session.foreign(&name);
+                        let foreign = p.system.foreign(&name);
                         let _ = send(
                             conn,
                             &Message::Welcome {
@@ -716,7 +713,7 @@ impl Orrery {
                                 foreign: foreign.clone(),
                             },
                         );
-                        tracing::info!("{name} joined the session from {} (renumbered: {renames:?})", conn.peer);
+                        tracing::info!("{name} joined the orrery from {} (renumbered: {renames:?})", conn.peer);
                         if let Some(t) = conn.deadline.take() {
                             handle.remove(t);
                         }
@@ -735,10 +732,10 @@ impl Orrery {
                 let Some(name) = &conn.joined else {
                     return;
                 };
-                match p.session.report(name, screens, workspaces) {
+                match p.system.report(name, screens, workspaces) {
                     Ok(renames) if renames.is_empty() => {}
                     Ok(renames) => {
-                        let foreign = p.session.foreign(name);
+                        let foreign = p.system.foreign(name);
                         let _ = send(
                             conn,
                             &Message::Renames {
@@ -763,22 +760,22 @@ impl Orrery {
                     handle.remove(*t);
                 }
                 if pending.resync && !response.ok {
-                    resync(conn, p.session.foreign(&pending.machine));
+                    resync(conn, p.system.foreign(&pending.machine));
                 }
                 pending.answer(response);
             }
-            other => tracing::debug!("unexpected on the primary: {other:?}"),
+            other => tracing::debug!("unexpected on the sun: {other:?}"),
         }
     }
 
-    /// The primary's message, on a satellite. Its link has checked it may come here now.
-    fn satellite_got(&mut self, id: u64, msg: Message) {
+    /// The sun's message, on a planet. Its link has checked it may come here now.
+    fn planet_got(&mut self, id: u64, msg: Message) {
         match msg {
             Message::Welcome { renames, foreign } | Message::Renames { renames, foreign } => {
-                let failed = self.stacks.apply_session(&renames, foreign);
+                let failed = self.stacks.apply_system(&renames, foreign);
                 self.arrange();
                 let Some(Net {
-                    side: Side::Satellite(s),
+                    side: Side::Planet(s),
                     conns,
                     error,
                     name,
@@ -790,16 +787,13 @@ impl Orrery {
                 if !failed.is_empty() {
                     tracing::info!("renames that failed here ({failed:?}): reporting again");
                 }
-                // Told again what this machine has, so the session sees anything that changed meanwhile.
+                // Told again what this machine has, so the orrery sees anything that changed meanwhile.
                 s.reported = None;
                 if let Some(conn) = conns.get_mut(&id)
                     && conn.joined.is_none()
                 {
-                    tracing::info!(
-                        "joined the session at {} as {name:?} (renumbered: {renames:?})",
-                        s.primary
-                    );
-                    conn.joined = Some(s.primary.clone());
+                    tracing::info!("joined the orrery at {} as {name:?} (renumbered: {renames:?})", s.sun);
+                    conn.joined = Some(s.sun.clone());
                     s.backoff = BACKOFF_FIRST;
                     *error = None;
                 }
@@ -826,11 +820,11 @@ impl Orrery {
                         let _ = send(conn, &answer);
                     }
                     Ok(None) => {}
-                    // Dropped by the tick, which releases what the primary's input has down here.
+                    // Dropped by the tick, which releases what the sun's input has down here.
                     Err(why) => conn.link.protocol_error(why),
                 }
             }
-            other => tracing::debug!("unexpected on a satellite: {other:?}"),
+            other => tracing::debug!("unexpected on a planet: {other:?}"),
         }
     }
 
@@ -938,16 +932,13 @@ impl Orrery {
             return;
         };
         match &mut net.side {
-            Side::Primary(p) => match conn.joined {
+            Side::Sun(p) => match conn.joined {
                 Some(name) => {
-                    tracing::info!("{name} left the session: {why}");
-                    p.session.drop_satellite(&name);
+                    tracing::info!("{name} left the orrery: {why}");
+                    p.system.drop_planet(&name);
                     // Its outbox went with the connection; input there comes home.
                     self.input_lost(&name);
-                    let Some(Net {
-                        side: Side::Primary(p), ..
-                    }) = &mut self.net
-                    else {
+                    let Some(Net { side: Side::Sun(p), .. }) = &mut self.net else {
                         return;
                     };
                     let lost: Vec<u64> = (p.commands.iter())
@@ -964,7 +955,7 @@ impl Orrery {
                     }
                 }
                 None => {
-                    // The same failure from the same address again (a satellite retrying) is logged quietly.
+                    // The same failure from the same address again (a planet retrying) is logged quietly.
                     let error = format!("{}: {why}", conn.peer.ip());
                     if net.error.as_ref() == Some(&error) {
                         tracing::debug!("a connection from {} did not join: {why}", conn.peer);
@@ -974,14 +965,14 @@ impl Orrery {
                     net.error = Some(error);
                 }
             },
-            Side::Satellite(s) => {
+            Side::Planet(s) => {
                 let joined = conn.joined.is_some();
                 if joined {
-                    tracing::warn!("lost the primary at {}: {why}", s.primary);
+                    tracing::warn!("lost the sun at {}: {why}", s.sun);
                     s.backoff = BACKOFF_FIRST;
                     self.stacks.clear_foreign();
                 }
-                // Nothing more comes from the primary's keyboard and pointer: what they have down goes up.
+                // Nothing more comes from the sun's keyboard and pointer: what they have down goes up.
                 self.remote_lost();
                 if joined {
                     self.arrange();
@@ -991,10 +982,10 @@ impl Orrery {
         }
     }
 
-    /// A satellite's attempt failed for `why` (or its link went): the next one after the backoff.
+    /// A planet's attempt failed for `why` (or its link went): the next one after the backoff.
     fn link_retry(&mut self, why: String) {
         let Some(Net {
-            side: Side::Satellite(s),
+            side: Side::Planet(s),
             error,
             ..
         }) = &mut self.net
@@ -1002,9 +993,9 @@ impl Orrery {
             return;
         };
         if error.as_ref() == Some(&why) {
-            tracing::debug!("the primary at {}: {why}", s.primary);
+            tracing::debug!("the sun at {}: {why}", s.sun);
         } else {
-            tracing::warn!("the primary at {}: {why}; trying again", s.primary);
+            tracing::warn!("the sun at {}: {why}; trying again", s.sun);
         }
         *error = Some(why);
         s.reported = None;
@@ -1021,10 +1012,10 @@ impl Orrery {
         }
     }
 
-    /// A satellite tries the primary, on a thread of its own (resolving and connecting may take a while).
+    /// A planet tries the sun, on a thread of its own (resolving and connecting may take a while).
     fn link_connect(&mut self) {
         let Some(Net {
-            side: Side::Satellite(s),
+            side: Side::Planet(s),
             secret,
             ..
         }) = &self.net
@@ -1034,7 +1025,7 @@ impl Orrery {
         if secret.is_none() {
             return self.link_retry("no secret (see config_error)".into());
         }
-        let (addr, results) = (s.primary.clone(), s.connected.clone());
+        let (addr, results) = (s.sun.clone(), s.connected.clone());
         // The thread inherits this one's signal mask (calloop's signals blocked), so they never land there.
         let started = std::thread::Builder::new()
             .name(format!("{NAME}-connect"))
@@ -1046,7 +1037,7 @@ impl Orrery {
         }
     }
 
-    /// A satellite's attempt is over: a connection gets a link and says Hello; a failure tries again later.
+    /// A planet's attempt is over: a connection gets a link and says Hello; a failure tries again later.
     fn link_connected(&mut self, result: Result<TcpStream, String>) {
         let stream = match result {
             Ok(s) => s,
@@ -1061,7 +1052,7 @@ impl Orrery {
         let Ok(peer) = stream.peer_addr() else {
             return self.link_retry("the connection closed at once".into());
         };
-        let mut link = Link::new(Role::Satellite, secret);
+        let mut link = Link::new(Role::Planet, secret);
         let (screens, workspaces) = report(&self.stacks);
         let hello = Message::Hello {
             version: PROTOCOL_VERSION,
@@ -1096,7 +1087,7 @@ impl Orrery {
         }
     }
 
-    /// Tells the session what this machine has if that changed, and each machine the numbers the others own if
+    /// Tells the orrery what this machine has if that changed, and each machine the numbers the others own if
     /// those changed.
     fn link_report(&mut self) {
         let current = report(&self.stacks);
@@ -1104,15 +1095,15 @@ impl Orrery {
             return;
         };
         match &mut net.side {
-            Side::Primary(p) => {
+            Side::Sun(p) => {
                 if p.reported.as_ref() != Some(&current) {
                     let (screens, numbers) = current.clone();
                     p.reported = Some(current);
-                    match p.session.report(&net.name, screens, numbers) {
+                    match p.system.report(&net.name, screens, numbers) {
                         Ok(renames) if renames.is_empty() => {}
                         Ok(renames) => {
                             // Another machine took some of these meanwhile: renamed here, then told again.
-                            let failed = self.stacks.apply_session(&renames, p.session.foreign(&net.name));
+                            let failed = self.stacks.apply_system(&renames, p.system.foreign(&net.name));
                             tracing::info!("renumbered here: {renames:?} (failed: {failed:?})");
                             p.reported = None;
                             self.arrange();
@@ -1121,7 +1112,7 @@ impl Orrery {
                     }
                 }
                 let Some(Net {
-                    side: Side::Primary(p),
+                    side: Side::Sun(p),
                     conns,
                     name,
                     ..
@@ -1129,7 +1120,7 @@ impl Orrery {
                 else {
                     return;
                 };
-                let mine = p.session.foreign(name);
+                let mine = p.system.foreign(name);
                 if &mine != self.stacks.foreign() {
                     self.stacks.set_foreign(mine);
                 }
@@ -1137,7 +1128,7 @@ impl Orrery {
                     let Some(machine) = &conn.joined else {
                         continue;
                     };
-                    let foreign = p.session.foreign(machine);
+                    let foreign = p.system.foreign(machine);
                     if foreign != conn.foreign {
                         let _ = send(
                             conn,
@@ -1150,7 +1141,7 @@ impl Orrery {
                     }
                 }
             }
-            Side::Satellite(s) => {
+            Side::Planet(s) => {
                 if s.reported.as_ref() == Some(&current) {
                     return;
                 }
@@ -1165,21 +1156,21 @@ impl Orrery {
         }
     }
 
-    /// Sends `request` to satellite `machine`, its answer for `reply`; without one it is a routed `workspace`, a
+    /// Sends `request` to planet `machine`, its answer for `reply`; without one it is a routed `workspace`, a
     /// failure logged and resynced. Some(error) when it cannot be sent; None when sent: the answer, or an error
     /// after `FORWARD_TIMEOUT`, comes later.
     fn link_command(&mut self, machine: &str, request: Request, reply: Option<Reply>) -> Option<Response> {
         let handle = self.loop_handle.clone();
         let Some(Net {
-            side: Side::Primary(p),
+            side: Side::Sun(p),
             conns,
             ..
         }) = &mut self.net
         else {
-            return Some(Response::error("only the primary sends requests to other machines"));
+            return Some(Response::error("only the sun sends requests to other machines"));
         };
         let Some(conn) = conns.values_mut().find(|c| c.joined.as_deref() == Some(machine)) else {
-            return Some(Response::error(format!("no machine named {machine:?} in the session")));
+            return Some(Response::error(format!("no machine named {machine:?} in the orrery")));
         };
         let id = p.next_command;
         p.next_command += 1;
@@ -1188,7 +1179,7 @@ impl Orrery {
         }
         let timer = handle.insert_source(Timer::from_duration(FORWARD_TIMEOUT), move |_, _, state| {
             if let Some(Net {
-                side: Side::Primary(p),
+                side: Side::Sun(p),
                 conns,
                 ..
             }) = &mut state.net
@@ -1197,7 +1188,7 @@ impl Orrery {
                 if pending.resync
                     && let Some(conn) = conns.values_mut().find(|c| c.joined.as_ref() == Some(&pending.machine))
                 {
-                    resync(conn, p.session.foreign(&pending.machine));
+                    resync(conn, p.system.foreign(&pending.machine));
                 }
                 let response = Response::error(format!(
                     "no answer from {} within {} s",
@@ -1219,7 +1210,7 @@ impl Orrery {
     }
 
     /// `request` run on machine `machine` (`orrery msg --to`): here when it names this machine, else sent there by
-    /// the primary. Some(answer) now, or None: `reply` is called once, later, with the other machine's answer.
+    /// the sun. Some(answer) now, or None: `reply` is called once, later, with the other machine's answer.
     pub fn link_forward(&mut self, machine: &str, request: Request, reply: Reply) -> Option<Response> {
         if matches!(request, Request::To { .. }) {
             return Some(Response::error(
@@ -1228,15 +1219,15 @@ impl Orrery {
         }
         let Some(net) = &self.net else {
             return Some(Response::error(
-                "not in a session: the config has neither `listen` nor `primary`",
+                "not in an orrery: the config has neither `listen` nor `sun`",
             ));
         };
         if net.name == machine {
             return Some(self.handle_request(request));
         }
-        if let Side::Satellite(_) = net.side {
+        if let Side::Planet(_) = net.side {
             return Some(Response::error(format!(
-                "this is {:?}, a satellite: requests to other machines go from the primary",
+                "this is {:?}, a planet: requests to other machines go from the sun",
                 net.name
             )));
         }
@@ -1244,18 +1235,18 @@ impl Orrery {
     }
 
     /// `inject-remote` (a testing aid; the caller checked `--debug-inject`): `message`, an input message, sent as it
-    /// is to satellite `machine`, as forwarding would.
+    /// is to planet `machine`, as forwarding would.
     pub(super) fn inject_remote(&mut self, machine: &str, message: &Message) -> Response {
         let Some(Net {
-            side: Side::Primary(_),
+            side: Side::Sun(_),
             conns,
             ..
         }) = &mut self.net
         else {
-            return Response::error("`inject-remote` sends from the primary: this is no primary");
+            return Response::error("`inject-remote` sends from the sun: this is no sun");
         };
         let Some(conn) = conns.values_mut().find(|c| c.joined.as_deref() == Some(machine)) else {
-            return Response::error(format!("no machine named {machine:?} in the session"));
+            return Response::error(format!("no machine named {machine:?} in the orrery"));
         };
         match send(conn, message) {
             Ok(()) => Response::ok(),
@@ -1263,26 +1254,26 @@ impl Orrery {
         }
     }
 
-    /// `workspace n` in a session: shown here, or by the machine that has it (the session's focus marker moves to
-    /// it, and the primary's input with it), or made on the focused machine. A satellite asks the primary for a
-    /// number another machine has (`SessionRequest`), answered ok once sent.
-    pub(super) fn session_workspace(&mut self, n: u8) -> Response {
+    /// `workspace n` in an orrery: shown here, or by the machine that has it (the orrery's focus marker moves to
+    /// it, and the sun's input with it), or made on the focused machine. A planet asks the sun for a
+    /// number another machine has (`OrreryRequest`), answered ok once sent.
+    pub(super) fn system_workspace(&mut self, n: u8) -> Response {
         let here = Request::Workspace { number: n };
         let Some(net) = &mut self.net else {
             return self.apply(here);
         };
         let route = match &mut net.side {
-            Side::Satellite(_) if self.stacks.foreign().contains(&n) => {
+            Side::Planet(_) if self.stacks.foreign().contains(&n) => {
                 let Some(conn) = net.conns.values_mut().find(|c| c.joined.is_some()) else {
-                    return Response::error(format!("workspace {n} is on another machine, and the primary is gone"));
+                    return Response::error(format!("workspace {n} is on another machine, and the sun is gone"));
                 };
-                return match send(conn, &Message::SessionRequest { request: here }) {
+                return match send(conn, &Message::OrreryRequest { request: here }) {
                     Ok(()) => Response::ok(),
-                    Err(e) => Response::error(format!("cannot ask the primary for workspace {n}: {e}")),
+                    Err(e) => Response::error(format!("cannot ask the sun for workspace {n}: {e}")),
                 };
             }
-            Side::Satellite(_) => return self.apply(here),
-            Side::Primary(p) => p.session.workspace(n),
+            Side::Planet(_) => return self.apply(here),
+            Side::Sun(p) => p.system.workspace(n),
         };
         let response = match route {
             Err(e) => Response::error(e.to_string()),
@@ -1294,71 +1285,59 @@ impl Orrery {
         response
     }
 
-    /// Satellite `from` asks the primary to route `request` (a `workspace` it does not have): as the primary's own.
-    fn session_request(&mut self, from: &str, request: Request) {
+    /// Planet `from` asks the sun to route `request` (a `workspace` it does not have): as the sun's own.
+    fn system_request(&mut self, from: &str, request: Request) {
         let response = match request {
-            Request::Workspace { number } => self.session_workspace(number),
-            other => Response::error(format!("{} is no session request", other.verb())),
+            Request::Workspace { number } => self.system_workspace(number),
+            other => Response::error(format!("{} is no orrery request", other.verb())),
         };
         if let Some(e) = response.error {
             tracing::info!("{from}'s request: {e}");
         }
     }
 
-    /// The primary's crossing: where its input goes.
+    /// The sun's crossing: where its input goes.
     pub(super) fn crossing(&mut self) -> Option<&mut Crossing> {
         match &mut self.net {
-            Some(Net {
-                side: Side::Primary(p), ..
-            }) => Some(&mut p.crossing),
+            Some(Net { side: Side::Sun(p), .. }) => Some(&mut p.crossing),
             _ => None,
         }
     }
 
-    /// Where the primary's input goes; None elsewhere.
+    /// Where the sun's input goes; None elsewhere.
     pub(super) fn input_place(&self) -> Option<&Place> {
         match &self.net {
-            Some(Net {
-                side: Side::Primary(p), ..
-            }) => Some(p.crossing.place()),
+            Some(Net { side: Side::Sun(p), .. }) => Some(p.crossing.place()),
             _ => None,
         }
     }
 
-    /// This machine's name in a session.
+    /// This machine's name in an orrery.
     pub(super) fn this_machine(&self) -> Option<String> {
         self.net.as_ref().map(|n| n.name.clone())
     }
 
-    /// The machine holding the session's focus marker (the primary's view).
+    /// The machine holding the orrery's focus marker (the sun's view).
     pub(super) fn marker(&self) -> Option<String> {
         match &self.net {
-            Some(Net {
-                side: Side::Primary(p), ..
-            }) => Some(p.session.focused().name().to_owned()),
+            Some(Net { side: Side::Sun(p), .. }) => Some(p.system.focused().name().to_owned()),
             _ => None,
         }
     }
 
     pub(super) fn focus_marker(&mut self, machine: &str) {
-        if let Some(Net {
-            side: Side::Primary(p), ..
-        }) = &mut self.net
-        {
-            p.session.focus(machine);
+        if let Some(Net { side: Side::Sun(p), .. }) = &mut self.net {
+            p.system.focus(machine);
         }
     }
 
-    /// Where machine `from`'s pointer lands, leaving its screens past `edge` at height `y`: the session's monitors
-    /// in a row (satellites' sizes never cross the link, and landing needs none).
+    /// Where machine `from`'s pointer lands, leaving its screens past `edge` at height `y`: the orrery's monitors
+    /// in a row (planets' sizes never cross the link, and landing needs none).
     pub(super) fn landing(&self, from: &str, edge: Edge, y: f64) -> Option<Landing> {
-        let Some(Net {
-            side: Side::Primary(p), ..
-        }) = &self.net
-        else {
+        let Some(Net { side: Side::Sun(p), .. }) = &self.net else {
             return None;
         };
-        let row: Vec<RowScreen> = (p.session.monitors())
+        let row: Vec<RowScreen> = (p.system.monitors())
             .map(|(m, s)| RowScreen {
                 machine: m.name().to_owned(),
                 screen: s.name.clone(),
@@ -1369,14 +1348,14 @@ impl Orrery {
         crate::crossing::landing(&row, from, edge, y)
     }
 
-    /// Queues input for satellite `machine` (dropped when it is gone: its drop brings input home).
+    /// Queues input for planet `machine` (dropped when it is gone: its drop brings input home).
     pub(super) fn queue_input(&mut self, machine: &str, msg: Message) {
         if let Some(conn) = self.joined_conn(machine) {
             conn.outbox.push(msg);
         }
     }
 
-    /// Queues `keymap` (this machine's, when that satellite was not sent it yet) and `handoff` for `machine`; false
+    /// Queues `keymap` (this machine's, when that planet was not sent it yet) and `handoff` for `machine`; false
     /// when it is gone.
     pub(super) fn queue_handoff(&mut self, machine: &str, keymap: Option<String>, handoff: Message) -> bool {
         let Some(conn) = self.joined_conn(machine) else {
@@ -1398,16 +1377,16 @@ impl Orrery {
         (self.net.as_mut()?.conns.values_mut()).find(|c| c.joined.as_deref() == Some(machine) && c.dropped.is_none())
     }
 
-    /// `move-to-workspace n` in a session: refused for another machine's number (windows never cross machines).
-    pub(super) fn session_move(&mut self, n: u8) -> Response {
+    /// `move-to-workspace n` in an orrery: refused for another machine's number (windows never cross machines).
+    pub(super) fn system_move(&mut self, n: u8) -> Response {
         let here = Request::MoveToWorkspace { number: n };
         let refused = match &self.net {
             None => None,
             Some(Net {
-                side: Side::Primary(p),
+                side: Side::Sun(p),
                 name,
                 ..
-            }) => p.session.move_to_workspace(name, n).err().map(|e| e.to_string()),
+            }) => p.system.move_to_workspace(name, n).err().map(|e| e.to_string()),
             Some(_) => (self.stacks.foreign().contains(&n))
                 .then(|| format!("workspace {n} is on another machine: windows never cross machines")),
         };
@@ -1417,18 +1396,18 @@ impl Orrery {
         }
     }
 
-    /// `state`'s session: None alone.
-    pub(super) fn session_view(&self) -> Option<SessionView> {
+    /// `state`'s orrery: None alone.
+    pub(super) fn system_view(&self) -> Option<SystemView> {
         let net = self.net.as_ref()?;
         let foreign = self.stacks.foreign().iter().copied().collect();
-        let (listen, primary, machines) = match &net.side {
-            Side::Primary(p) => {
+        let (listen, sun, machines) = match &net.side {
+            Side::Sun(p) => {
                 let latency = |name: &str| {
                     (net.conns.values())
                         .find(|c| c.joined.as_deref() == Some(name))
                         .and_then(latency_ms)
                 };
-                let machines = (p.session.machines().iter())
+                let machines = (p.system.machines().iter())
                     .map(|m| MachineView {
                         name: m.name().to_owned(),
                         role: m.role(),
@@ -1436,7 +1415,7 @@ impl Orrery {
                         workspaces: m.workspaces().iter().copied().collect(),
                         latency_ms: latency(m.name()),
                         connected: true,
-                        focused: p.session.focused().name() == m.name(),
+                        focused: p.system.focused().name() == m.name(),
                         queued: (net.conns.values())
                             .find(|c| c.joined.as_deref() == Some(m.name()))
                             .map_or(0, |c| c.outbox.len()),
@@ -1444,12 +1423,12 @@ impl Orrery {
                     .collect();
                 (p.listen.map(|a| a.to_string()), None, machines)
             }
-            Side::Satellite(s) => {
+            Side::Planet(s) => {
                 let conn = net.conns.values().find(|c| c.joined.is_some());
                 let (monitors, workspaces) = report(&self.stacks);
                 let me = MachineView {
                     name: net.name.clone(),
-                    role: Role::Satellite,
+                    role: Role::Planet,
                     monitors,
                     workspaces: workspaces.into_iter().collect(),
                     latency_ms: conn.and_then(latency_ms),
@@ -1457,24 +1436,24 @@ impl Orrery {
                     focused: false,
                     queued: 0,
                 };
-                (None, Some(s.primary.clone()), vec![me])
+                (None, Some(s.sun.clone()), vec![me])
             }
         };
-        Some(SessionView {
+        Some(SystemView {
             machine: net.name.clone(),
             role: match net.side {
-                Side::Primary(_) => Role::Primary,
-                Side::Satellite(_) => Role::Satellite,
+                Side::Sun(_) => Role::Sun,
+                Side::Planet(_) => Role::Planet,
             },
             listen,
-            primary,
+            sun,
             machines,
             input: match &net.side {
-                Side::Primary(p) => match p.crossing.place() {
+                Side::Sun(p) => match p.crossing.place() {
                     Place::Local => net.name.clone(),
                     Place::Remote(m) => m.clone(),
                 },
-                Side::Satellite(_) => net.name.clone(),
+                Side::Planet(_) => net.name.clone(),
             },
             foreign,
             error: net.error.clone(),

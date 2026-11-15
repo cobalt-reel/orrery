@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use orrery_wm::comp::{self, BackendChoice, RunOptions, ipc_server, net};
 use orrery_wm::ipc::{Request, Response};
 use orrery_wm::link::Secret;
-use orrery_wm::session::Role;
+use orrery_wm::system::Role;
 use orrery_wm::{NAME, config, ipc};
 
 #[derive(Parser)]
@@ -29,7 +29,7 @@ enum Command {
     Msg {
         #[arg(long, help = msg_socket_help())]
         socket: Option<PathBuf>,
-        /// Run the request on that machine of the session (through the primary).
+        /// Run the request on that machine of the orrery (through the sun).
         #[arg(long, value_name = "MACHINE")]
         to: Option<String>,
         /// Words (`focus-slot left`) or a single JSON request.
@@ -70,7 +70,7 @@ struct RunArgs {
     #[arg(long, help = socket_help())]
     socket: Option<PathBuf>,
     /// A testing aid, off by default: answer `inject` (input as if from this machine's own devices) and
-    /// `inject-remote` (input messages sent to a satellite as they are).
+    /// `inject-remote` (input messages sent to a planet as they are).
     #[arg(long)]
     debug_inject: bool,
 }
@@ -194,8 +194,8 @@ fn check(path: Option<PathBuf>) -> ExitCode {
             }
             let name = net::machine_name(&config);
             let place = match link.role {
-                Role::Primary => format!("the primary, listening on {}", link.addr),
-                Role::Satellite => format!("a satellite of the primary at {}", link.addr),
+                Role::Sun => format!("the sun, listening on {}", link.addr),
+                Role::Planet => format!("a planet of the sun at {}", link.addr),
             };
             println!("ok");
             println!("link: {name:?}, {place}, secret file {}", secret.display());

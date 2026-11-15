@@ -74,7 +74,7 @@ fn the_link_is_reported_and_its_secret_file_checked() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let said = text(&out.stdout);
     assert!(
-        said.starts_with("ok\nlink: \"desk\", the primary, listening on 127.0.0.1:7340"),
+        said.starts_with("ok\nlink: \"desk\", the sun, listening on 127.0.0.1:7340"),
         "{said}"
     );
     assert!(

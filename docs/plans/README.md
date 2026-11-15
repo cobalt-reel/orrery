@@ -22,3 +22,4 @@ Where they say "the README", they mean what is now the [manual](../manual.md) an
 | [focus-follows-mouse](2026-11-13-focus-follows-mouse.md) | the slot under the pointer takes the focus |
 | [layouts](2026-11-13-layouts.md) | a library of layouts, `cycle-layout`, the layout in the bar, a picker |
 | [fullscreen](2026-11-14-fullscreen.md) | a window over its whole screen |
+| [sun and planets](2026-11-15-sun-and-planets.md) | the linked machines renamed: an orrery, its sun and its planets (earlier notes say session, primary and satellite) |

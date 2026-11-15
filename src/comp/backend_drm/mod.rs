@@ -23,7 +23,7 @@
 //! to the nearest. `open-screen` and `close-screen` answer that monitors decide here.
 //!
 //! **Input.** libinput through the session. Relative motion goes through `device_motion` (`crossing::step` keeps the
-//! pointer on the screens, and crosses at the outer edges in a session of linked machines); keys, buttons, scrolling
+//! pointer on the screens, and crosses at the outer edges in an orrery of linked machines); keys, buttons, scrolling
 //! and absolute motion go through `process_input_event`, with the screen the pointer is on. Keystrokes are never
 //! logged. orrery draws the pointer itself (`Orrery::draws_pointer`).
 //!

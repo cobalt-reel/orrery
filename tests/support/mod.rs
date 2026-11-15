@@ -1,9 +1,9 @@
-//! Runs a headless orrery for a test: its own temp `XDG_RUNTIME_DIR` and config, never the user's session.
+//! Runs a headless orrery for a test: its own temp `XDG_RUNTIME_DIR` and config, never the user's orrery.
 
 #![allow(dead_code)] // each test binary uses a different part of this
 
 pub mod client;
-pub mod session;
+pub mod system;
 
 use std::io::{BufRead, BufReader, Read as _};
 use std::os::unix::net::UnixStream;
@@ -21,7 +21,7 @@ use tempfile::TempDir;
 pub const BIN: &str = env!("CARGO_BIN_EXE_orrery");
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// A orrery still running after this is killed, so a deadlocked compositor fails the test (its client's
+/// An orrery still running after this is killed, so a deadlocked compositor fails the test (its client's
 /// roundtrip errors) instead of hanging it.
 pub const WATCHDOG: Duration = Duration::from_secs(60);
 
@@ -96,7 +96,7 @@ impl Compositor {
             .arg("--socket")
             .arg(socket_path_in(runtime.path()))
             .args(args)
-            // Never the user's session: our own runtime dir, and no display to inherit.
+            // Never the user's orrery: our own runtime dir, and no display to inherit.
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", config_dir.path())
             .env_remove("WAYLAND_DISPLAY")

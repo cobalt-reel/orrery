@@ -573,7 +573,7 @@ fn msg_refuses_bad_words_locally_and_reports_a_missing_orrery() {
 
 #[test]
 fn a_second_orrery_refuses_while_the_lock_is_held() {
-    // A orrery still starting holds the lock but never answers (within a second): refused, not joined.
+    // An orrery still starting holds the lock but never answers (within a second): refused, not joined.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = socket_path_in(dir.path());
     let lock = std::fs::File::create(dir.path().join(format!("{NAME}.sock.lock"))).expect("lock file");
@@ -658,7 +658,7 @@ impl Drop for Killed {
 #[test]
 fn a_stale_socket_is_replaced() {
     let runtime = tempfile::tempdir().expect("temp runtime dir");
-    // A socket file nobody listens on: a orrery that was killed.
+    // A socket file nobody listens on: an orrery that was killed.
     drop(UnixListener::bind(socket_path_in(runtime.path())).expect("bind"));
     let orrery = Compositor::start_in(runtime, config::DEFAULT, SIZE);
     assert_eq!(orrery.state()["monitors"][0]["name"], "headless");

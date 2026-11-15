@@ -95,19 +95,20 @@ Holding `Mod+Space` shows every slot's tabs as a strip along its top, as in the 
 
 ### 3. Several machines, the same desktop
 
-Run orrery on each machine on your desk, give them a shared secret, and they join into a **session**: a
-*primary*, which is the machine whose keyboard and mouse you use, and any number of *satellites*.
+Run orrery on each machine on your desk, give them a shared secret, and together they make an **orrery**: a
+*sun*, which is the machine whose keyboard and mouse you use, and any number of *planets* around it. (An orrery is
+a clockwork model of the solar system, which is where the names come from.)
 
 ```
-        "desk", the primary                               "side", a satellite
+          "desk", the sun                                 "side", a planet
  +-------------+  +-------------+                        +-------------+
  | workspace 1 |  | workspace 2 |  <---- encrypted ----> | workspace 3 |
  +-------------+  +-------------+          link          +-------------+
    your keyboard and mouse  ---- Mod+3, or the pointer pushed past the edge ---->
 ```
 
-- **Shared workspaces.** The workspace numbers run across every screen of every machine: the primary's screens
-  first, then each satellite's. `Mod+3` shows workspace 3 on whichever machine has it.
+- **Shared workspaces.** The workspace numbers run across every screen of every machine: the sun's screens
+  first, then each planet's. `Mod+3` shows workspace 3 on whichever machine has it.
 - **Your keyboard and mouse everywhere.** They follow the focus. Press the key of a workspace on another machine,
   or push the pointer past the edge of the last screen, and from then on your typing, clicks and scrolling happen on that
   machine, key binds included, in your own keyboard layout. `Mod+Escape` always brings them home, and each
@@ -273,8 +274,8 @@ It needs kitty 0.43 or later, python3 and fzf. Details are under
 
 ## Linking machines
 
-To make the session of [idea 3](#3-several-machines-the-same-desktop), give two machines the same secret and say
-which is the primary:
+To make the orrery of [idea 3](#3-several-machines-the-same-desktop), give two machines the same secret and say
+which is the sun:
 
 ```kdl
 // on the desk
@@ -283,7 +284,7 @@ listen "0.0.0.0:7340" secret-file="~/.config/orrery/secret"
 
 // on the machine beside it
 name "side"
-primary "desk.lan:7340" secret-file="~/.config/orrery/secret"
+sun "desk.lan:7340" secret-file="~/.config/orrery/secret"
 ```
 
 That is the whole setup: start orrery on both, and the desk's screens are workspaces 1, 2, … with the other
@@ -301,7 +302,7 @@ has needed so far, and these are the things it has not needed yet:
 - no screen capture protocol, so no screenshots or screen sharing (the pictures here were taken by the host of a
   nested orrery);
 - no screen lock and no idle handling;
-- in a session the clipboard stays on each machine: copy and paste do not cross the link;
+- in an orrery the clipboard stays on each machine: copy and paste do not cross the link;
 - scale 1 only, each monitor at its preferred mode, a single GPU;
 - no hardware cursor planes and no direct scanout: everything is composited;
 - touchscreens and tablets are ignored; touchpads keep libinput's defaults.

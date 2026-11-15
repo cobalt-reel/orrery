@@ -5,7 +5,7 @@
 
 Left the workspaces (the one shown on this screen highlighted, occupied ones plain, empty ones dim, one asking for
 attention in the attention colour), middle the tabs of the focused slot of this screen's workspace (the current one
-bright), right the session's machines (only in a session; where input is in the focus colour), this screen's layout
+bright), right the orrery's machines (only in an orrery; where input is in the focus colour), this screen's layout
 (in the badge colour) and the time. Driven
 by `orrery msg subscribe` ($ORRERY, which orrery sets for what it starts, else `orrery` on PATH); colours from
 orrery's config; it stops when its orrery's socket is gone or replaced (see Seen). Python 3 standard library
@@ -155,7 +155,7 @@ class Model:
         self.tabs = {}  # workspace number -> [{current, attention, windows: [{id, app_id, title}]}]
         self.layouts = {}  # screen name -> the layout of the workspace it shows
         self.colors = {}  # name -> (r, g, b)
-        self.session = None
+        self.system = None
 
     @classmethod
     def from_state(cls, ev):
@@ -180,7 +180,7 @@ class Model:
             focused = next((s for s in slots if s.get("index") == w.get("focused_slot")), None)
             m.tabs[w.get("number")] = (focused or {}).get("tabs") or []
         m.set_colors(ev.get("colors"))
-        m.session = ev.get("session")
+        m.system = ev.get("orrery")
         return m
 
     def set_colors(self, colors):
@@ -233,8 +233,8 @@ class Model:
                 w["attention"] = n in numbers
         elif kind == "layout" and "screens" in ev:
             self.layouts = {s.get("name"): s["layout"] for s in ev["screens"] if s.get("layout")}
-        elif kind == "session":
-            self.session = ev.get("session")
+        elif kind == "orrery":
+            self.system = ev.get("orrery")
         elif kind == "config" and ev.get("colors"):
             self.set_colors(ev["colors"])
         return self
@@ -286,14 +286,14 @@ def workspace_segments(model, screen):
     c = model.colors
     here = model.screens.get(screen)
     focused = bool(here and here["focused"])
-    session = model.session or {}
+    system = model.system or {}
     numbers = sorted(n for n in model.workspaces if isinstance(n, int))
-    foreign = sorted(set(n for n in session.get("foreign") or [] if isinstance(n, int)) - set(numbers))
+    foreign = sorted(set(n for n in system.get("foreign") or [] if isinstance(n, int)) - set(numbers))
     segs = []
     for n in sorted(numbers + foreign):
         w = model.workspaces.get(n)
         if w is None:
-            style = DIM + ITALIC  # on another machine of the session
+            style = DIM + ITALIC  # on another machine of the orrery
         elif here and here["workspace"] == n:
             style = bg(c.get("focus")) + fg(c.get("background")) + BOLD if focused else fg(c.get("focus")) + BOLD
         elif w.get("attention"):
@@ -327,16 +327,16 @@ def tab_segments(model, screen, avail):
     return segs
 
 
-def session_segments(model):
-    session = model.session
-    if not session:
+def system_segments(model):
+    system = model.system
+    if not system:
         return []
     segs = []
-    for m in session.get("machines") or []:
+    for m in system.get("machines") or []:
         name = clean(m.get("name") or "?")
         if segs:
             segs.append(("", " "))
-        if name == session.get("input"):
+        if name == system.get("input"):
             segs.append((fg(model.colors.get("focus")) + BOLD, name))
         elif m.get("connected") is False:
             segs.append((DIM, name))
@@ -354,9 +354,9 @@ def render(model, screen, width, clock):
             seg = [(fg(model.colors.get("badge")), clean(layout)), ("", "  ")]
             if segments_width(seg) + segments_width(right) + 1 <= width:
                 right = seg + right
-        session = session_segments(model)
-        if session and segments_width(session) + 2 + segments_width(right) + 1 <= width:
-            right = session + [("", "  ")] + right
+        system = system_segments(model)
+        if system and segments_width(system) + 2 + segments_width(right) + 1 <= width:
+            right = system + [("", "  ")] + right
     if segments_width(right) + 1 > width:
         right = []
     left = workspace_segments(model, screen) if model is not None else []

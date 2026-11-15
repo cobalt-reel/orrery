@@ -31,7 +31,7 @@ def tab(*windows, current=False, attention=False):
     return {"current": current, "attention": attention, "windows": windows}
 
 
-def snapshot(session=None):
+def snapshot(system=None):
     """Two screens: A shows workspace 1 (focused; two tabs in its focused slot), B shows 2 (empty); 3 hidden, on A."""
     stack = tab((2, "kitty", "~"), (3, "kitty", "htop"), current=True)
     ws1 = [slot(0, [tab((1, "kitty", "vim")), stack], True), slot(1, [])]
@@ -48,7 +48,7 @@ def snapshot(session=None):
             {"number": 3, "monitor": "A", "shown": False, "layout": "x", "focused_slot": 1, "slots": ws3},
         ],
         "colors": COLORS,
-        "session": session,
+        "orrery": system,
     }
 
 
@@ -152,8 +152,8 @@ class Model(unittest.TestCase):
         m = model({"event": "config", "error": None, "colors": dict(COLORS, focus="#000001ff")})
         self.assertEqual(m.colors["focus"], (0, 0, 1))
 
-        m = model({"event": "session", "session": {"machine": "desk", "input": "desk", "machines": []}})
-        self.assertEqual(m.session["machine"], "desk")
+        m = model({"event": "orrery", "orrery": {"machine": "desk", "input": "desk", "machines": []}})
+        self.assertEqual(m.system["machine"], "desk")
 
     def test_each_screens_layout_comes_from_the_snapshot_and_layout_events(self):
         self.assertEqual(model().layouts, {"A": "tall", "B": "quad"})
@@ -249,14 +249,14 @@ class Render(unittest.TestCase):
             text = plain(bar.render(model(), "A", width, "12:34"))
             self.assertEqual(bar.cell_width(text), width, repr(text))
 
-    def test_the_session_shows_only_in_one_with_input_marked(self):
+    def test_the_orrery_shows_only_in_one_with_input_marked(self):
         self.assertNotIn("desk", plain(bar.render(model(), "A", 80, "12:34")))
-        session = {"machine": "desk", "role": "primary", "input": "side", "machines": [
+        system = {"machine": "desk", "role": "sun", "input": "side", "machines": [
             {"name": "desk", "connected": True},
             {"name": "side", "connected": True},
             {"name": "far", "connected": False},
         ]}
-        m = bar.apply(None, snapshot(session))
+        m = bar.apply(None, snapshot(system))
         line = bar.render(m, "A", 80, "12:34")
         self.assertTrue(plain(line).endswith(" desk side far  tall  12:34 "), plain(line))
         self.assertIn(fg("ff7edb") + bar.BOLD + "side", line, "where input is")

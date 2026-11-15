@@ -1,10 +1,11 @@
-//! The session: one primary and its satellites, the order of their monitors, and which machine owns each workspace
-//! number.
+//! The orrery as a whole: a sun and its planets, the order of their monitors, and which machine owns each workspace
+//! number. The type is `System` (as in solar system) because `Orrery` is one machine's compositor state; everywhere
+//! a user reads or writes it (the config, `state`, the events, the docs), the whole is "the orrery".
 //!
-//! Pure, and kept by the primary. Workspace numbers (1..=WORKSPACES) are one space across the session: each is owned
+//! Pure, and kept by the sun. Workspace numbers (1..=WORKSPACES) are one space across the orrery: each is owned
 //! by at most one machine, which has it in its `Stacks`, and is foreign to every other one (`Stacks::set_foreign`).
 //! A screen's number is that of the workspace it locks, so it is owned too. Numbers never change on a drop: the
-//! satellite keeps them, the session only frees them. On a (re)join, and on every report, a machine keeps each
+//! planet keeps them, the orrery only frees them. On a (re)join, and on every report, a machine keeps each
 //! number still free and renames each taken one. Windows never cross machines.
 
 use std::collections::BTreeSet;
@@ -13,14 +14,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::stacks::WORKSPACES;
 
-/// Workspace numbers to change, (from, to): what a join or a report hands a machine for `Stacks::apply_session`.
+/// Workspace numbers to change, (from, to): what a join or a report hands a machine for `Stacks::apply_system`.
 pub type Renames = Vec<(u8, u8)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
-    Primary,
-    Satellite,
+    Sun,
+    Planet,
 }
 
 /// A machine's screen: its output's name and its number.
@@ -32,7 +33,7 @@ pub struct Screen {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine {
-    /// Unique in the session.
+    /// Unique in the orrery.
     name: String,
     role: Role,
     /// In number order.
@@ -42,30 +43,30 @@ pub struct Machine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
-    /// The primary first, then the satellites in the order they joined.
+pub struct System {
+    /// The sun first, then the planets in the order they joined.
     machines: Vec<Machine>,
-    /// The machine holding the session's focus marker, by index.
+    /// The machine holding the orrery's focus marker, by index.
     focused: usize,
 }
 
 /// Where `workspace N` goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// The primary has it: its own `Stacks::workspace` shows it.
+    /// The sun has it: its own `Stacks::workspace` shows it.
     Local,
-    /// That satellite (by name) has it and shows it.
+    /// That planet (by name) has it and shows it.
     On(String),
     /// Nobody has it: that machine (by name), the focused one, makes it with that number (`Stacks::workspace`) and
-    /// owns it from now on (see `Session::workspace`).
+    /// owns it from now on (see `Orrery::workspace`).
     Create(String),
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum Refused {
-    #[error("a machine named {name:?} is already in the session")]
+    #[error("a machine named {name:?} is already in the orrery")]
     DuplicateName { name: String },
-    #[error("no machine named {name:?} in the session")]
+    #[error("no machine named {name:?} in the orrery")]
     UnknownMachine { name: String },
     #[error("workspace {number} is not 1 to {WORKSPACES}")]
     OutOfRange { number: u8 },
@@ -100,30 +101,30 @@ impl Machine {
     }
 }
 
-impl Session {
-    /// The primary `name` alone, owning its screens' and workspaces' numbers before anything can join. Refused for
+impl System {
+    /// The sun `name` alone, owning its screens' and workspaces' numbers before anything can join. Refused for
     /// bad numbers.
     pub fn new(name: &str, screens: Vec<Screen>, workspaces: impl IntoIterator<Item = u8>) -> Result<Self, Refused> {
         let (screens, workspaces) = checked(screens, workspaces)?;
-        let primary = Machine {
+        let sun = Machine {
             name: name.to_owned(),
-            role: Role::Primary,
+            role: Role::Sun,
             screens,
             workspaces,
         };
         Ok(Self {
-            machines: vec![primary],
+            machines: vec![sun],
             focused: 0,
         })
     }
 
-    /// The primary first, then the satellites in join order.
+    /// The sun first, then the planets in join order.
     #[must_use]
     pub fn machines(&self) -> &[Machine] {
         &self.machines
     }
 
-    /// The machine holding the session's focus marker.
+    /// The machine holding the orrery's focus marker.
     #[must_use]
     pub fn focused(&self) -> &Machine {
         &self.machines[self.focused]
@@ -144,17 +145,17 @@ impl Session {
             .collect()
     }
 
-    /// Every monitor in the session with its machine: the primary's first, then each satellite's in join order,
+    /// Every monitor in the orrery with its machine: the sun's first, then each planet's in join order,
     /// each machine's in number order.
     // No #[must_use]: iterators already carry it.
     pub fn monitors(&self) -> impl Iterator<Item = (&Machine, &Screen)> + '_ {
         (self.machines.iter()).flat_map(|m| m.screens.iter().map(move |s| (m, s)))
     }
 
-    /// Machine `name` (the primary too) says what it has now, after any change: a rejoin in place. Its numbers
+    /// Machine `name` (the sun too) says what it has now, after any change: a rejoin in place. Its numbers
     /// become these and its screens' (a workspace gone frees its own), each still free kept and each another owns
     /// renamed as on a join, so collisions from races (a number made on two machines at once) heal on the next
-    /// report. Returns the renames for it to apply (`Stacks::apply_session`). Refused, with nothing changed, for an
+    /// report. Returns the renames for it to apply (`Stacks::apply_system`). Refused, with nothing changed, for an
     /// unknown machine, bad numbers, or more renames than free numbers.
     pub fn report(
         &mut self,
@@ -173,9 +174,9 @@ impl Session {
         Ok(renames)
     }
 
-    /// Satellite `name` joins with its screens and workspaces, numbered as `assign` says. Returns the renames for
-    /// the satellite to apply (`Stacks::apply_session`). Its monitors come after every machine already in. Refused,
-    /// with nothing changed, for a name already in the session, bad numbers, or more renames than free numbers.
+    /// Planet `name` joins with its screens and workspaces, numbered as `assign` says. Returns the renames for
+    /// the planet to apply (`Stacks::apply_system`). Its monitors come after every machine already in. Refused,
+    /// with nothing changed, for a name already in the orrery, bad numbers, or more renames than free numbers.
     pub fn join(
         &mut self,
         name: &str,
@@ -189,17 +190,17 @@ impl Session {
         let (mine, renames) = assign(owned, self.foreign(name))?;
         self.machines.push(Machine {
             name: name.to_owned(),
-            role: Role::Satellite,
+            role: Role::Planet,
             screens: renumbered(screens, &renames),
             workspaces: mine,
         });
         Ok(renames)
     }
 
-    /// Satellite `name` lost its link: its monitors leave the session and its numbers are free (it keeps them, and
-    /// asks for them back when it rejoins). The focus marker goes to the primary if it was there. `false` (and
-    /// nothing done) for the primary or an unknown name.
-    pub fn drop_satellite(&mut self, name: &str) -> bool {
+    /// Planet `name` lost its link: its monitors leave the orrery and its numbers are free (it keeps them, and
+    /// asks for them back when it rejoins). The focus marker goes to the sun if it was there. `false` (and
+    /// nothing done) for the sun or an unknown name.
+    pub fn drop_planet(&mut self, name: &str) -> bool {
         let Some(i) = self.index_of(name).filter(|&i| i > 0) else {
             return false;
         };
@@ -228,13 +229,13 @@ impl Session {
         };
         self.focused = owner;
         Ok(match self.machines[owner].role {
-            Role::Primary => Route::Local,
-            Role::Satellite => Route::On(self.machines[owner].name.clone()),
+            Role::Sun => Route::Local,
+            Role::Planet => Route::On(self.machines[owner].name.clone()),
         })
     }
 
-    /// The focus marker to machine `name`: the pointer crossed onto it, or input came back to the primary. False
-    /// (and nothing done) for a machine not in the session.
+    /// The focus marker to machine `name`: the pointer crossed onto it, or input came back to the sun. False
+    /// (and nothing done) for a machine not in the orrery.
     pub fn focus(&mut self, name: &str) -> bool {
         let Some(i) = self.index_of(name) else {
             return false;
@@ -330,31 +331,31 @@ mod tests {
         }
     }
 
-    /// The primary "p": screen "p1" numbered 1, workspaces 1 and 3.
-    fn primary() -> Session {
-        Session::new("p", vec![screen("p1", 1)], [1, 3]).expect("valid")
+    /// The sun "p": screen "p1" numbered 1, workspaces 1 and 3.
+    fn sun() -> System {
+        System::new("p", vec![screen("p1", 1)], [1, 3]).expect("valid")
     }
 
     /// Each machine's name and the numbers it owns.
-    fn owners(s: &Session) -> Vec<(&str, Vec<u8>)> {
+    fn owners(s: &System) -> Vec<(&str, Vec<u8>)> {
         (s.machines().iter())
             .map(|m| (m.name(), m.workspaces().iter().copied().collect()))
             .collect()
     }
 
-    /// The session's monitors as (machine, screen name, number), in order.
-    fn monitors(s: &Session) -> Vec<(&str, &str, u8)> {
+    /// The orrery's monitors as (machine, screen name, number), in order.
+    fn monitors(s: &System) -> Vec<(&str, &str, u8)> {
         s.monitors()
             .map(|(m, sc)| (m.name(), sc.name.as_str(), sc.number))
             .collect()
     }
 
     #[test]
-    fn the_primary_owns_its_numbers_from_the_start() {
+    fn the_sun_owns_its_numbers_from_the_start() {
         // Its screens' numbers are its workspaces too.
-        let mut s = Session::new("p", vec![screen("p2", 2), screen("p1", 1)], [5]).expect("valid");
+        let mut s = System::new("p", vec![screen("p2", 2), screen("p1", 1)], [5]).expect("valid");
         assert_eq!(s.machines().len(), 1);
-        assert_eq!(s.machines()[0].role(), Role::Primary);
+        assert_eq!(s.machines()[0].role(), Role::Sun);
         assert_eq!(s.focused().name(), "p");
         assert_eq!(owners(&s), [("p", vec![1, 2, 5])]);
         assert_eq!(
@@ -365,9 +366,9 @@ mod tests {
         assert_eq!(s.owner(5).map(Machine::name), Some("p"));
         assert_eq!(s.owner(3), None);
         assert!(s.foreign("p").is_empty());
-        assert_eq!(Session::new("p", vec![], [11]), Err(Refused::OutOfRange { number: 11 }));
+        assert_eq!(System::new("p", vec![], [11]), Err(Refused::OutOfRange { number: 11 }));
         assert_eq!(
-            Session::new("p", vec![screen("a", 1), screen("b", 1)], []),
+            System::new("p", vec![screen("a", 1), screen("b", 1)], []),
             Err(Refused::ScreenTwice { number: 1 })
         );
         // Refused, nothing changed: an unknown machine, a number out of range, a screen number twice.
@@ -390,11 +391,11 @@ mod tests {
 
     #[test]
     fn a_join_keeps_free_numbers_and_monitors_follow_the_join_order() {
-        let mut s = primary();
+        let mut s = sun();
         assert_eq!(s.join("a", vec![screen("a1", 2)], [2, 5]), Ok(vec![]));
         assert_eq!(s.join("b", vec![screen("b1", 4)], [4, 6]), Ok(vec![]));
         assert_eq!(owners(&s), [("p", vec![1, 3]), ("a", vec![2, 5]), ("b", vec![4, 6])]);
-        assert_eq!(s.machines()[1].role(), Role::Satellite);
+        assert_eq!(s.machines()[1].role(), Role::Planet);
         assert_eq!(monitors(&s), [("p", "p1", 1), ("a", "a1", 2), ("b", "b1", 4)]);
         assert_eq!(s.foreign("a"), BTreeSet::from([1, 3, 4, 6]));
         assert_eq!(s.foreign("p"), BTreeSet::from([2, 4, 5, 6]));
@@ -403,8 +404,8 @@ mod tests {
 
     #[test]
     fn a_taken_number_moves_to_the_lowest_one_neither_taken_nor_kept() {
-        let mut s = primary();
-        // 1 and 3 are the primary's; 2 is kept, so 1 goes to 4 and 3 to 5.
+        let mut s = sun();
+        // 1 and 3 are the sun's; 2 is kept, so 1 goes to 4 and 3 to 5.
         let renames = s.join("a", vec![screen("a1", 1), screen("a2", 2)], [1, 2, 3]);
         assert_eq!(renames, Ok(vec![(1, 4), (3, 5)]));
         assert_eq!(owners(&s), [("p", vec![1, 3]), ("a", vec![2, 4, 5])]);
@@ -413,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_join_is_refused_for_a_name_taken_bad_numbers_or_too_few_free() {
-        let mut s = primary();
+        let mut s = sun();
         assert_eq!(s.join("a", vec![], [2, 4, 5, 6, 7, 8]), Ok(vec![]));
         let before = s.clone();
         for name in ["p", "a"] {
@@ -435,12 +436,12 @@ mod tests {
 
     #[test]
     fn a_drop_frees_numbers_and_monitors_and_the_focus_goes_home() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2]).expect("joins");
         s.join("b", vec![screen("b1", 4)], [4, 5]).expect("joins");
         assert_eq!(s.workspace(5), Ok(Route::On("b".into())));
         assert_eq!(s.focused().name(), "b");
-        assert!(s.drop_satellite("b"));
+        assert!(s.drop_planet("b"));
         assert_eq!(owners(&s), [("p", vec![1, 3]), ("a", vec![2])]);
         assert_eq!(monitors(&s), [("p", "p1", 1), ("a", "a1", 2)]);
         assert_eq!(s.owner(5), None);
@@ -448,18 +449,18 @@ mod tests {
         // The marker on a machine after the one dropped stays there.
         s.join("b", vec![], [4]).expect("joins");
         s.workspace(4).expect("in range");
-        assert!(s.drop_satellite("a"));
+        assert!(s.drop_planet("a"));
         assert_eq!(s.focused().name(), "b");
-        // Never the primary, nor an unknown machine.
+        // Never the sun, nor an unknown machine.
         let before = s.clone();
-        assert!(!s.drop_satellite("p"));
-        assert!(!s.drop_satellite("x"));
+        assert!(!s.drop_planet("p"));
+        assert!(!s.drop_planet("x"));
         assert_eq!(s, before);
     }
 
     #[test]
     fn the_marker_moves_to_where_the_pointer_crossed() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2]).expect("joins");
         s.join("b", vec![], [4]).expect("joins");
         assert!(s.focus("a"));
@@ -468,7 +469,7 @@ mod tests {
         assert_eq!(s.workspace(6), Ok(Route::Create("a".into())));
         assert!(s.focus("p"));
         assert_eq!(s.focused().name(), "p");
-        assert!(!s.focus("x"), "not in the session");
+        assert!(!s.focus("x"), "not in the orrery");
         assert_eq!(s.focused().name(), "p");
         assert!(s.focus("b"), "a machine without screens too");
         assert_eq!(s.focused().name(), "b");
@@ -476,17 +477,17 @@ mod tests {
 
     #[test]
     fn a_rejoin_keeps_its_numbers_unless_one_was_taken_meanwhile() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2, 4, 5]).expect("joins");
-        s.drop_satellite("a");
+        s.drop_planet("a");
         assert_eq!(
             s.join("a", vec![screen("a1", 2)], [2, 4, 5]),
             Ok(vec![]),
             "nothing taken"
         );
         assert_eq!(owners(&s), [("p", vec![1, 3]), ("a", vec![2, 4, 5])]);
-        // Dropped again; meanwhile the primary makes 2 and 4 (its screen 2 among them).
-        s.drop_satellite("a");
+        // Dropped again; meanwhile the sun makes 2 and 4 (its screen 2 among them).
+        s.drop_planet("a");
         let mine = s.report("p", vec![screen("p1", 1), screen("p2", 2)], [1, 3, 4]);
         assert_eq!(mine, Ok(vec![]));
         let renames = s.join("a", vec![screen("a1", 2)], [2, 4, 5]);
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn workspace_goes_to_its_owner_or_is_made_on_the_focused_machine() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2, 5]).expect("joins");
         assert_eq!(s.workspace(3), Ok(Route::Local));
         assert_eq!(s.workspace(5), Ok(Route::On("a".into())));
@@ -524,7 +525,7 @@ mod tests {
 
     #[test]
     fn moves_never_cross_machines() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2, 5]).expect("joins");
         let refused = s.move_to_workspace("p", 5);
         assert_eq!(
@@ -534,7 +535,7 @@ mod tests {
                 machine: "a".into()
             })
         );
-        let refused = s.move_to_workspace("a", 1).expect_err("the primary's");
+        let refused = s.move_to_workspace("a", 1).expect_err("the sun's");
         assert_eq!(refused.to_string(), "workspace 1 is on p: windows never cross machines");
         // Its own, or one nobody has, which it makes; claimed by its next report, not here.
         assert_eq!(s.move_to_workspace("p", 3), Ok(()));
@@ -550,10 +551,10 @@ mod tests {
 
     #[test]
     fn a_report_is_a_rejoin_in_place() {
-        let mut s = primary();
+        let mut s = sun();
         s.join("a", vec![screen("a1", 2)], [2, 5]).expect("joins");
-        // a's 5 went away (empty, hidden) and it made 6; in a race it also made the primary's 3, and opened a screen
-        // numbered 1, the primary's too. Kept where free, taken ones renamed, as on a join.
+        // a's 5 went away (empty, hidden) and it made 6; in a race it also made the sun's 3, and opened a screen
+        // numbered 1, the sun's too. Kept where free, taken ones renamed, as on a join.
         let renames = s.report("a", vec![screen("a1", 2), screen("a2", 1)], [2, 3, 6]);
         assert_eq!(renames, Ok(vec![(1, 4), (3, 5)]));
         assert_eq!(owners(&s), [("p", vec![1, 3]), ("a", vec![2, 4, 5, 6])]);
@@ -580,15 +581,15 @@ mod tests {
         h: 1080,
     };
 
-    /// What a machine's `Stacks` tells the session: its screens and workspaces.
+    /// What a machine's `Stacks` tells the orrery: its screens and workspaces.
     fn state(st: &Stacks) -> (Vec<Screen>, Vec<u8>) {
         let screens = st.monitors().iter().map(|m| screen(m.name(), m.number())).collect();
         (screens, st.workspaces().iter().map(|w| w.number()).collect())
     }
 
     #[test]
-    fn stacks_follow_the_session_through_a_join_a_drop_and_a_rejoin() {
-        // The primary: screen 1, workspace 3 holding a window. The satellite: screen 1, workspace 2 holding one.
+    fn stacks_follow_the_system_through_a_join_a_drop_and_a_rejoin() {
+        // The sun: screen 1, workspace 3 holding a window. The planet: screen 1, workspace 2 holding one.
         let mut p = Stacks::new();
         p.add_monitor("p1", AREA, layout("wall"));
         p.workspace(3);
@@ -600,28 +601,28 @@ mod tests {
         a.open_stacked(10);
         a.workspace(1);
         let (screens, numbers) = state(&p);
-        let mut s = Session::new("p", screens, numbers).expect("valid");
+        let mut s = System::new("p", screens, numbers).expect("valid");
         // Join: a's 1 collides and goes to 4 (2 is kept), screen and all.
         let (screens, numbers) = state(&a);
         let renames = s.join("a", screens, numbers).expect("joins");
         assert_eq!(renames, [(1, 4)]);
-        assert_eq!(a.apply_session(&renames, s.foreign("a")), []);
-        assert_eq!(p.apply_session(&[], s.foreign("p")), []);
+        assert_eq!(a.apply_system(&renames, s.foreign("a")), []);
+        assert_eq!(p.apply_system(&[], s.foreign("p")), []);
         assert_eq!(a.monitors()[0].number(), 4);
         assert_eq!(
             state(&a).1,
             s.machines()[1].workspaces().iter().copied().collect::<Vec<_>>()
         );
-        // workspace 2 asked on the primary: a has it; on a itself it is local.
+        // workspace 2 asked on the sun: a has it; on a itself it is local.
         assert_eq!(p.workspace(2), Outcome::Remote(2));
         assert_eq!(s.workspace(2), Ok(Route::On("a".into())));
         assert_eq!(a.workspace(2), Outcome::Done);
         assert_eq!(a.move_to_workspace(3), Outcome::Remote(3));
         assert!(s.move_to_workspace("a", 3).is_err());
-        // Drop: a keeps everything, the primary forgets a's numbers and may make one of them.
-        assert!(s.drop_satellite("a"));
+        // Drop: a keeps everything, the sun forgets a's numbers and may make one of them.
+        assert!(s.drop_planet("a"));
         a.clear_foreign();
-        p.apply_session(&[], s.foreign("p"));
+        p.apply_system(&[], s.foreign("p"));
         assert!(p.foreign().is_empty());
         assert_eq!(p.workspace(2), Outcome::Done);
         p.open_stacked(2);
@@ -631,13 +632,13 @@ mod tests {
         let (screens, numbers) = state(&a);
         let renames = s.join("a", screens, numbers).expect("joins");
         assert_eq!(renames, [(2, 5)]);
-        assert_eq!(a.apply_session(&renames, s.foreign("a")), []);
+        assert_eq!(a.apply_system(&renames, s.foreign("a")), []);
         assert_eq!(a.where_is(10).map(|w| w.0), Some(5));
         assert_eq!(p.where_is(2).map(|w| w.0), Some(2));
         // A rename that fails (a made its target meanwhile) is handed back: a reports again.
         a.workspace(7);
         a.open_stacked(11);
-        assert_eq!(a.apply_session(&[(5, 7)], s.foreign("a")), [(5, 7)]);
+        assert_eq!(a.apply_system(&[(5, 7)], s.foreign("a")), [(5, 7)]);
         let (screens, numbers) = state(&a);
         assert_eq!(s.report("a", screens, numbers), Ok(vec![]));
         assert_eq!(s.owner(7).map(Machine::name), Some("a"));

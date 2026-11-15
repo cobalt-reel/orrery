@@ -51,12 +51,12 @@ fn moving_into_a_slot_focuses_it() {
     assert!(slot_count(&state) >= 3, "a layout with several slots");
     let first = other_slot(&state, &[focused_slot(&state)]);
     move_to(&o, slot_centre(&state, first));
-    support::session::wait("the hovered slot focused", &o, |s| {
+    support::system::wait("the hovered slot focused", &o, |s| {
         focused_slot(s) == Some(first as u64)
     });
     let second = other_slot(&state, &[focused_slot(&state), Some(first as u64)]);
     move_to(&o, slot_centre(&state, second));
-    support::session::wait("the next hovered slot focused", &o, |s| {
+    support::system::wait("the next hovered slot focused", &o, |s| {
         focused_slot(s) == Some(second as u64)
     });
     assert!(o.stop().success());

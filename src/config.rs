@@ -9,8 +9,8 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 use smithay::input::keyboard::{Keysym, XkbConfig, xkb};
 
 use crate::layout::{Dir, Layout, LayoutError, MAX_WEIGHT, SlotSpec};
-use crate::session::Role;
 use crate::stacks::WORKSPACES;
+use crate::system::Role;
 
 /// The built-in config, used when no file exists. Kept as a file so it can be copied to start a config; the
 /// manual shows it verbatim (tested).
@@ -72,7 +72,7 @@ pub enum Action {
     Close,
     ShowTabs,
     Quit,
-    /// Keyboard and pointer back to this machine from another in the session (the escape key): matched before
+    /// Keyboard and pointer back to this machine from another in the orrery (the escape key): matched before
     /// input is forwarded, so it works wherever input is.
     Reclaim,
     /// To console 1..=CONSOLES (bare metal; where the backend has none, logged and nothing else).
@@ -115,9 +115,9 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     pub colors: Colors,
     pub binds: Vec<Bind>,
-    /// This machine's place in a session of linked orrerys (`listen` or `primary`); None: alone.
+    /// This machine's place in an orrery of linked machines (`listen` or `sun`); None: alone.
     pub link: Option<LinkConfig>,
-    /// `name`: this machine's name in a session; None: its hostname.
+    /// `name`: this machine's name in an orrery; None: its hostname.
     pub name: Option<String>,
     pub keyboard: Keyboard,
     /// `spawn-at-start` lines, in order: programs run once when orrery starts (never on a reload).
@@ -208,16 +208,16 @@ impl Keyboard {
     }
 }
 
-/// A machine name (`name`, a satellite's Hello) is at most this many bytes.
+/// A machine name (`name`, a planet's Hello) is at most this many bytes.
 pub const MAX_NAME: usize = 64;
 
-/// `listen "ADDR:PORT" secret-file="PATH"` (the primary, `Role::Primary`) or `primary "HOST:PORT"
-/// secret-file="PATH"` (a satellite, `Role::Satellite`).
+/// `listen "ADDR:PORT" secret-file="PATH"` (the sun, `Role::Sun`) or `sun "HOST:PORT"
+/// secret-file="PATH"` (a planet, `Role::Planet`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
     pub role: Role,
-    /// The primary: the address it listens on (an IP address and a port; port 0 picks one). A satellite: where the
-    /// primary is (a host name or IP address, and a port).
+    /// The sun: the address it listens on (an IP address and a port; port 0 picks one). A planet: where the
+    /// sun is (a host name or IP address, and a port).
     pub addr: String,
     /// As written: absolute, or `~/` for the home directory (see `secret_path`).
     pub secret_file: String,
@@ -790,12 +790,12 @@ impl<'a> Parser<'a> {
                     }
                     colors = Some(self.colors(node));
                 }
-                which @ ("listen" | "primary") => {
+                which @ ("listen" | "sun") => {
                     match seen_link {
                         Some(w) if w == which => self.err(node, format!("`{which}` is set twice")),
                         Some(_) => self.err(
                             node,
-                            "`listen` and `primary` are both set: a machine is the primary or a satellite",
+                            "`listen` and `sun` are both set: a machine is the sun or a planet",
                         ),
                         None => {}
                     }
@@ -849,6 +849,11 @@ impl<'a> Parser<'a> {
                         ),
                     }
                 }
+                // The name this had before the sun and its planets.
+                "primary" => self.err(
+                    node,
+                    "`primary` is now `sun`: write `sun \"HOST:PORT\" secret-file=...`",
+                ),
                 other => self.err(node, format!("unknown node `{other}`")),
             }
         }
@@ -964,25 +969,22 @@ impl<'a> Parser<'a> {
         keyboard
     }
 
-    /// A `listen` or `primary` node.
+    /// A `listen` or `sun` node.
     fn link(&mut self, node: &KdlNode) -> Option<LinkConfig> {
         self.no_children(node);
         let which = node.name().value();
         let (role, msg) = match which {
             "listen" => (
-                Role::Primary,
+                Role::Sun,
                 "`listen` takes the address and port to listen on, like \"0.0.0.0:7340\"",
             ),
-            _ => (
-                Role::Satellite,
-                "`primary` takes the primary's HOST:PORT, like \"desk.lan:7340\"",
-            ),
+            _ => (Role::Planet, "`sun` takes the sun's HOST:PORT, like \"desk.lan:7340\""),
         };
         let file = self.props(node, &["secret-file"])[0];
         let addr = self.one_string(node, msg).and_then(|(addr, at)| {
             let ok = match role {
-                Role::Primary => addr.parse::<SocketAddr>().is_ok(),
-                Role::Satellite => host_port(&addr),
+                Role::Sun => addr.parse::<SocketAddr>().is_ok(),
+                Role::Planet => host_port(&addr),
             };
             if !ok {
                 self.err_at(at, msg);
@@ -2428,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_listens_or_follows_a_primary_and_has_a_name() {
+    fn a_machine_listens_or_follows_a_sun_and_has_a_name() {
         assert_eq!(
             (default_config().link, default_config().name),
             (None, None),
@@ -2441,26 +2443,30 @@ mod tests {
         assert_eq!(
             c.link,
             Some(LinkConfig {
-                role: Role::Primary,
+                role: Role::Sun,
                 addr: "0.0.0.0:7340".into(),
                 secret_file: "~/.config/orrery/secret".into(),
             })
         );
         assert_eq!(c.name.as_deref(), Some("desk"));
         let c = parse(&format!(
-            "{DEFAULT}\nprimary \"desk.lan:7340\" secret-file=\"/etc/orrery-secret\"\n"
+            "{DEFAULT}\nsun \"desk.lan:7340\" secret-file=\"/etc/orrery-secret\"\n"
         ))
         .expect("parses");
         assert_eq!(
             c.link,
             Some(LinkConfig {
-                role: Role::Satellite,
+                role: Role::Planet,
                 addr: "desk.lan:7340".into(),
                 secret_file: "/etc/orrery-secret".into(),
             })
         );
+        // The keyword's old name is refused with the new one.
+        let old = parse(&format!("{DEFAULT}\nprimary \"desk.lan:7340\" secret-file=\"/s\"\n"));
+        let said = old.expect_err("refused").to_string();
+        assert!(said.contains("`primary` is now `sun`"), "{said}");
         // A bracketed IPv6 address works for both.
-        parse(&format!("{DEFAULT}\nprimary \"[::1]:7340\" secret-file=\"/s\"\n")).expect("parses");
+        parse(&format!("{DEFAULT}\nsun \"[::1]:7340\" secret-file=\"/s\"\n")).expect("parses");
         parse(&format!("{DEFAULT}\nlisten \"[::]:7340\" secret-file=\"/s\"\n")).expect("parses");
         // `~/` is the home directory; any other path is taken as written.
         let link = c.link.expect("a link");
@@ -2488,13 +2494,13 @@ mod tests {
             ("listen \"desk:7340\" secret-file=\"/s\"", "address"),
             ("listen \"0.0.0.0\" secret-file=\"/s\"", "address"),
             ("listen \"0.0.0.0:70000\" secret-file=\"/s\"", "address"),
-            ("primary \"desk\" secret-file=\"/s\"", "HOST:PORT"),
-            ("primary \":7340\" secret-file=\"/s\"", "HOST:PORT"),
-            ("primary \"desk:port\" secret-file=\"/s\"", "HOST:PORT"),
-            ("primary \"desk:7340\" secret-file=\"s\"", "absolute"),
-            ("primary \"desk:7340\" secret-file=1", "string"),
-            ("primary \"desk:7340\" secret-file=\"/s\" key=\"x\"", "unknown property"),
-            ("primary \"desk:7340\" secret-file=\"/s\" {\n}", "block"),
+            ("sun \"desk\" secret-file=\"/s\"", "HOST:PORT"),
+            ("sun \":7340\" secret-file=\"/s\"", "HOST:PORT"),
+            ("sun \"desk:port\" secret-file=\"/s\"", "HOST:PORT"),
+            ("sun \"desk:7340\" secret-file=\"s\"", "absolute"),
+            ("sun \"desk:7340\" secret-file=1", "string"),
+            ("sun \"desk:7340\" secret-file=\"/s\" key=\"x\"", "unknown property"),
+            ("sun \"desk:7340\" secret-file=\"/s\" {\n}", "block"),
             ("name", "name"),
             ("name \"\"", "name"),
             ("name \"a\\tb\"", "name"),
@@ -2510,7 +2516,7 @@ mod tests {
             last + 1,
             "twice",
         );
-        let both = at_end("listen \"0.0.0.0:1\" secret-file=\"/s\"\nprimary \"desk:1\" secret-file=\"/s\"");
+        let both = at_end("listen \"0.0.0.0:1\" secret-file=\"/s\"\nsun \"desk:1\" secret-file=\"/s\"");
         assert_problem(&both, last + 1, "both");
     }
 

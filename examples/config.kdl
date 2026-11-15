@@ -76,7 +76,7 @@ binds {
     "Mod+Shift+Q" close           // as Hyprland's killactive
     "Mod+Space" show-tabs        // held: tab strips visible while down
     "Mod+Shift+E" quit
-    "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in a session)
+    "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in an orrery)
     "Mod+Ctrl+F1" vt 1           // to console 1 ... 12 (bare metal; elsewhere it does nothing)
     "Mod+Ctrl+F2" vt 2
     "Mod+Ctrl+F3" vt 3

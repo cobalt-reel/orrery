@@ -1,5 +1,5 @@
 //! Where input goes: the keyboard and pointer of the machine the user is at stay here, or travel over the link to
-//! the machine holding the session's focus marker.
+//! the machine holding the orrery's focus marker.
 //!
 //! Pure. Keyboard and pointer go to one place, here (`Place::Local`) or another machine. Every key and button is
 //! kept from press to release on the machine it went to. A handoff releases everything down on the machine input
@@ -69,7 +69,7 @@ impl Entry {
 /// Where keyboard and pointer go, and what is down there.
 #[derive(Debug, Clone)]
 pub struct Crossing {
-    /// This machine's name in the session.
+    /// This machine's name in the orrery.
     name: String,
     place: Place,
     /// Keys down where input is, each with whether it is a modifier key. Only there: a handoff releases or moves
@@ -223,7 +223,7 @@ impl Crossing {
     }
 }
 
-/// A screen in the row the pointer crosses, left to right: the session's monitors in order (`Session::monitors`),
+/// A screen in the row the pointer crosses, left to right: the orrery's monitors in order (`Orrery::monitors`),
 /// each machine's together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowScreen {
@@ -234,7 +234,7 @@ pub struct RowScreen {
 }
 
 /// The pointer left its machine's screens: past `edge` (the left of its first, the right of its last) at height `y`
-/// (a fraction). A satellite sends it as `Message::InputExit`; the primary finds where it lands with `landing`.
+/// (a fraction). A planet sends it as `Message::InputExit`; the sun finds where it lands with `landing`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Exit {
     pub edge: Edge,
@@ -683,11 +683,11 @@ mod tests {
         // Past the left of a machine's first screen.
         assert_eq!(exit(&row, 2, -1.0, 360.0), out(Edge::Left, 0.25));
         assert_eq!(exit(&row, 0, -1.0, 270.0), out(Edge::Left, 0.25));
-        assert_eq!(landing(&row, "p", Edge::Left, 0.25), None, "nothing before the primary");
+        assert_eq!(landing(&row, "p", Edge::Left, 0.25), None, "nothing before the sun");
         // Past the last machine: an exit to nowhere.
         assert_eq!(exit(&row, 3, 1280.0, 10.0), out(Edge::Right, 10.0 / 1024.0));
         assert_eq!(landing(&row, "b", Edge::Right, 0.5), None);
-        // A satellite knows only its own screens: both its outer edges are exits, which it reports (InputExit).
+        // A planet knows only its own screens: both its outer edges are exits, which it reports (InputExit).
         let own = [screen("a", "a1", 2560, 1440)];
         assert_eq!(exit(&own, 0, 2560.0, 360.0), out(Edge::Right, 0.25));
         assert_eq!(exit(&own, 0, -0.5, 360.0), out(Edge::Left, 0.25));

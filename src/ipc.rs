@@ -6,8 +6,8 @@ use crate::config::{Colors, Config, Cycle, parse_dir, workspace_number};
 use crate::crossing::RawKey;
 use crate::layout::{Dir, Rect};
 use crate::link::{Message, ScrollSource};
-use crate::session::{Role, Screen};
 use crate::stacks::{Stacks, WORKSPACES, WinId, Workspace};
+use crate::system::{Role, Screen};
 
 /// Read through `Wire`: every variant needs a twin there (a test fails to compile until it has one).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,7 +72,7 @@ pub enum Request {
     CloseScreen {
         name: String,
     },
-    /// `request` run on machine `machine` of the session (`orrery msg --to`), through the primary; never another
+    /// `request` run on machine `machine` of the orrery (`orrery msg --to`), through the sun; never another
     /// `to`.
     To {
         machine: String,
@@ -83,8 +83,8 @@ pub enum Request {
     Inject {
         input: Box<Message>,
     },
-    /// A testing aid, answered only by a primary started with `--debug-inject`: `message` (an input message: keymap,
-    /// handoff, key, motion, button, axis or release) sent as it is to satellite `machine`, as forwarding would.
+    /// A testing aid, answered only by a sun started with `--debug-inject`: `message` (an input message: keymap,
+    /// handoff, key, motion, button, axis or release) sent as it is to planet `machine`, as forwarding would.
     InjectRemote {
         machine: String,
         message: Box<Message>,
@@ -247,9 +247,9 @@ pub struct StateView {
     /// Recent spawns and whether a window has taken each (see `placement`), oldest first: a debug aid.
     #[serde(default)]
     pub launches: Vec<LaunchView>,
-    /// This machine's place in a session of linked orrerys; absent alone (no `listen` or `primary`).
+    /// This machine's place in an orrery of linked machines; absent alone (no `listen` or `sun`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<Box<SessionView>>,
+    pub orrery: Option<Box<SystemView>>,
     /// The config's colours, for programs drawing in orrery's (a bar).
     pub colors: ColorsView,
     /// The config's layouts, in config order (what `cycle-layout` steps through), for a picker to show; `state`
@@ -287,23 +287,23 @@ impl From<&Colors> for ColorsView {
     }
 }
 
-/// A machine in a session: who it is, where it links, and the machines it knows. The primary knows every machine
-/// in the session; a satellite only itself (and which numbers the others own).
+/// A machine in an orrery: who it is, where it links, and the machines it knows. The sun knows every machine
+/// in the orrery; a planet only itself (and which numbers the others own).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionView {
+pub struct SystemView {
     /// This machine's name.
     pub machine: String,
     pub role: Role,
-    /// The primary: the address it listens on, the port picked when it was given 0; absent while not listening.
+    /// The sun: the address it listens on, the port picked when it was given 0; absent while not listening.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
-    /// A satellite: the primary's address, as configured.
+    /// A planet: the sun's address, as configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary: Option<String>,
-    /// The primary: itself, then the satellites in join order. A satellite: itself.
+    pub sun: Option<String>,
+    /// The sun: itself, then the planets in join order. A planet: itself.
     pub machines: Vec<MachineView>,
-    /// Where this machine's keyboard and pointer go: the machine holding the focus marker, on the primary; a
-    /// satellite's own devices stay on it.
+    /// Where this machine's keyboard and pointer go: the machine holding the focus marker, on the sun; a
+    /// planet's own devices stay on it.
     pub input: String,
     /// The workspace numbers other machines own here: switching or moving to them is not done on this machine.
     pub foreign: Vec<u8>,
@@ -319,14 +319,14 @@ pub struct MachineView {
     pub monitors: Vec<Screen>,
     /// The workspace numbers it owns, its screens' among them.
     pub workspaces: Vec<u8>,
-    /// The round trip of its link to the primary (to this machine, for a satellite's own view); null for the
-    /// primary itself, before the first answer to a ping and while one is overdue.
+    /// The round trip of its link to the sun (to this machine, for a planet's own view); null for the
+    /// sun itself, before the first answer to a ping and while one is overdue.
     pub latency_ms: Option<u64>,
-    /// Its link is up (on the primary every machine in the session is).
+    /// Its link is up (on the sun every machine in the orrery is).
     pub connected: bool,
-    /// It holds the session's focus marker: `workspace N` last went to it (the primary's view only).
+    /// It holds the orrery's focus marker: `workspace N` last went to it (the sun's view only).
     pub focused: bool,
-    /// The primary's input waiting for this machine's link to take more (motion merged): a stalled link shows here.
+    /// The sun's input waiting for this machine's link to take more (motion merged): a stalled link shows here.
     #[serde(default)]
     pub queued: usize,
 }
@@ -546,7 +546,7 @@ impl StateView {
             dmabuf: None,
             last_key: None,
             launches: Vec::new(),
-            session: None,
+            orrery: None,
             colors: colors.into(),
             layouts: Vec::new(),
         }
@@ -1197,14 +1197,14 @@ mod tests {
                 age_ms: 120,
                 claimed: false,
             }],
-            session: Some(Box::new(SessionView {
+            orrery: Some(Box::new(SystemView {
                 machine: "desk".into(),
-                role: Role::Primary,
+                role: Role::Sun,
                 listen: Some("127.0.0.1:7340".into()),
-                primary: None,
+                sun: None,
                 machines: vec![MachineView {
                     name: "desk".into(),
-                    role: Role::Primary,
+                    role: Role::Sun,
                     monitors: vec![Screen {
                         name: "winit".into(),
                         number: 1,
@@ -1244,17 +1244,17 @@ mod tests {
             "{}",
             json(&r)
         );
-        let session = concat!(
-            r#""session":{"machine":"desk","role":"primary","listen":"127.0.0.1:7340","machines":[{"name":"desk","#,
-            r#""role":"primary","monitors":[{"name":"winit","number":1}],"workspaces":[1,4],"latency_ms":null,"#,
+        let system = concat!(
+            r#""orrery":{"machine":"desk","role":"sun","listen":"127.0.0.1:7340","machines":[{"name":"desk","#,
+            r#""role":"sun","monitors":[{"name":"winit","number":1}],"workspaces":[1,4],"latency_ms":null,"#,
             r#""connected":true,"focused":true,"queued":0}],"input":"desk","foreign":[2],"error":null}"#
         );
-        assert!(json(&r).contains(session), "{}", json(&r));
+        assert!(json(&r).contains(system), "{}", json(&r));
         let alone = Response::with_state(StateView {
-            session: None,
+            orrery: None,
             ..state_view()
         });
-        assert!(!json(&alone).contains("session"), "absent alone");
+        assert!(!json(&alone).contains("orrery"), "absent alone");
         let workspaces = concat!(
             r#""workspaces":[{"number":4,"monitor":"winit","shown":false,"layout":"halves","#,
             r#""focused_slot":1,"slots":[]}]"#

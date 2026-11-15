@@ -125,8 +125,8 @@ echo "include \"$PWD/examples/kitty/orrery.kdl\"" >> /tmp/orrery-try.kdl
       was.
 - [ ] `Super+D`: the launcher appears centred over everything and takes typing; type a name, Enter: the program
       opens as a new tab in the focused slot; `Super+D` then Escape: it goes, nothing started.
-- [ ] In a linked session (Linking machines): the bar's right shows the machines, the one with input in the focus
-      colour; `Super+2` to the satellite moves it.
+- [ ] In a linked orrery (Linking machines): the bar's right shows the machines, the one with input in the focus
+      colour; `Super+2` to the planet moves it.
 - [ ] Quit orrery: within a minute no `bars.py` or `bar.py` is left running (`pgrep -f bars.py`).
 - [ ] desktop-ui (optional): after the steps above, a file dialog (e.g. a browser's Save As) is kitty's chooser,
       and `kitten desktop-ui set-color-scheme dark` turns a portal-following program dark.

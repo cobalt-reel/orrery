@@ -28,7 +28,7 @@
 //! window, so client textures are shared; each window has its own EGL surface, made current before its frame (EGL
 //! reports the buffer age only for the current surface), with swap interval 0, and its own damage tracker.
 //!
-//! **Input away.** While the primary's input is on another machine (`Orrery::input_away`), the host's pointer is
+//! **Input away.** While the sun's input is on another machine (`Orrery::input_away`), the host's pointer is
 //! hidden and held: locked in place (Wayland's pointer constraints; a window that cannot lock lets every lock go),
 //! else confined to the window it is in, or the next of ours it enters (X11; again when that window closes), else
 //! only hidden (logged once); windows opened meanwhile are held too, and one that cannot lock lets every lock go.

@@ -8,7 +8,7 @@
 //! one place, and does nothing when it cannot apply (an edge, an empty slot, an unknown id). The state is private
 //! so nothing outside these methods can break that; callers read it through accessors.
 //!
-//! In a session (`session.rs`) some numbers are owned by other machines: they never exist here, and switching or
+//! In an orrery (`orrery.rs`) some numbers are owned by other machines: they never exist here, and switching or
 //! moving to one says so (`Outcome::Remote`) instead of making it. Alone, no number is.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,7 +85,7 @@ pub enum Outcome {
     Done,
     /// Nothing to do (see each method).
     Nothing,
-    /// Another machine owns that number: nothing was done here, the session decides.
+    /// Another machine owns that number: nothing was done here, the orrery decides.
     Remote(u8),
 }
 
@@ -493,7 +493,7 @@ impl Stacks {
     /// Shows workspace `n` on the monitor it lives on and focuses that monitor; one that does not exist is made on
     /// the focused monitor from its default layout. The workspace that monitor showed goes if it is not locked and
     /// holds no window. Nothing outside 1..=WORKSPACES or without a monitor; `Remote` for a number owned elsewhere.
-    // No #[must_use]: alone it is never `Remote`, and the outcome is only news to a session.
+    // No #[must_use]: alone it is never `Remote`, and the outcome is only news to an orrery.
     pub fn workspace(&mut self, n: u8) -> Outcome {
         if !(1..=WORKSPACES).contains(&n) {
             return Outcome::Nothing;
@@ -565,11 +565,11 @@ impl Stacks {
         self.foreign.clear();
     }
 
-    /// What the session says, applied in the one safe order: the old foreign numbers go, then `renames` (from a
+    /// What the orrery says, applied in the one safe order: the old foreign numbers go, then `renames` (from a
     /// join or a report) are made with `renumber_workspace`, then `foreign` is set. Returns the renames that failed
     /// (a workspace made here meanwhile on the target, or the source gone): the caller reports again, and the
-    /// session heals the collision then.
-    pub fn apply_session(&mut self, renames: &[(u8, u8)], foreign: impl IntoIterator<Item = u8>) -> Vec<(u8, u8)> {
+    /// orrery heals the collision then.
+    pub fn apply_system(&mut self, renames: &[(u8, u8)], foreign: impl IntoIterator<Item = u8>) -> Vec<(u8, u8)> {
         self.clear_foreign();
         let failed = (renames.iter().copied())
             .filter(|&(from, to)| !self.renumber_workspace(from, to))
@@ -2722,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_renames_then_sets_what_is_owned_elsewhere() {
+    fn apply_system_renames_then_sets_what_is_owned_elsewhere() {
         // Screen 1 shows 1; 3 hidden holds [1]. Stale foreign numbers from before.
         let mut s = wall_monitor();
         s.workspace(3);
@@ -2730,7 +2730,7 @@ mod tests {
         s.workspace(1);
         s.set_foreign([4, 5]);
         // 4 was foreign: the old set goes first, so renaming onto it works.
-        assert_eq!(s.apply_session(&[(1, 4), (3, 5)], [1, 2, 3]), []);
+        assert_eq!(s.apply_system(&[(1, 4), (3, 5)], [1, 2, 3]), []);
         assert_invariants(&s);
         assert_eq!(numbers(&s), [4]);
         assert_eq!(workspaces(&s), [(4, 0), (5, 0)]);
@@ -2739,7 +2739,7 @@ mod tests {
         s.set_foreign([]);
         s.workspace(6);
         s.open_stacked(2);
-        assert_eq!(s.apply_session(&[(5, 6), (8, 9)], [5, 7]), [(5, 6), (8, 9)]);
+        assert_eq!(s.apply_system(&[(5, 6), (8, 9)], [5, 7]), [(5, 6), (8, 9)]);
         assert_eq!(workspaces(&s), [(4, 0), (5, 0), (6, 0)]);
         assert_eq!(s.foreign(), &BTreeSet::from([7]), "here wins");
         assert_invariants(&s);

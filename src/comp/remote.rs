@@ -1,9 +1,9 @@
-//! Input from the primary, on a satellite holding the session's focus marker: what it sends runs through this
+//! Input from the sun, on a planet holding the orrery's focus marker: what it sends runs through this
 //! machine's own input path (`input`), binds included, on this machine's clock; everything it pressed is released
 //! when input leaves (a Release, or the link drops), and this machine's keymap is back, on the layout it was on. The
-//! primary's keymap comes once per link (and when it changes) and is used again at each Handoff. Its pointer moves
+//! sun's keymap comes once per link (and when it changes) and is used again at each Handoff. Its pointer moves
 //! here by relative motion, kept on this machine's screens; pushed out past their outer edges it stops at the edge,
-//! holds still until the next Handoff, and the primary is told where it left (InputExit).
+//! holds still until the next Handoff, and the sun is told where it left (InputExit).
 //!
 //! Also `inject`, a testing aid: input as if from this machine's own devices (`forward`).
 
@@ -20,25 +20,25 @@ use crate::ipc::Response;
 use crate::layout::Rect;
 use crate::link::{Message, ScrollSource};
 
-/// What the primary's input has down here. No Debug: it holds keycodes, and keystrokes are never logged.
+/// What the sun's input has down here. No Debug: it holds keycodes, and keystrokes are never logged.
 #[derive(Default)]
 pub struct Remote {
     /// Keys (xkb keycodes) and buttons it pressed and has not released.
     keys: BTreeSet<u32>,
     buttons: BTreeSet<u32>,
-    /// This machine's keymap (xkb text) and the layout it was on, while the primary's is in use.
+    /// This machine's keymap (xkb text) and the layout it was on, while the sun's is in use.
     local_keymap: Option<(String, Layout)>,
-    /// The primary's keymap, as last sent: used at each Handoff, until the link drops.
-    primary_keymap: Option<String>,
+    /// The sun's keymap, as last sent: used at each Handoff, until the link drops.
+    sun_keymap: Option<String>,
     /// The pointer left past an outer edge (InputExit sent): it holds still until the next Handoff, so motion still
     /// on its way here never pulls it back.
     exited: bool,
-    /// The primary's input is here (a Handoff, until a Release or the link drops): orrery draws the pointer.
+    /// The sun's input is here (a Handoff, until a Release or the link drops): orrery draws the pointer.
     active: bool,
 }
 
 impl Remote {
-    /// Its keys were released another way (`keyboard_focus_lost`): their releases from the primary go nowhere.
+    /// Its keys were released another way (`keyboard_focus_lost`): their releases from the sun go nowhere.
     pub fn forget_keys(&mut self) {
         self.keys.clear();
     }
@@ -109,7 +109,7 @@ impl Orrery {
             .collect()
     }
 
-    /// An input message from the primary (`Message::is_input`): Ok with the message to answer (an InputExit), or
+    /// An input message from the sun (`Message::is_input`): Ok with the message to answer (an InputExit), or
     /// Err when the link must close (a keymap that does not compile). Its times are not used: clients get this
     /// machine's clock.
     pub(super) fn remote_input(&mut self, msg: Message) -> Result<Option<Message>, String> {
@@ -117,16 +117,16 @@ impl Orrery {
         match msg {
             Message::Keymap { xkb } => {
                 self.remote_keymap(xkb.0.clone())?;
-                self.remote.primary_keymap = Some(xkb.0);
+                self.remote.sun_keymap = Some(xkb.0);
             }
             Message::Handoff { mods, pointer, layout } => {
                 self.remote.exited = false;
                 self.remote.active = true;
                 if self.remote.local_keymap.is_none()
-                    && let Some(text) = self.remote.primary_keymap.clone()
+                    && let Some(text) = self.remote.sun_keymap.clone()
                     && let Err(e) = self.remote_keymap(text)
                 {
-                    tracing::warn!("cannot use the primary's keymap again: {e}");
+                    tracing::warn!("cannot use the sun's keymap again: {e}");
                 }
                 if self.remote.local_keymap.is_some() {
                     self.select_layout(Layout(layout));
@@ -167,7 +167,7 @@ impl Orrery {
         Ok(None)
     }
 
-    /// A key from the primary: a press of a key it has down already (a modifier a Handoff announced again), or a
+    /// A key from the sun: a press of a key it has down already (a modifier a Handoff announced again), or a
     /// release of one it does not, goes nowhere.
     fn remote_key(&mut self, code: u32, pressed: bool) {
         let went = match pressed {
@@ -179,7 +179,7 @@ impl Orrery {
         }
     }
 
-    /// The primary's keymap, for its keys from now on; this machine's own is kept to go back to.
+    /// The sun's keymap, for its keys from now on; this machine's own is kept to go back to.
     fn remote_keymap(&mut self, text: String) -> Result<(), String> {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return Ok(());
@@ -197,7 +197,7 @@ impl Orrery {
         Ok(())
     }
 
-    /// Relative motion from the primary: the pointer moves on this machine's screens, or to an outer edge and
+    /// Relative motion from the sun: the pointer moves on this machine's screens, or to an outer edge and
     /// out (the InputExit to send), then holds still until the next Handoff.
     fn remote_motion(&mut self, dx: f64, dy: f64) -> Option<Message> {
         if self.remote.exited {
@@ -222,7 +222,7 @@ impl Orrery {
         })
     }
 
-    /// Input left (a Release, or the link to the primary dropped): every key and button the primary has down is
+    /// Input left (a Release, or the link to the sun dropped): every key and button the sun has down is
     /// released, through the usual path, and this machine's keymap is back.
     pub(super) fn remote_release(&mut self) {
         let keys = std::mem::take(&mut self.remote.keys);
@@ -244,7 +244,7 @@ impl Orrery {
         self.remote.active = false;
     }
 
-    /// The primary's keymap is in use, this machine's own kept to come back to.
+    /// The sun's keymap is in use, this machine's own kept to come back to.
     pub(super) fn keymap_kept(&self) -> bool {
         self.remote.local_keymap.is_some()
     }
@@ -260,7 +260,7 @@ impl Orrery {
         }
     }
 
-    /// The primary's input is here: the pointer it moves is drawn here (`render::cursor_draw`).
+    /// The sun's input is here: the pointer it moves is drawn here (`render::cursor_draw`).
     #[must_use]
     pub fn remote_input_active(&self) -> bool {
         self.remote.active
@@ -281,11 +281,11 @@ impl Orrery {
         });
     }
 
-    /// The link to the primary dropped, joined or not: everything it had down here goes up, and its keymap is
+    /// The link to the sun dropped, joined or not: everything it had down here goes up, and its keymap is
     /// forgotten (the next link sends it again).
     pub(super) fn remote_lost(&mut self) {
         self.remote_release();
-        self.remote.primary_keymap = None;
+        self.remote.sun_keymap = None;
     }
 
     /// This machine's keymap as xkb text, and the layout it is on.

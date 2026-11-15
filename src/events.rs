@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{ColorsView, LayerView, SessionView, StateView, TabView, WindowView};
+use crate::ipc::{ColorsView, LayerView, StateView, SystemView, TabView, WindowView};
 use crate::layout::Rect;
 use crate::stacks::WinId;
 
@@ -48,8 +48,8 @@ pub enum Event {
     Layout { screens: Vec<ScreenLayout> },
     /// Each screen's layer surfaces.
     Layers { screens: Vec<ScreenLayers> },
-    /// The session (machines, links, where input is); null alone.
-    Session { session: Option<Box<SessionView>> },
+    /// The orrery (machines, links, where input is); null alone.
+    Orrery { orrery: Option<Box<SystemView>> },
     /// The config was read again: why it was not used (null when it was), and the colours in force.
     Config { error: Option<String>, colors: ColorsView },
 }
@@ -127,7 +127,7 @@ pub struct Summary {
     attention: Event,
     layout: Event,
     layers: Event,
-    session: Option<SessionView>,
+    system: Option<SystemView>,
     /// The number of config reads so far, and the event telling about the last.
     config: (u64, Event),
 }
@@ -223,13 +223,13 @@ impl Summary {
             attention,
             layout,
             layers,
-            session: view.session.as_deref().cloned(),
+            system: view.orrery.as_deref().cloned(),
             config: (reads, config),
         }
     }
 
     /// The events leading from `self` (sent last) to `now`, in this order: workspace, layout, focus, tabs, titles
-    /// and closed windows (by window id), attention, layers, session, config.
+    /// and closed windows (by window id), attention, layers, orrery, config.
     #[must_use]
     pub fn events(&self, now: &Summary) -> Vec<Event> {
         let changed = |was: &Event, is: &Event| (was != is).then(|| is.clone());
@@ -250,7 +250,7 @@ impl Summary {
         let closed = (self.titles.keys())
             .filter(|w| !now.titles.contains_key(w))
             .map(|&id| Event::Closed { id });
-        let session = self.session.as_ref().map(steady) != now.session.as_ref().map(steady);
+        let system = self.system.as_ref().map(steady) != now.system.as_ref().map(steady);
         let mut events: Vec<Event> = [
             changed(&self.workspace, &now.workspace),
             changed(&self.layout, &now.layout),
@@ -266,8 +266,8 @@ impl Summary {
             [
                 changed(&self.attention, &now.attention),
                 changed(&self.layers, &now.layers),
-                session.then(|| Event::Session {
-                    session: now.session.clone().map(Box::new),
+                system.then(|| Event::Orrery {
+                    orrery: now.system.clone().map(Box::new),
                 }),
                 (self.config != now.config).then(|| now.config.1.clone()),
             ]
@@ -278,9 +278,9 @@ impl Summary {
     }
 }
 
-/// A session without what moves all the time (link latencies, queued input): what a change of is news.
-fn steady(session: &SessionView) -> SessionView {
-    let mut s = session.clone();
+/// An orrery without what moves all the time (link latencies, queued input): what a change of is news.
+fn steady(system: &SystemView) -> SystemView {
+    let mut s = system.clone();
     for m in &mut s.machines {
         m.latency_ms = None;
         m.queued = 0;
@@ -294,8 +294,8 @@ mod tests {
     use crate::config::{Colors, default_config};
     use crate::ipc::{LayerName, MachineView};
     use crate::layout::Dir;
-    use crate::session::Role;
     use crate::stacks::Stacks;
+    use crate::system::Role;
     use std::collections::{BTreeSet, HashMap};
 
     const UHD: Rect = Rect {
@@ -313,7 +313,7 @@ mod tests {
         error: Option<String>,
         colors: Colors,
         layers: Vec<LayerView>,
-        session: Option<SessionView>,
+        system: Option<SystemView>,
     }
 
     impl World {
@@ -330,7 +330,7 @@ mod tests {
                 error: None,
                 colors: Colors::default(),
                 layers: Vec::new(),
-                session: None,
+                system: None,
             }
         }
 
@@ -344,7 +344,7 @@ mod tests {
                 (Some(format!("app{w}")), self.titles.get(&w).cloned())
             });
             v.monitors[0].layers = self.layers.clone();
-            v.session = self.session.clone().map(Box::new);
+            v.orrery = self.system.clone().map(Box::new);
             v
         }
 
@@ -565,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_session_and_config_have_their_events() {
+    fn layers_system_and_config_have_their_events() {
         let mut w = World::new();
         let bar = LayerView {
             namespace: "bar".into(),
@@ -588,7 +588,7 @@ mod tests {
 
         let machine = MachineView {
             name: "desk".into(),
-            role: Role::Primary,
+            role: Role::Sun,
             monitors: vec![],
             workspaces: vec![1],
             latency_ms: None,
@@ -596,36 +596,36 @@ mod tests {
             focused: true,
             queued: 0,
         };
-        let session = SessionView {
+        let system = SystemView {
             machine: "desk".into(),
-            role: Role::Primary,
+            role: Role::Sun,
             listen: None,
-            primary: None,
+            sun: None,
             machines: vec![machine],
             input: "desk".into(),
             foreign: vec![],
             error: None,
         };
-        let events = after(&mut w, |w| w.session = Some(session.clone()));
+        let events = after(&mut w, |w| w.system = Some(system.clone()));
         assert_eq!(
             events,
-            [Event::Session {
-                session: Some(Box::new(session))
+            [Event::Orrery {
+                orrery: Some(Box::new(system))
             }]
         );
         // Pings and queues move all the time: not news by themselves, though the next event carries them.
         let events = after(&mut w, |w| {
-            let m = &mut w.session.as_mut().unwrap().machines[0];
+            let m = &mut w.system.as_mut().unwrap().machines[0];
             m.latency_ms = Some(3);
             m.queued = 2;
         });
         assert_eq!(events, []);
-        let events = after(&mut w, |w| w.session.as_mut().unwrap().input = "side".into());
-        let Event::Session { session: Some(s) } = &events[0] else {
+        let events = after(&mut w, |w| w.system.as_mut().unwrap().input = "side".into());
+        let Event::Orrery { orrery: Some(s) } = &events[0] else {
             panic!("{events:?}");
         };
         assert_eq!((s.input.as_str(), s.machines[0].latency_ms), ("side", Some(3)));
-        assert_eq!(after(&mut w, |w| w.session = None), [Event::Session { session: None }]);
+        assert_eq!(after(&mut w, |w| w.system = None), [Event::Orrery { orrery: None }]);
 
         // Every read of the config is an event, the same result again too.
         let events = after(&mut w, |w| w.reads += 1);
@@ -672,8 +672,8 @@ mod tests {
             r#"{"event":"attention","windows":[4],"workspaces":[2]}"#
         );
         assert_eq!(
-            json(&Event::Session { session: None }),
-            r#"{"event":"session","session":null}"#
+            json(&Event::Orrery { orrery: None }),
+            r#"{"event":"orrery","orrery":null}"#
         );
         let mut w = World::new();
         w.open(1, "one");

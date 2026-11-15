@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn events_go_one_line_each() {
         let events = [
-            Event::Session { session: None },
+            Event::Orrery { orrery: None },
             Event::Attention {
                 windows: vec![1],
                 workspaces: vec![2],
@@ -309,7 +309,7 @@ mod tests {
         ];
         assert_eq!(
             String::from_utf8(lines(&events)).unwrap(),
-            "{\"event\":\"session\",\"session\":null}\n{\"event\":\"attention\",\"windows\":[1],\"workspaces\":[2]}\n"
+            "{\"event\":\"orrery\",\"orrery\":null}\n{\"event\":\"attention\",\"windows\":[1],\"workspaces\":[2]}\n"
         );
     }
 }

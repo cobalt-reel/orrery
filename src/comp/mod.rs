@@ -481,9 +481,9 @@ pub struct Orrery {
     pub consoles: Option<Box<dyn Consoles>>,
     /// How long frames take to draw (backends with a renderer record them).
     frames: frames::FrameStats,
-    /// This machine in a session of linked orrerys; None alone.
+    /// This machine in an orrery of linked machines; None alone.
     net: Option<net::Net>,
-    /// What the primary's input has down here (a satellite holding the focus marker).
+    /// What the sun's input has down here (a planet holding the focus marker).
     remote: remote::Remote,
     /// `inject` and `inject-remote` are answered (`--debug-inject`, a testing aid).
     debug_inject: bool,
@@ -1060,7 +1060,7 @@ impl Orrery {
         self.popups.cleanup();
     }
 
-    /// orrery draws the pointer: input from the primary moves it, or the backend has no cursor of its own and input is
+    /// orrery draws the pointer: input from the sun moves it, or the backend has no cursor of its own and input is
     /// here (while it is away the pointer is held, and hidden as nested).
     #[must_use]
     pub fn pointer_drawn(&self) -> bool {
@@ -1086,13 +1086,13 @@ impl Orrery {
         }
     }
 
-    /// One request, from the socket, a key or the primary. Pure requests go through the stacks and are arranged;
-    /// in a session `workspace` and `move-to-workspace` go through it first. A `to` for another machine is sent
+    /// One request, from the socket, a key or the sun. Pure requests go through the stacks and are arranged;
+    /// in an orrery `workspace` and `move-to-workspace` go through it first. A `to` for another machine is sent
     /// there and answered ok at once (its answer, an error, is logged): the control socket uses `link_forward`.
     pub fn handle_request(&mut self, request: Request) -> Response {
         match request {
-            Request::Workspace { number } if self.net.is_some() => self.session_workspace(number),
-            Request::MoveToWorkspace { number } if self.net.is_some() => self.session_move(number),
+            Request::Workspace { number } if self.net.is_some() => self.system_workspace(number),
+            Request::MoveToWorkspace { number } if self.net.is_some() => self.system_move(number),
             Request::To { machine, request } => {
                 let to = machine.clone();
                 let logged = Box::new(move |r: Response| {
@@ -1168,10 +1168,10 @@ impl Orrery {
     /// `stacking_after_reload` says; the keyboard as `apply_keyboard` says) and clears `config_error`; a broken one
     /// leaves everything as it was and sets `config_error`, which shows as the red bar until a good config loads. A
     /// file gone while running (an editor between delete and write, say) keeps the running config: the built-in one
-    /// stands in only at startup. That is an error answer for `reload` but not a `config_error`. In a session the
+    /// stands in only at startup. That is an error answer for `reload` but not a `config_error`. In an orrery the
     /// secret file is read again too: a different secret drops every link (they open again on it), and one that
     /// cannot be read is the `config_error` and this answer's error, the config being applied all the same.
-    /// `listen`, `primary` (the `secret-file` path too) and `name` take effect on the next start.
+    /// `listen`, `sun` (the `secret-file` path too) and `name` take effect on the next start.
     pub fn reload(&mut self) -> Result<(), String> {
         let Some(path) = self.config_path.clone() else {
             return Err("no config path (neither --config, XDG_CONFIG_HOME nor HOME): nothing to reload".into());
@@ -1198,7 +1198,7 @@ impl Orrery {
                 self.stacking = stacking_after_reload(self.stacking, &self.config, &config);
                 if (&self.config.link, &self.config.name) != (&config.link, &config.name) {
                     tracing::warn!(
-                        "`listen`, `primary`, their `secret-file` path or `name` changed: they take effect when {NAME} \
+                        "`listen`, `sun`, their `secret-file` path or `name` changed: they take effect when {NAME} \
                          starts again (the secret file's contents are read again now)"
                     );
                 }
@@ -1289,7 +1289,7 @@ impl Orrery {
         for monitor in &mut view.monitors {
             monitor.layers = self.layer_views(&monitor.name);
         }
-        view.session = self.session_view().map(Box::new);
+        view.orrery = self.system_view().map(Box::new);
         view
     }
 

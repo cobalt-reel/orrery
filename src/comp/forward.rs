@@ -1,10 +1,10 @@
 //! Input from this machine's own devices (a backend, `inject`): here, through the usual path (`input`), or, on the
-//! primary while the session's focus marker is on another machine, over the link to it (`Crossing` decides, each
+//! sun while the orrery's focus marker is on another machine, over the link to it (`Crossing` decides, each
 //! machine's `Outbox` in `net` carries it). The escape key (`reclaim`) is matched first and never forwarded. Input
 //! follows the marker: a `workspace` that moves it, the pointer pushed past this machine's outer edges or past a
-//! satellite's (its InputExit), the escape key, a link drop.
+//! planet's (its InputExit), the escape key, a link drop.
 //!
-//! A machine alone or a satellite has no `Crossing`: its devices' input stays here.
+//! A machine alone or a planet has no `Crossing`: its devices' input stays here.
 
 use smithay::backend::input::{ButtonState, KeyState};
 use smithay::input::keyboard::{Keycode, Keysym};
@@ -125,7 +125,7 @@ impl Orrery {
         }
     }
 
-    /// The session's focus marker may have moved (a `workspace`): input goes where it is now.
+    /// The orrery's focus marker may have moved (a `workspace`): input goes where it is now.
     pub(super) fn input_follow_marker(&mut self) {
         let Some(to) = self.marker() else {
             return;
@@ -136,7 +136,7 @@ impl Orrery {
     }
 
     /// Machine `from`'s pointer left its screens past `edge` at height `y`: onto the machine beside it there, the
-    /// marker along. While input is on a satellite that never lands (past the row's end, or a button down), it is
+    /// marker along. While input is on a planet that never lands (past the row's end, or a button down), it is
     /// handed input again, or its pointer would stay held at the edge. Only from where input is: an exit sent before
     /// input left that machine moves nothing.
     pub(super) fn input_cross(&mut self, from: &str, edge: Edge, y: f64) {
@@ -176,8 +176,8 @@ impl Orrery {
         }
     }
 
-    /// Satellite `machine`'s link dropped: input comes back here if it was there (it releases what it has down on
-    /// its own drop). The session moved the marker home itself.
+    /// Planet `machine`'s link dropped: input comes back here if it was there (it releases what it has down on
+    /// its own drop). The orrery moved the marker home itself.
     pub(super) fn input_lost(&mut self, machine: &str) {
         if let Some(h) = self.crossing().and_then(|c| c.link_lost(machine)) {
             self.input_go(h);

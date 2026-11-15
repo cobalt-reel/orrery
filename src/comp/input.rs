@@ -359,7 +359,7 @@ impl Orrery {
     }
 
     /// The config's `keyboard` on the seat where it differs from `old`: a new keymap goes to every client (while the
-    /// primary's keymap is in use, it is the one that comes back after), on the layout in use when the layouts are
+    /// sun's keymap is in use, it is the one that comes back after), on the layout in use when the layouts are
     /// the same (other options, say), new repeat info too. Err when xkb cannot
     /// build the keymap (the old one stays).
     pub fn apply_keyboard(&mut self, old: &Keyboard) -> Result<(), String> {
@@ -405,7 +405,7 @@ impl Orrery {
         if let Some(keyboard) = self.seat.get_keyboard() {
             self.release_keys(keyboard.pressed_keys());
         }
-        // Released too: the primary's release of one of them now goes nowhere.
+        // Released too: the sun's release of one of them now goes nowhere.
         self.remote.forget_keys();
         self.held.clear();
     }
@@ -430,7 +430,7 @@ impl Orrery {
         u32::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u32::MAX)
     }
 
-    /// A key went down or up, on this machine's keyboard or the primary's: a press matching a bind runs its action
+    /// A key went down or up, on this machine's keyboard or the sun's: a press matching a bind runs its action
     /// (see `Held`), anything else goes to the focused client.
     pub fn key_input(&mut self, code: Keycode, key_state: KeyState, time: u32) {
         let Some(keyboard) = self.seat.get_keyboard() else {

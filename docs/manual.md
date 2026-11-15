@@ -117,7 +117,7 @@ such as kitty or foot) or with `orrery msg spawn`.
   moving as for any screen; the others close the gap. `open-screen` and `close-screen` answer that the monitors
   decide, and so does a second `orrery run` (it joins the running orrery, which says so).
 - **Input:** keyboards, mice and touchpads through libinput, with the `keyboard` block (or `XKB_DEFAULT_*`). The pointer
-  moves over the screens and stops at their edges (in a session of linked machines, pushed past the outer edges it
+  moves over the screens and stops at their edges (in an orrery of linked machines, pushed past the outer edges it
   crosses as nested). orrery draws the pointer: the cursor the client under it asked for, else the named cursor from
   the xcursor theme (`XCURSOR_THEME` and `XCURSOR_SIZE`, default `default` and 24), else a small light square.
 - **Consoles:** `Super+Ctrl+F1` ... `F12` and `Ctrl+Alt+F1` ... `F12` switch consoles (they are binds, so they work
@@ -165,7 +165,7 @@ keys back. Or change the modifier with `mod "..."` in the config (a combination 
 | `Super+Shift+Q` | close the focused window (asks it to close) |
 | `Super+Space` (held) | show tab strips along the top of each slot holding more than one window: one segment per tab, the current tab bright, pips for its depth |
 | `Super+Shift+E` | quit orrery |
-| `Super+Escape` | in a session: keyboard and pointer back to this machine (see Input crossing) |
+| `Super+Escape` | in an orrery: keyboard and pointer back to this machine (see Input crossing) |
 | `Super+Ctrl+F1` ... `F12`, `Ctrl+Alt+F1` ... `F12` | switch to console 1 ... 12 (bare metal; nested and headless they do nothing but log) |
 
 A slot holding more than one window (in any tab, at any depth), or a marked one (below), shows a small badge in its
@@ -208,11 +208,11 @@ orrery msg reload                     # re-read the config now (it is also watch
 orrery msg quit
 orrery msg '{"cmd":"layout","name":"wall"}'   # a single argument is taken as a JSON request
 orrery msg --socket /path/to/orrery.sock state   # default: $ORRERY_SOCKET, else $XDG_RUNTIME_DIR/orrery.sock
-orrery msg --to side state            # any request, run on that machine of the session (see Linking machines)
+orrery msg --to side state            # any request, run on that machine of the orrery (see Linking machines)
 orrery msg inject key 38 down         # testing aid (--debug-inject only): input as if from this machine's devices
                                       #   (forwarded as theirs is): key XKB-KEYCODE down|up, motion DX DY (relative),
                                       #   button CODE down|up, axis H V
-orrery msg inject-remote side release # testing aid (--debug-inject, primary): an input message sent to a satellite
+orrery msg inject-remote side release # testing aid (--debug-inject, sun): an input message sent to a planet
                                       #   as it is: the same four, handoff [KEYCODE...], release; keymap in JSON
 ```
 
@@ -235,8 +235,8 @@ clients may use, and `device`, the GPU named as the main device; absent headless
 `last_key`: the last key press as the bind lookup read it (`key`, `mods`, and the `bind` it matched, if any). When a
 bind does nothing, `last_key` tells whether the key reached orrery at all and with which modifiers. Plain typing (no
 Ctrl, Alt or Super) is kept only as `(plain key)`, never which key it was. `colors` holds the config's colours
-(`focus`, `badge`, `attention`, `background`, each `#rrggbbaa`), for programs drawing in orrery's. In a session,
-`state` also carries `session` (see [Linking machines](#linking-machines)); alone it has none. `layouts` lists the
+(`focus`, `badge`, `attention`, `background`, each `#rrggbbaa`), for programs drawing in orrery's. In an orrery,
+`state` also carries `orrery` (see [Linking machines](#linking-machines)); alone it has none. `layouts` lists the
 config's layouts in config order (the order `cycle-layout` steps through), each as `{ name, cols, rows, col_weights,
 row_weights, slots }` with the weights left out when the grid has none and each slot `{ name, col, row, cols, rows }`:
 what a layout picker draws. `layouts` is in `state` only, not in the event stream's first line.
@@ -262,7 +262,7 @@ carries all a bar needs to redraw its part without asking again; at one time the
 | `closed` | a window leaves the slots (closed, or unmapped by its client); one per window | `id` |
 | `attention` | a window asks for attention, or its mark goes | `windows` (ids) and `workspaces` (numbers) asking |
 | `layers` | a layer surface appears, goes, moves or takes the keyboard | `screens`, each `{ name, layers }`, each layer `{ namespace, layer, rect, keyboard }` |
-| `session` | a machine joins or leaves, a link goes up or down, input moves, the link error changes (latency alone does not) | `session` as in `state`, null alone |
+| `orrery` | a machine joins or leaves, a link goes up or down, input moves, the link error changes (latency alone does not) | `orrery` as in `state`, null alone |
 | `config` | the config file was read again (a reload, good or broken) | `error` (as `config_error`) and `colors` |
 
 ```json
@@ -314,7 +314,7 @@ orrery check                          # the default path; or: orrery check --con
 ```
 
 prints `ok` (exit 0), or every problem as `FILE:LINE:COL: message` on stderr (exit 1). A missing file is exit 1
-too (orrery would use the built-in config). With `listen` or `primary` it also reads the secret file as `run` would
+too (orrery would use the built-in config). With `listen` or `sun` it also reads the secret file as `run` would
 (what is wrong with it is an error, exit 1) and prints a `link:` line: the machine's name, its role and address,
 and the secret file's path.
 
@@ -346,12 +346,12 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   focused slot's current stack (`#true`, the default) or as a new tab there; `toggle-stacking` flips it while
   running. Dialogs go on their parent's stack and launched programs' windows open as new tabs where the launch was
   made, whatever `stacking` says.
-- `listen "ADDR:PORT" secret-file="PATH"`: this machine is a session's primary, listening for satellites on that
+- `listen "ADDR:PORT" secret-file="PATH"`: this machine is an orrery's sun, listening for planets on that
   IP address and port (`0.0.0.0:7340` for every interface; port 0 picks one, shown in `state`).
-- `primary "HOST:PORT" secret-file="PATH"`: this machine is a satellite of the primary there (a host name or an IP
-  address, IPv6 in brackets). A machine has `listen` or `primary`, never both. `PATH` is absolute, or starts with
+- `sun "HOST:PORT" secret-file="PATH"`: this machine is a planet of the sun there (a host name or an IP
+  address, IPv6 in brackets). A machine has `listen` or `sun`, never both. `PATH` is absolute, or starts with
   `~/` for the home directory.
-- `name "NAME"`: this machine's name in a session, 1 to 64 bytes, unique in it; default: the hostname.
+- `name "NAME"`: this machine's name in an orrery, 1 to 64 bytes, unique in it; default: the hostname.
 - `keyboard { layout "..."; variant "..."; options "..."; model "..."; repeat-delay MS; repeat-rate N }`: every
   child optional. The four xkb names are as xkb takes them (`layout "us,de"`, `options "grp:alt_shift_toggle"`);
   `options` and `model` left out come from `XKB_DEFAULT_OPTIONS` and `XKB_DEFAULT_MODEL`, else xkb's own default.
@@ -360,7 +360,7 @@ example's `Mod+Ctrl+F1` and `Ctrl+Alt+F1` are). Every node is optional except at
   xkb cannot build is a config error (so `orrery check` catches a misspelt layout). `repeat-delay` is the hold
   before a key repeats, 1 to 10000 ms (default 200); `repeat-rate` the repeats a second, 0 (no repeat) to 1000
   (default 25). A reload that changes the block sends the new keymap (on the layout in use, when the layouts are
-  the same) and repeat to every client (in a session, while the primary's input is here, the new keymap comes back
+  the same) and repeat to every client (in an orrery, while the sun's input is here, the new keymap comes back
   with this machine's own input).
 - `colors { focus "#rrggbb"; badge "#rrggbb"; attention "#rrggbb"; background "#rrggbb" }`: each also
   `#rrggbbaa`. `focus` is the 1 px border inside the focused slot, `badge` the badge on a slot holding more than
@@ -488,7 +488,7 @@ binds {
     "Mod+Shift+Q" close           // as Hyprland's killactive
     "Mod+Space" show-tabs        // held: tab strips visible while down
     "Mod+Shift+E" quit
-    "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in a session)
+    "Mod+Escape" reclaim         // keyboard and pointer back to this machine (in an orrery)
     "Mod+Ctrl+F1" vt 1           // to console 1 ... 12 (bare metal; elsewhere it does nothing)
     "Mod+Ctrl+F2" vt 2
     "Mod+Ctrl+F3" vt 3
@@ -518,19 +518,19 @@ binds {
 
 ## Linking machines
 
-orrerys on several machines make one **session**: one **primary** and any number of **satellites**. Workspace
-numbers are one space across the session: the primary's screens come first, then each satellite's in the order they
+orrery on several machines makes an **orrery**: a **sun** and any number of **planets**. Workspace
+numbers are one space across the orrery: the sun's screens come first, then each planet's in the order they
 join, and workspace k is locked to screen k wherever that screen is. Each machine keeps its own windows; the
-primary's keyboard and pointer go where the session's focus marker is (Input crossing, below).
+sun's keyboard and pointer go where the orrery's focus marker is (Input crossing, below).
 
 ```kdl
-// the primary
+// the sun
 name "desk"
 listen "0.0.0.0:7340" secret-file="~/.config/orrery/secret"
 
-// each satellite
+// each planet
 name "side"
-primary "desk.lan:7340" secret-file="~/.config/orrery/secret"
+sun "desk.lan:7340" secret-file="~/.config/orrery/secret"
 ```
 
 The **secret file** holds the same secret on every machine, 32 to 4096 bytes (whitespace at either end aside, so a
@@ -541,75 +541,75 @@ naming the file, and never logs or shows its contents):
 (umask 077; head -c 32 /dev/urandom | base64 > ~/.config/orrery/secret)   # then copy it to each machine, 0600
 ```
 
-Holding it is a shell on every machine in the session (`--to` can spawn programs), so guard it like a private key.
+Holding it is a shell on every machine in the orrery (`--to` can spawn programs), so guard it like a private key.
 The link is TCP, encrypted and authenticated with Noise on that secret: a machine with another secret never joins
-(the primary logs the failed handshake) and nothing crosses in clear. The satellite connects; the primary only
-listens. To cross a firewall or NAT one way is an ssh reverse tunnel from the primary, so the satellite reaches it at
+(the sun logs the failed handshake) and nothing crosses in clear. The planet connects; the sun only
+listens. To cross a firewall or NAT one way is an ssh reverse tunnel from the sun, so the planet reaches it at
 its own loopback:
 
 ```sh
-ssh -R 7340:127.0.0.1:7340 side       # on the primary; the satellite's config says primary "127.0.0.1:7340"
+ssh -R 7340:127.0.0.1:7340 side       # on the sun; the planet's config says sun "127.0.0.1:7340"
 ```
 
-- **Joining:** a satellite keeps its workspace numbers where they are free in the session; a number already taken
+- **Joining:** a planet keeps its workspace numbers where they are free in the orrery; a number already taken
   moves, windows and screen with it, to the lowest free one (two machines that both start with screen 1: the
-  satellite's becomes 2). A name already in the session, or another link protocol version, is refused with a reason
-  shown on both ends (the satellite's in `state`).
-- **`workspace N`** (keys or `orrery msg`) on the primary goes to the machine that has N: that machine shows it, and
-  the session's focus marker moves there, the primary's keyboard and pointer with it. A number nobody has is made on
-  the machine holding the marker. On a satellite, a number another machine has goes to the primary, which routes it
-  the same way (answered ok once sent; a failure is logged on the primary).
+  planet's becomes 2). A name already in the orrery, or another link protocol version, is refused with a reason
+  shown on both ends (the planet's in `state`).
+- **`workspace N`** (keys or `orrery msg`) on the sun goes to the machine that has N: that machine shows it, and
+  the orrery's focus marker moves there, the sun's keyboard and pointer with it. A number nobody has is made on
+  the machine holding the marker. On a planet, a number another machine has goes to the sun, which routes it
+  the same way (answered ok once sent; a failure is logged on the sun).
 - **`move-to-workspace N`** to a number on another machine is refused: windows never cross machines.
 - **`orrery msg --to MACHINE <request>`** runs any request on that machine and prints its answer (`--to side
-  spawn foot`, `--to side state`); on the primary, through the link (an error after 5 s without an answer); naming
-  the machine itself runs it there; a satellite sends nothing on. An answer must fit one link frame (about 64 KB):
+  spawn foot`, `--to side state`); on the sun, through the link (an error after 5 s without an answer); naming
+  the machine itself runs it there; a planet sends nothing on. An answer must fit one link frame (about 64 KB):
   a `--to … state` of a machine with very many windows comes back as an error saying so.
-- **Dropping:** a satellite that loses the primary keeps working alone with every workspace number it has, and
-  tries again every 1 s, backing off to every 5 s; the primary frees its numbers meanwhile. On the rejoin it keeps
+- **Dropping:** a planet that loses the sun keeps working alone with every workspace number it has, and
+  tries again every 1 s, backing off to every 5 s; the sun frees its numbers meanwhile. On the rejoin it keeps
   them where still free. A link silent for 10 s counts as lost.
-- `listen`, `primary`, `name` and the `secret-file` path take effect when orrery starts. A reload reads the secret
-  file's contents again: a different secret drops every link at once, and satellites get back in once they have
+- `listen`, `sun`, `name` and the `secret-file` path take effect when orrery starts. A reload reads the secret
+  file's contents again: a different secret drops every link at once, and planets get back in once they have
   it too (rewrite the file on every machine, then reload each); a secret that cannot be read is the
   `config_error`, and the one read before stays in use.
-- The primary refuses a connection beyond 8 still joining, or beyond 2 from one IP address. A satellite whose
+- The sun refuses a connection beyond 8 still joining, or beyond 2 from one IP address. A planet whose
   name is held by a link silent for 4 s (a machine that froze or lost power) takes its place instead of being
   refused.
 
-`state.session` shows this machine's place: `machine` (its name), `role` (`primary` or `satellite`), `listen` (the
-primary's address, with the port it picked for 0), `primary` (a satellite's primary, as configured), `input` (the
-machine this one's keyboard and pointer go to: on the primary, the one holding the focus marker; a satellite's own
+`state.orrery` shows this machine's place: `machine` (its name), `role` (`sun` or `planet`), `listen` (the
+sun's address, with the port it picked for 0), `sun` (a planet's sun, as configured), `input` (the
+machine this one's keyboard and pointer go to: on the sun, the one holding the focus marker; a planet's own
 stay on it), `foreign` (the workspace numbers other machines own), `error` (why a link last failed, until one opens),
-and `machines`: on the primary every machine in the session (itself first, then the satellites in join order), on a
-satellite itself, each as `{ name, role, monitors, workspaces, latency_ms, connected, focused, queued }` (`monitors`
-as `{ name, number }`; `latency_ms` the link's round trip, pinged every 2 s, null for the primary itself, before the
-first answer and while a ping is overdue; `focused`: the session's focus marker is there, known on the primary only:
-a satellite shows false; `queued`: the primary's input waiting for that machine's link to take more, a stalled link
+and `machines`: on the sun every machine in the orrery (itself first, then the planets in join order), on a
+planet itself, each as `{ name, role, monitors, workspaces, latency_ms, connected, focused, queued }` (`monitors`
+as `{ name, number }`; `latency_ms` the link's round trip, pinged every 2 s, null for the sun itself, before the
+first answer and while a ping is overdue; `focused`: the orrery's focus marker is there, known on the sun only:
+a planet shows false; `queued`: the sun's input waiting for that machine's link to take more, a stalled link
 shows here).
 
 ## Input crossing
 
-The primary's keyboard and pointer go to the machine holding the session's focus marker. With the marker on the
-primary, input works as always; with it on a satellite, every key, button, scroll and pointer movement of the
-primary's own devices travels over the link and runs there through the satellite's own input path, binds included,
-as if typed on it. The satellite's own keyboard and pointer keep working on it all along (only the primary forwards).
+The sun's keyboard and pointer go to the machine holding the orrery's focus marker. With the marker on the
+sun, input works as always; with it on a planet, every key, button, scroll and pointer movement of the
+sun's own devices travels over the link and runs there through the planet's own input path, binds included,
+as if typed on it. The planet's own keyboard and pointer keep working on it all along (only the sun forwards).
 
-- **What moves input:** `workspace N` for a number on another machine (keys or `orrery msg`; typed on the satellite,
-  through the primary, so `Super+1` there comes home), and the pointer: the session's screens sit in a row, the
-  primary's then each satellite's in join order, and pushing the pointer past the right edge of a machine's last
+- **What moves input:** `workspace N` for a number on another machine (keys or `orrery msg`; typed on the planet,
+  through the sun, so `Super+1` there comes home), and the pointer: the orrery's screens sit in a row, the
+  sun's then each planet's in join order, and pushing the pointer past the right edge of a machine's last
   screen crosses onto the next machine's first, past the left edge of a machine's first onto the previous machine's
   last, at the same height (as a fraction of the screen's). The marker crosses with it, so the keyboard follows.
   Past either end of the row nothing happens. While a button is down the pointer stays on its machine (a drag).
-- **Keys:** raw keycodes travel, with the primary's keymap (once per link) and the layout it is on (at each
+- **Keys:** raw keycodes travel, with the sun's keymap (once per link) and the layout it is on (at each
   handoff), so the user's layout follows them. At each handoff everything down on the machine input leaves is
   released there, and the machine it goes to is told which modifiers are held: hold `Super`, press `2`, and Super is
-  still down on the satellite. Lock keys (Caps, Num) stay each machine's own. Receivers repeat keys themselves;
-  nothing repeats over the link. While the primary's input is on a satellite, the satellite's own keyboard types
-  with the primary's layout too; its own comes back, on the layout it was on, when input leaves.
-- **`Super+Escape`** (bind action `reclaim`) is matched on the primary before anything is forwarded and never
-  crosses: keyboard and pointer come home, the marker with them, and the satellite lets go of everything the
-  primary had down. Losing the link while input is away does the same at once, and so does the nested window
+  still down on the planet. Lock keys (Caps, Num) stay each machine's own. Receivers repeat keys themselves;
+  nothing repeats over the link. While the sun's input is on a planet, the planet's own keyboard types
+  with the sun's layout too; its own comes back, on the layout it was on, when input leaves.
+- **`Super+Escape`** (bind action `reclaim`) is matched on the sun before anything is forwarded and never
+  crosses: keyboard and pointer come home, the marker with them, and the planet lets go of everything the
+  sun had down. Losing the link while input is away does the same at once, and so does the nested window
   losing the host's keyboard focus.
-- **The pointer while away:** nested, the primary hides the host's pointer and holds it (locked in place where the
+- **The pointer while away:** nested, the sun hides the host's pointer and holds it (locked in place where the
   host supports pointer constraints, else confined to the window it is in, or the next of orrery's it enters) and
   sends its relative motion; on return it is let go and shown where it came in. Pointer crossing nested needs the
   host's relative-pointer protocol (most Wayland compositors have it; X11 reports raw motion): pushing past orrery's
@@ -617,23 +617,23 @@ as if typed on it. The satellite's own keyboard and pointer keep working on it a
   has it: the client's cursor, or where a client names one, that cursor from the xcursor theme (else a plain square).
 - **Motion merges, keys never do:** when a link stalls, pointer movement waiting for it merges into one step and is
   never replayed late, and so does touchpad scroll (its stop kept apart); keys, buttons and wheel steps all arrive,
-  in order. The satellite acknowledges the input it ran,
-  and the primary keeps at most 32 input messages unacknowledged: the rest wait on the primary, where they merge
+  in order. The planet acknowledges the input it ran,
+  and the sun keeps at most 32 input messages unacknowledged: the rest wait on the sun, where they merge
   (`queued` in `state` shows them).
-- Plain typing never shows in `last_key` on the primary while it is forwarded, and keystrokes are never logged.
+- Plain typing never shows in `last_key` on the sun while it is forwarded, and keystrokes are never logged.
 
 **Trying it on one machine:** two nested orrerys side by side in the host, each with its own config and control
-socket (a satellite named `side` whose `primary` is the primary's `listen`):
+socket (a planet named `side` whose `sun` is the sun's `listen`):
 
 ```sh
 (umask 077; head -c 32 /dev/urandom | base64 > /tmp/orrery-secret)
 { cat examples/config.kdl; echo 'name "desk"'; echo 'listen "127.0.0.1:7340" secret-file="/tmp/orrery-secret"'; } \
     > /tmp/orrery-desk.kdl
-{ cat examples/config.kdl; echo 'name "side"'; echo 'primary "127.0.0.1:7340" secret-file="/tmp/orrery-secret"'; } \
+{ cat examples/config.kdl; echo 'name "side"'; echo 'sun "127.0.0.1:7340" secret-file="/tmp/orrery-secret"'; } \
     > /tmp/orrery-side.kdl
 ./target/release/orrery run --config /tmp/orrery-desk.kdl --socket /tmp/orrery-desk.sock &
 ./target/release/orrery run --config /tmp/orrery-side.kdl --socket /tmp/orrery-side.sock &
-./target/release/orrery msg --socket /tmp/orrery-desk.sock state    # session.input, the machines
+./target/release/orrery msg --socket /tmp/orrery-desk.sock state    # orrery.input, the machines
 ```
 
 Put the `desk` window against the right edge of a host monitor (the host stops its pointer there, so `desk` can hold
@@ -706,9 +706,9 @@ script or a kitty kitten driven by `orrery msg`:
 - **A bar** along the top of every screen (`bars.py` starts `bar.py` in a `kitten panel` per screen, and keeps one
   per screen as screens come and go): left the workspaces (the one this screen shows highlighted, in a block when the
   screen has the focus; one shown on another screen in the badge colour; occupied ones plain, empty ones dim; one
-  asking for attention in the attention colour; in a session, other machines' numbers dim), middle the tabs of the
-  focused slot of this screen's workspace (the current one bright, titles cut to fit), right the session's machines
-  (only in a session; where input is in the focus colour, one whose link is down dim), this screen's layout (in the
+  asking for attention in the attention colour; in an orrery, other machines' numbers dim), middle the tabs of the
+  focused slot of this screen's workspace (the current one bright, titles cut to fit), right the orrery's machines
+  (only in an orrery; where input is in the focus colour, one whose link is down dim), this screen's layout (in the
   badge colour; it goes first when the bar is narrow) and the time. It follows
   `orrery msg subscribe`, takes its colours from orrery's (a reload recolours it) and reconnects when the stream
   ends. It belongs to the orrery whose control socket was there when it started: when that socket is gone or
@@ -768,7 +768,7 @@ xdg-desktop-portal installed:
    snippet's include brings): `spawn-at-start "kitten" "desktop-ui" "run-server" launch=#false`.
 3. Have toolkits use the portal: `GTK_USE_PORTAL=1` and `QT_QPA_PLATFORMTHEME=xdgdesktopportal` in the environment
    orrery starts with (your login's profile or `/etc/environment`), so every program it starts has them.
-4. Start orrery again (a new session, so D-Bus and the portal start with the new environment).
+4. Start orrery again (a new orrery, so D-Bus and the portal start with the new environment).
 
 Then `kitten desktop-ui set-color-scheme dark` (or `light`, `no-preference`, `toggle`) switches every program that
 follows the portal's colour scheme; bind it if you like:
@@ -835,5 +835,5 @@ orrery's frame, never put on a monitor plane directly; implicit synchronization 
 - With the host passing every key through, orrery takes its `Mod` (Super) keys before clients see them.
 - Nested, one output per window, scale 1; no Xwayland, no touch input (bare metal: see its section).
 - Nested, `open-screen` holds orrery until the host has configured the new window (milliseconds).
-- Input crossing: a keyboard layout switched while input is on a satellite (a group toggle key, say) switches only
-  there; the primary comes home on the layout it was on, and the next handoff sends that one.
+- Input crossing: a keyboard layout switched while input is on a planet (a group toggle key, say) switches only
+  there; the sun comes home on the layout it was on, and the next handoff sends that one.

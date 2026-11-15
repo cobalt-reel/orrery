@@ -6,7 +6,7 @@ mod support;
 use orrery_wm::config;
 use support::Compositor;
 use support::client::Client;
-use support::session::wait_log;
+use support::system::wait_log;
 
 const SIZE: (i32, i32) = (1280, 720);
 
