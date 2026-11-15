@@ -38,7 +38,7 @@ changes is what a slot holds:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ 1  2  3        editor │ docs │ shell                   tall    21:07   │  a bar (any layer-shell client)
+│ 1  2  3        editor │ docs │ shell                   tall    21:07   │
 ├───────────────────────────────────────────┬────────────────────────────┤
 │                                           │ slot 1                     │
 │  slot 0 "main"                            │   one tab, one window      │
@@ -51,7 +51,7 @@ changes is what a slot holds:
 │                                           │ slot 3                     │
 │                                           │   empty                    │
 └───────────────────────────────────────────┴────────────────────────────┘
-        a screen shows one workspace; a workspace has one layout
+   the top line is a bar (any layer-shell client); under it, one workspace
 ```
 
 - A **screen** shows one **workspace**; there are ten, and workspace *k* is locked to screen *k*.
