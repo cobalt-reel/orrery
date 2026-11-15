@@ -13,7 +13,7 @@ use crate::session::Role;
 use crate::stacks::WORKSPACES;
 
 /// The built-in config, used when no file exists. Kept as a file so it can be copied to start a config; the
-/// README shows it verbatim (tested).
+/// manual shows it verbatim (tested).
 pub const DEFAULT: &str = include_str!("../examples/config.kdl");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1849,11 +1849,11 @@ mod tests {
     }
 
     #[test]
-    fn the_readme_shows_the_built_in_config_verbatim() {
-        let readme = include_str!("../README.md");
+    fn the_manual_shows_the_built_in_config_verbatim() {
+        let manual = include_str!("../docs/manual.md");
         assert!(
-            readme.contains(&format!("```kdl\n{DEFAULT}```")),
-            "README's example drifted from examples/config.kdl"
+            manual.contains(&format!("```kdl\n{DEFAULT}```")),
+            "the manual's example drifted from examples/config.kdl"
         );
     }
 
