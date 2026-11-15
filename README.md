@@ -18,9 +18,14 @@ the desk.
 ## Why this exists
 
 orrery is a personal project. It was built for a real desk and a specific idea of how windows should behave, and
-it does that and not much more. It is not meant to replace the compositor you use. It is in use on the desk it
-was built for, it has held up, and so it is shared as it is. If the ideas below sound like the way you work, you
-may like it too.
+it does that and not much more. It is not meant to replace the compositor you use.
+
+That desk is a cluster of small, low-powered machines that together make up the computer, each with its own
+screens. This is why orrery spans machines: the windows run wherever there is room for them, and the same keyboard
+and mouse have to reach all of it as if it were a single box.
+
+It is in use on the desk it was built for, it has held up, and so it is shared as it is. If the ideas below sound
+like the way you work, you may like it too.
 
 ## How it was made
 
