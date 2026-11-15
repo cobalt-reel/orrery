@@ -1,14 +1,15 @@
 <h1 align="center">orrery</h1>
 
 <p align="center">
-  <b>A static tiling Wayland compositor.</b><br>
-  Fixed layouts of slots, tabs in every slot, a stack in every tab.<br>
-  Windows never move by themselves.
+  <b>A static tiling Wayland compositor that spans machines.</b><br>
+  Windows stay where you put them, windows that belong together stack in one place,<br>
+  and one keyboard and mouse drive every screen of every machine on your desk.
 </p>
 
 <p align="center">
-  <a href="docs/manual.md">Manual</a> ·
+  <a href="#what-orrery-is">What it is</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="docs/manual.md">Manual</a> ·
   <a href="examples/config.kdl">Example config</a> ·
   <a href="docs/plans/">Design notes</a>
 </p>
@@ -23,64 +24,103 @@
   <img src="docs/images/desktop.png" width="900" alt="orrery with the kitty desktop: a bar along the top, an editor in the main slot with its tab strip showing, and three terminals stacked on the right">
 </p>
 <p align="center">
-  <sub>The <code>tall</code> layout under the kitty desktop's bar. The main slot holds three tabs; holding
-  <code>Mod+Space</code> shows its tab strip.</sub>
+  <sub>One screen in the <code>tall</code> layout, under the kitty desktop's bar. The main slot holds three tabs;
+  holding <code>Mod+Space</code> shows its tab strip.</sub>
 </p>
 
 ---
 
-orrery is a Wayland compositor and tiling window manager written in Rust on
-[Smithay](https://github.com/Smithay/smithay).
+## What orrery is
 
-Most tiling compositors are *dynamic*: open or close a window and the others are rearranged around it. orrery is
-*static*. You describe each layout once, as a grid of **slots**, and a slot stays exactly where you put it. What
-changes is what a slot holds:
+orrery is a Wayland compositor and tiling window manager, written in Rust on
+[Smithay](https://github.com/Smithay/smithay). All of it in one paragraph:
+
+> Each screen is divided into fixed **slots** that never rearrange themselves. A slot holds **tabs**, and every tab
+> is a **stack**: windows that belong together, piled up, so a dialog or a program started from a terminal opens on
+> top of what it came from and gives the place back when it closes. And orrery is **distributed**: run it on every
+> machine on your desk and they join into one desktop, with one set of workspaces across all their screens and one
+> keyboard and mouse that go wherever you are working.
+
+Those are three ideas. One at a time:
+
+### 1. Nothing moves unless you move it
+
+Most tiling window managers are *dynamic*: open or close a window and the others shuffle and resize to make room.
+orrery is *static*. You write each **layout** once, as a grid of **slots**, and a slot stays where it is whatever
+opens or closes. A window is the size of its slot, or of its whole screen when you ask for fullscreen. Nothing
+floats, and nothing is resized by its neighbours.
+
+In the picture above the screen is in the `tall` layout: a main slot on the left and three slots on the right.
+A layout is a few lines of config, a [library of eight](examples/layouts.kdl) comes ready to include, and a key
+switches between them.
+
+There are ten **workspaces**. Each screen shows one, and each workspace has a layout of its own. Workspace 1 is
+locked to screen 1, workspace 2 to screen 2, and the others stay on the screen where you first opened them, so a
+workspace key always takes you to the same place.
+
+### 2. A slot holds tabs, and every tab is a stack
+
+What changes is what a slot holds, and it holds things two levels deep.
+
+**Tabs** are for things that share a place: an editor, its documentation and a shell, say. A slot shows one tab at
+a time and you cycle through them, as in a browser. Whatever you launch with a key or the launcher opens as a new
+tab in the slot that had the focus when you launched it, even if you have moved on by the time its window appears.
+
+A **stack** is for windows that belong together, and every tab is one: a pile of windows of which you see only the
+top. A dialog opens on top of its parent. A program you start from a terminal opens on top of that terminal. Close
+the top window and the one beneath is there again, exactly where it was.
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 1  2  3        editor │ docs │ shell                   tall    21:07   │
-├───────────────────────────────────────────┬────────────────────────────┤
-│                                           │ slot 1                     │
-│  slot 0 "main"                            │   one tab, one window      │
-│                                           │                            │
-│    three tabs:  editor · docs · shell     ├────────────────────────────┤
-│                                           │ slot 2                     │
-│    the editor tab is a stack:             │   two tabs                 │
-│      a file dialog       (on top, drawn)  │                            │
-│      the editor window   (beneath)        ├────────────────────────────┤
-│                                           │ slot 3                     │
-│                                           │   empty                    │
-└───────────────────────────────────────────┴────────────────────────────┘
-   the top line is a bar (any layer-shell client); under it, one workspace
+a slot
+ ├─ tab 1   an editor, and on top of it its "Save as" dialog      you see the dialog
+ ├─ tab 2   a terminal, and on top of it the viewer you ran       you see the viewer
+ └─ tab 3   a browser                                             you see the browser
 ```
 
-- A **screen** shows one **workspace**; there are ten, and workspace *k* is locked to screen *k*.
-- A workspace has one **layout**: a weighted grid whose rectangles are the **slots**.
-- A slot holds **tabs**; it shows its current tab.
-- A tab is a **stack** of windows; only the top one is drawn. Close it and the one beneath shows again.
+A stack moves as one thing: send a tab to another slot or another workspace and everything in it goes along, the
+program together with the terminal that started it. `split` lifts the top window out into a tab of its own. If
+you would rather have tabs only, one setting makes every new window a tab (dialogs still stack on their parent).
+Holding `Mod+Space` shows every slot's tabs as a strip along its top, as in the picture.
 
-A new window goes where you would expect and nowhere else: a dialog lands on top of its parent, a program you
-launched opens as a new tab in the slot that had the focus *when you launched it* (even if the focus has moved on
-by the time its window appears), and everything else joins the focused slot. From there you move things, with keys
-or from a script.
+### 3. One desktop across several machines
 
-## What is in it
+Run orrery on each machine on your desk, give them one shared secret, and they join into one **session**: a
+*primary*, which is the machine whose keyboard and mouse you use, and any number of *satellites*.
 
-- **Layouts you write yourself**, in a [KDL](https://kdl.dev) config: grids with weighted columns and rows, slots
-  spanning cells, a starting layout per monitor. A [library of eight](examples/layouts.kdl) is ready to include,
-  and `cycle-layout` steps through them.
-- **A config that cannot lock you out.** The file is watched and reloads within a second. A broken file changes
-  nothing: the old config keeps running, a red bar along the top says so, and `orrery check` names every problem
-  as `FILE:LINE:COL`.
+```
+        "desk", the primary                               "side", a satellite
+ ┌─────────────┐  ┌─────────────┐                        ┌─────────────┐
+ │ workspace 1 │  │ workspace 2 │  <──── encrypted ────> │ workspace 3 │
+ └─────────────┘  └─────────────┘          link          └─────────────┘
+   your keyboard and mouse  ──── Mod+3, or the pointer pushed past the edge ────>
+```
+
+- **One set of workspaces.** The workspace numbers run across every screen of every machine: the primary's screens
+  first, then each satellite's. `Mod+3` shows workspace 3 on whichever machine has it.
+- **One keyboard and mouse.** They follow the focus. Press the key of a workspace on another machine, or push the
+  pointer past the edge of the last screen, and from then on your typing, clicks and scrolling happen on that
+  machine, key binds included, in your own keyboard layout. `Mod+Escape` always brings them home, and each
+  machine's own keyboard and mouse keep working all along.
+- **Windows stay on their machine.** Every machine runs and draws its own programs. Only input and commands travel
+  (`orrery msg --to side spawn kitty` starts a terminal on the other machine); no pixels cross the network, so
+  nothing is streamed. It is the sharing a software KVM gives you, built into the compositor.
+- **Nothing to set up but the secret.** The link is encrypted and authenticated with it (Noise over TCP). orrery is
+  the compositor at both ends, so it needs no portal, no virtual input device and no extra permission. A machine
+  that drops off keeps working by itself and rejoins when it can.
+
+On one machine none of this is in the way: orrery is then simply a static tiling compositor.
+
+### And the rest
+
+- **A config that cannot lock you out.** The config is one [KDL](https://kdl.dev) file, watched and reloaded within
+  a second. A broken file changes nothing: the old config keeps running, a red bar along the top says so, and
+  `orrery check` names every problem as `FILE:LINE:COL`.
 - **Scriptable.** `orrery msg` runs the actions the keys run, over a control socket: focus, move, split, layouts,
   workspaces, spawn. `orrery msg state` is the whole desktop as JSON; `orrery msg subscribe` is an event stream,
   one JSON line per change, made for bars.
 - **Three ways to run:** on **bare metal** (DRM/KMS, libinput, a seat from logind, elogind or seatd), **nested**
   as a window inside another Wayland compositor, and **headless** for tests.
 - **Several monitors**, each a screen with its own workspace and layout, coming and going as they are plugged in.
-- **One session across machines.** orrerys on several machines join over an encrypted link (Noise over TCP):
-  workspace numbers span all of them, and one keyboard and pointer cross from machine to machine, by workspace key
-  or by pushing the pointer past the edge of a screen.
 - **A desktop made of kitty.** [`examples/kitty/`](examples/kitty) adds a bar on every screen, a drop-down
   terminal, an application launcher and a layout picker that draws each layout, all as small scripts driven by
   `orrery msg`. One `include` line brings it in.
@@ -222,9 +262,10 @@ include "/path/to/orrery/examples/layouts.kdl"
 It needs kitty 0.43 or later, python3 and fzf. Details are under
 [A kitty desktop](docs/manual.md#a-kitty-desktop). Any other layer-shell bar, launcher or wallpaper works too.
 
-## One session across machines
+## Linking machines
 
-Give two machines the same secret and name one the primary:
+To make the session of [idea 3](#3-one-desktop-across-several-machines), give two machines the same secret and name
+one the primary:
 
 ```kdl
 // on the desk
@@ -236,11 +277,11 @@ name "side"
 primary "desk.lan:7340" secret-file="~/.config/orrery/secret"
 ```
 
-Now the desk's screens are workspaces 1, 2, … and the other machine's follow on. `Mod+3` on the desk's keyboard
-shows workspace 3 wherever it lives, and the keyboard and pointer go there with it; so does pushing the pointer
-off the edge of the last screen. Windows never cross machines; input does, encrypted and authenticated with the
-secret. See [Linking machines](docs/manual.md#linking-machines) and
-[Input crossing](docs/manual.md#input-crossing).
+That is the whole setup: start orrery on both, and the desk's screens are workspaces 1, 2, … with the other
+machine's following on. The secret file, firewalls and what happens when a link drops are under
+[Linking machines](docs/manual.md#linking-machines); how keys, layouts and the pointer cross is under
+[Input crossing](docs/manual.md#input-crossing), which also shows how to try it with two nested orrerys on one
+machine.
 
 ## Status
 
@@ -250,6 +291,7 @@ orrery is young: version 0.1. It runs a desktop on bare metal, and these are the
 - no screen capture protocol, so no screenshots or screen sharing (the pictures here were taken by the host of a
   nested orrery);
 - no screen lock and no idle handling;
+- in a session the clipboard stays on each machine: copy and paste do not cross the link;
 - scale 1 only, each monitor at its preferred mode, one GPU;
 - no hardware cursor planes and no direct scanout: everything is composited;
 - touchscreens and tablets are ignored; touchpads keep libinput's defaults.
