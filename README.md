@@ -89,10 +89,10 @@ Run orrery on each machine on your desk, give them one shared secret, and they j
 
 ```
         "desk", the primary                               "side", a satellite
- ┌─────────────┐  ┌─────────────┐                        ┌─────────────┐
- │ workspace 1 │  │ workspace 2 │  <──── encrypted ────> │ workspace 3 │
- └─────────────┘  └─────────────┘          link          └─────────────┘
-   your keyboard and mouse  ──── Mod+3, or the pointer pushed past the edge ────>
+ +-------------+  +-------------+                        +-------------+
+ | workspace 1 |  | workspace 2 |  <---- encrypted ----> | workspace 3 |
+ +-------------+  +-------------+          link          +-------------+
+   your keyboard and mouse  ---- Mod+3, or the pointer pushed past the edge ---->
 ```
 
 - **One set of workspaces.** The workspace numbers run across every screen of every machine: the primary's screens
