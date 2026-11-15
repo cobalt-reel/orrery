@@ -1,6 +1,6 @@
 # orrery
 
-A tiling Wayland compositor built around its owner's way of using a desk: windows stay where they are put,
+A tiling Wayland compositor built around a particular way of using a desk: windows stay where they are put,
 windows that belong together pile up in the same place, and the same keyboard and mouse drive every machine on
 the desk.
 
@@ -17,18 +17,17 @@ the desk.
 
 ## Why this exists
 
-orrery is a personal project. It was built to its owner's idea of how windows should behave, for their own
-desk, and it does that and not much more. It is not meant to replace the compositor you use. It is in use on
-the desk it was built for, it has held up, and so it is shared as it is. If the ideas below sound like the way you
-work, you may like it too.
+orrery is a personal project. It was built for a real desk and a specific idea of how windows should behave, and
+it does that and not much more. It is not meant to replace the compositor you use. It is in use on the desk it
+was built for, it has held up, and so it is shared as it is. If the ideas below sound like the way you work, you
+may like it too.
 
 ## How it was made
 
-Nobody typed this code by hand. orrery was written by Claude, Anthropic's AI model, working as the programmer:
-the owner of the desk described how it should behave, tried each piece on real hardware, and sent it back when it
-was wrong. Every commit in this repository is Claude's. People do not usually get a compositor
-built just to have their windows the way they like them. Now they can, and this repository is an example of
-that.
+Nobody typed this code by hand. orrery was written by Claude, Anthropic's AI model, working as the programmer
+from a description of how the desktop should behave. Each piece was tried on real hardware and sent back when it
+was wrong. Every commit in this repository is Claude's. People do not usually get a compositor built just to have
+their windows the way they like them. Now they can, and this repository is an example of that.
 
 It is not thrown together, though, and you can check:
 
