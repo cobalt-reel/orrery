@@ -1,7 +1,7 @@
 # orrery
 
-A tiling Wayland compositor I wrote for the way I use a desk: windows stay where I put them, windows that belong
-together pile up in one place, and one keyboard and mouse drive every machine in front of me.
+A tiling Wayland compositor built around one person's way of using a desk: windows stay where they are put,
+windows that belong together pile up in one place, and one keyboard and mouse drive every machine on the desk.
 
 [Manual](docs/manual.md) · [Example config](examples/config.kdl) · [Design notes](docs/plans/) ·
 [Quick start](#quick-start)
@@ -16,17 +16,17 @@ together pile up in one place, and one keyboard and mouse drive every machine in
 
 ## Why this exists
 
-This is a personal project. I know how I want my windows to behave, and orrery is that, written down as a
-compositor: it does what I want from a window manager and not much more. It is not trying to replace the one you
-use. I run it on my own desk, it has held up, and keeping it to myself seemed a waste. If the ideas below sound
-like the way you work, you may like it too.
+orrery is a personal project. It was built to one person's idea of how windows should behave, for that person's
+own desk, and it does that and not much more. It is not meant to replace the compositor you use. It is in use on
+the desk it was built for, it has held up, and so it is shared as it is. If the ideas below sound like the way you
+work, you may like it too.
 
 ## How it was made
 
-I did not type most of this code. orrery was built with Claude, Anthropic's coding model, as the programmer, and
-me as the one who designs it and has to live in it: I say how it should behave, read what comes back, run it on my
-desk, and send it back when it is wrong. That is the only reason it exists. One person does not usually write a
-compositor just to get their windows the way they like them. Now one can, and I think that is worth showing.
+Nobody typed this code by hand. orrery was written by Claude, Anthropic's AI model, working as the programmer:
+the owner of the desk described how it should behave, tried each piece on real hardware, and sent it back when it
+was wrong. Every commit in this repository is Claude's. A compositor is not something one person usually gets
+built just to have their windows the way they like them. Now it is, and this repository is an example of that.
 
 It is not thrown together, though, and you can check:
 
@@ -36,8 +36,8 @@ It is not thrown together, though, and you can check:
   connections and its control socket. The window logic is also put through seeded random walks that check its
   invariants after every step.
 - **Checked by hand on real hardware.** What needs a real screen and real keys has a list in
-  [`docs/checklists.md`](docs/checklists.md), and I go through it.
-- **Clean under `cargo fmt` and `cargo clippy -D warnings`**, and the commits say who wrote them.
+  [`docs/checklists.md`](docs/checklists.md).
+- **Clean under `cargo fmt` and `cargo clippy -D warnings`.**
 
 The code is MIT. Read it and judge for yourself.
 
@@ -56,10 +56,9 @@ Those are three ideas. One at a time:
 
 ### 1. Nothing moves unless you move it
 
-I do not want my windows to shuffle and resize every time one opens or closes, so in orrery they never do. You
-write each **layout** once, as a grid of **slots**, and a slot stays where it is whatever opens or closes. A
-window is the size of its slot, or of its whole screen when you ask for fullscreen. Nothing floats, and nothing is
-resized by its neighbours.
+Windows never shuffle or resize because another one opened or closed. You write each **layout** once, as a grid
+of **slots**, and a slot stays where it is whatever opens or closes. A window is the size of its slot, or of its
+whole screen when you ask for fullscreen. Nothing floats, and nothing is resized by its neighbours.
 
 In the picture above the screen is in the `tall` layout: a main slot on the left and three slots on the right.
 A layout is a few lines of config, a [library of eight](examples/layouts.kdl) comes ready to include, and a key
@@ -135,7 +134,7 @@ On one machine none of this is in the way.
 - **A desktop made of kitty.** [`examples/kitty/`](examples/kitty) adds a bar on every screen, a drop-down
   terminal, an application launcher and a layout picker that draws each layout, all as small scripts driven by
   `orrery msg`. One `include` line brings it in.
-- **The protocols my desktop needs:** xdg-shell with popups and menu grabs, fullscreen, layer-shell (bars,
+- **The protocols a desktop needs:** xdg-shell with popups and menu grabs, fullscreen, layer-shell (bars,
   launchers, wallpapers), xdg-activation (a window asking for attention is marked, never raised),
   xdg-decoration, linux-dmabuf (OpenGL and Vulkan clients render on the GPU), and copy and paste between clients.
 
@@ -294,8 +293,8 @@ machine.
 
 ## Status
 
-orrery is young: version 0.1. It runs my own desktop on bare metal, across two monitors. It does what I have
-needed so far, and these are the things I have not needed yet or have not got to:
+orrery is young: version 0.1. It runs a desktop on bare metal, across two monitors. It does what that desktop
+has needed so far, and these are the things it has not needed yet:
 
 - no Xwayland: Wayland clients only;
 - no screen capture protocol, so no screenshots or screen sharing (the pictures here were taken by the host of a
@@ -306,8 +305,8 @@ needed so far, and these are the things I have not needed yet or have not got to
 - no hardware cursor planes and no direct scanout: everything is composited;
 - touchscreens and tablets are ignored; touchpads keep libinput's defaults.
 
-The manual lists the [limits](docs/manual.md#limits) in full. If you try it and something breaks, open an issue: I
-would like to know. I make no promises about what gets built next, since it follows what I need on my own desk.
+The manual lists the [limits](docs/manual.md#limits) in full. What gets built next follows what that one desk
+needs.
 
 ## Documentation
 
