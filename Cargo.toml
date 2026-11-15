@@ -3,6 +3,11 @@ name = "orrery-wm"
 version = "0.1.0"
 edition = "2024"
 description = "A static tiling Wayland compositor on Smithay"
+license = "MIT"
+repository = "https://github.com/cobalt-reel/orrery"
+readme = "README.md"
+keywords = ["wayland", "compositor", "tiling", "window-manager", "smithay"]
+categories = ["gui"]
 
 [lib]
 name = "orrery_wm"
