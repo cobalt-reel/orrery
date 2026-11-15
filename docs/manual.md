@@ -693,7 +693,7 @@ where a layout has one, so a layout switch keeps the focused work there:
 | `columns` | 3 | three equal columns |
 | `quad` | 4 | two by two |
 | `six` | 6 | three by two: for a large screen |
-| `sidebar` | 3 | a main slot (3/4) and a side column of two |
+| `sidebar` | 3 | a main slot (3/4) and two slots in a side column |
 
 Give each screen its own starting layout with `monitor` rules (`monitor "DP-1" layout="centre"`), and pick any of
 them on the fly with `cycle-layout`, a `layout` bind or the kitty desktop's layout picker.

@@ -62,7 +62,7 @@ of **slots**, and a slot stays where it is whatever opens or closes. A window is
 whole screen when you ask for fullscreen. Nothing floats, and nothing is resized by its neighbours.
 
 In the picture above the screen is in the `tall` layout: a main slot on the left and three slots on the right.
-A layout is a few lines of config, a [library of eight](examples/layouts.kdl) comes ready to include, and a key
+A layout is a few lines of config, [eight ready-made layouts](examples/layouts.kdl) come with orrery, and a key
 switches between them.
 
 There are ten **workspaces**. Each screen shows a workspace, and each workspace has a layout of its own. Workspace 1 is
